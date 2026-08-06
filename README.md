@@ -104,18 +104,21 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
   --budgets 0
 ```
 
-也可以直接使用项目根目录的一键脚本。它会优先使用已导出的 `OPENAI_API_KEY`；如果未导出，则临时读取 `$HOME/.pi/agent/auth.json` 中的 key，不写入项目文件：
+也可以直接使用项目根目录的一键脚本运行 DeepSeek 测试。它会优先使用已导出的 `OPENAI_API_KEY`；如果未导出，则临时读取 `$HOME/.pi/agent/auth.json` 中的 key，不写入项目文件。脚本默认使用 `deepseek-chat`，并通过临时配置副本传递模型，不修改主 `config.json`：
 
 ```bash
 ./run_ablation.sh
 ```
 
-默认等价于运行预算 `0 1 2 3 4 5` 的 6 Å 口袋坐标实验。常用覆盖方式：
+默认输出到 `runs/ablation-deepseek-pocket-6A/`，等价于运行预算 `0 1 2 3 4 5` 的 6 Å 口袋坐标实验。常用覆盖方式：
 
 ```bash
-BUDGETS="0 1 2" OUTPUT_ROOT=runs/ablation-smoke ./run_ablation.sh
+BUDGETS="0 1 2" OUTPUT_ROOT=runs/ablation-deepseek-smoke ./run_ablation.sh
+ABLATION_MODEL=deepseek-reasoner ./run_ablation.sh
 COORDINATE_SCOPE=pocket POCKET_RADIUS=6.0 ./run_ablation.sh
 ```
+
+模型名称必须是当前第三方 OpenAI-compatible 端点支持的模型 ID。主工作流仍读取 `config.json` 中的模型，不受 `ABLATION_MODEL` 影响。
 
 比较结果时读取各目录的 `result.json` 和根目录的 `summary.json`，重点比较 `status`、`tool_call_count`、`decision_count`、`result.decision`、`result.validation.property_delta`、`result.validation.structure_change` 和 `error`。这项实验只能比较信息预算与工具使用对方案的影响，不能直接比较活性；后续接入 docking/RBFE 时，应在相同候选评估协议下追加结果。
 

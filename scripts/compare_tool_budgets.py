@@ -129,8 +129,10 @@ def run_budget(
     run_dir = output_root / f"budget-{budget:02d}"
     run_dir.mkdir(parents=True, exist_ok=True)
     coordinates = coordinate_text(context, coordinate_scope, pocket_radius)
+    config_data = json.loads(config_path.read_text(encoding="utf-8"))
     state: dict[str, Any] = {
         "budget": budget,
+        "model": config_data.get("model"),
         "coordinate_scope": coordinate_scope,
         "coordinate_chars": len(coordinates),
         "tool_calls": [],
