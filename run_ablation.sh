@@ -17,9 +17,9 @@ fi
 
 TASK_PATH="${TASK_PATH:-input/task.json}"
 CONFIG_PATH="${CONFIG_PATH:-config.json}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-tool-budget-full}"
-COORDINATE_SCOPE="${COORDINATE_SCOPE:-full}"
-POCKET_RADIUS="${POCKET_RADIUS:-8.0}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-tool-budget-pocket-6A}"
+COORDINATE_SCOPE="${COORDINATE_SCOPE:-pocket}"
+POCKET_RADIUS="${POCKET_RADIUS:-6.0}"
 BUDGETS="${BUDGETS:-0 1 2 3 4 5}"
 
 if ! command -v mamba >/dev/null 2>&1; then

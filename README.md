@@ -59,11 +59,13 @@ mamba run -n molecular-agent python -m molecular_agent.cli \
 
 ## 独立工具预算对比实验
 
-`scripts/compare_tool_budgets.py` 是主工作流之外的独立 ablation 实验，不会修改 `Workflow` 的证据门或状态逻辑。它固定任务、复合物坐标、模型和 API 配置，只改变每次实验允许的工具调用次数。
+`scripts/compare_tool_budgets.py` 是主工作流之外的独立 ablation 实验，不会修改 `Workflow` 的证据门或状态逻辑。它固定任务、模型和 API 配置，只改变每次实验允许的工具调用次数。
 
-预算 `k` 的含义是：该组最多执行 `k` 次工具调用。预算耗尽后，脚本要求 LLM 直接返回 `READY`；如果模型仍要求工具，该组记录为未完成，不会超预算执行。每组保存完整坐标输入、LLM 决策、工具结果、最终改造计划、候选 SDF、RDKit/刚性碰撞验证和 `result.json`。其中 `budget-00` 是只给模型坐标、不调用工具的直接输入基线。
+默认输入是：配体坐标 + 配体周围 `6.0 Å` 内的蛋白残基坐标。这样可以保留局部结合环境，避免把整个大型 PDB 文本塞入每次 LLM 请求。完整复合物坐标仍可用 `--coordinate-scope full` 显式启用。
 
-完整复合物坐标模式：
+预算 `k` 的含义是：该组最多执行 `k` 次工具调用。预算耗尽后，脚本要求 LLM 直接返回 `READY`；如果模型仍要求工具，该组记录为未完成，不会超预算执行。每组保存输入坐标、LLM 决策、工具结果、最终改造计划、候选 SDF、RDKit/刚性碰撞验证和 `result.json`。其中 `budget-00` 是只给坐标、不调用工具的直接输入基线。
+
+显式使用完整复合物坐标模式：
 
 ```bash
 cd /mnt/f/doctoral_period_huangwy/PhD_project/external_model/context_learn/test/simple_molecular_agent
@@ -77,17 +79,17 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
   --coordinate-scope full
 ```
 
-如果完整 PDB 文本超过模型上下文限制，使用宿主预筛选的口袋坐标模式。它仍然只传坐标，不传工具结果或额外配体文件：
+默认的 6 Å 口袋坐标模式如下，仍然只传坐标，不传工具结果或额外配体文件：
 
 ```bash
 OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
   python scripts/compare_tool_budgets.py \
   --task input/task.json \
   --config config.json \
-  --output-root runs/ablation-tool-budget-pocket \
+  --output-root runs/ablation-tool-budget-pocket-6A \
   --budgets 0 1 2 3 4 5 \
   --coordinate-scope pocket \
-  --pocket-radius 8.0
+  --pocket-radius 6.0
 ```
 
 建议先做单组检查，再跑完整对比：
@@ -105,11 +107,11 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
 ./run_ablation.sh
 ```
 
-默认等价于运行预算 `0 1 2 3 4 5` 的完整坐标实验。常用覆盖方式：
+默认等价于运行预算 `0 1 2 3 4 5` 的 6 Å 口袋坐标实验。常用覆盖方式：
 
 ```bash
 BUDGETS="0 1 2" OUTPUT_ROOT=runs/ablation-smoke ./run_ablation.sh
-COORDINATE_SCOPE=pocket POCKET_RADIUS=8.0 ./run_ablation.sh
+COORDINATE_SCOPE=pocket POCKET_RADIUS=6.0 ./run_ablation.sh
 ```
 
 比较结果时读取各目录的 `result.json` 和根目录的 `summary.json`，重点比较 `status`、`tool_call_count`、`decision_count`、`result.decision`、`result.validation.property_delta`、`result.validation.structure_change` 和 `error`。这项实验只能比较信息预算与工具使用对方案的影响，不能直接比较活性；后续接入 docking/RBFE 时，应在相同候选评估协议下追加结果。

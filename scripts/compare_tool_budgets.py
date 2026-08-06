@@ -50,13 +50,19 @@ def coordinate_text(context: ComplexContext, scope: str, pocket_radius: float) -
         point = conformer.GetAtomPosition(atom.GetIdx())
         ligand_xyz.append((point.x, point.y, point.z))
     selected_serials = {atom.serial for atom in context.ligand_pdb_atoms}
+    pocket_residues = set()
     for atom in context.protein_atoms:
         if any(
             (atom.xyz[0] - x) ** 2 + (atom.xyz[1] - y) ** 2 + (atom.xyz[2] - z) ** 2
             <= pocket_radius**2
             for x, y, z in ligand_xyz
         ):
-            selected_serials.add(atom.serial)
+            pocket_residues.add((atom.chain, atom.residue_name, atom.residue_number))
+    selected_serials.update(
+        atom.serial
+        for atom in context.protein_atoms
+        if (atom.chain, atom.residue_name, atom.residue_number) in pocket_residues
+    )
     selected = []
     for line in lines:
         record = line[:6].strip()
@@ -233,8 +239,8 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path("config.json"))
     parser.add_argument("--output-root", type=Path, default=Path("runs/ablation-tool-budget"))
     parser.add_argument("--budgets", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5])
-    parser.add_argument("--coordinate-scope", choices=["full", "pocket"], default="full")
-    parser.add_argument("--pocket-radius", type=float, default=8.0)
+    parser.add_argument("--coordinate-scope", choices=["full", "pocket"], default="pocket")
+    parser.add_argument("--pocket-radius", type=float, default=6.0)
     args = parser.parse_args()
 
     summaries = []
