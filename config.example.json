@@ -1,0 +1,6 @@
+{
+  "base_url": "https://api.p1-103n1x.com/v1",
+  "model": "gpt-5.6-sol",
+  "api_key_env": "OPENAI_API_KEY",
+  "timeout_seconds": 600
+}

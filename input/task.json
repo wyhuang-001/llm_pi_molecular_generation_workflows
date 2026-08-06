@@ -1,0 +1,11 @@
+{
+  "task": "提高配体对靶点的结合活性",
+  "complex_path": "complex.pdb",
+  "ligand_selector": {
+    "chain": "A",
+    "residue_name": "2A6",
+    "residue_number": 1298
+  },
+  "max_context_rounds": 8,
+  "max_edit_attempts": 4
+}

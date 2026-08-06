@@ -1,0 +1,22 @@
+{
+  "system": "CDK2/cyclin A with NU6094",
+  "pdb_id": "1H1Q",
+  "ligand_code": "2A6",
+  "resolution_angstrom": 2.5,
+  "urls": {
+    "complex": "https://files.rcsb.org/download/1H1Q.pdb",
+    "component": "https://files.rcsb.org/ligands/download/2A6.cif",
+    "ligand_graph": "https://files.rcsb.org/ligands/download/2A6_ideal.sdf"
+  },
+  "files": {
+    "complex.pdb": "21dc4df2252e8ffbd572e906d05603fb50a2ccd338c366123984d1c099e66586",
+    "raw/2A6.cif": "d414c634517e2b34be5ca06d13a5c1bbc7b7876d4e06c93fa03d7c0c7288479d",
+    "raw/2A6_ideal.sdf": "670dd8f0bf899cce00abf07f525d83df29ef67c68fbd02e458eb41ea437a715a",
+    "ligand.sdf": "44c08a57500e778fea2f5eaf99b2ffa300dbf5cba3a908f0413d2e18736be781"
+  },
+  "reference": {
+    "doi": "10.1038/nsb842",
+    "pubmed": "12244298",
+    "note": "NU6094 IC50 is about 970 nM for CDK2/cyclin A in ChEMBL assay CHEMBL662528. The stronger para-sulfamoyl analog NU6102 is held out from the agent input."
+  }
+}
