@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from molecular_agent.editing import apply_substituent, write_sdf
-from scripts.deepseek_client import DeepSeekChatClient
+from scripts.openai_compatible_client import OpenAICompatibleChatClient
 from molecular_agent.structure import ComplexContext
 
 
@@ -171,7 +171,7 @@ def run_budget(
 ) -> dict[str, Any]:
     context = ComplexContext(task_path)
     config_data = json.loads(config_path.read_text(encoding="utf-8"))
-    client = DeepSeekChatClient(config_path, system_prompt=ABLATION_PROMPT)
+    client = OpenAICompatibleChatClient(config_path, system_prompt=ABLATION_PROMPT)
     run_dir = output_root / f"budget-{budget:02d}"
     run_dir.mkdir(parents=True, exist_ok=True)
     coordinates = coordinate_text(context, coordinate_scope, pocket_radius)

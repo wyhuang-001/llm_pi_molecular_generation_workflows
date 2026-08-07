@@ -1,0 +1,6 @@
+{
+  "base_url": "https://llmapi.blsc.cn/v1",
+  "model": "glm-5.2",
+  "api_key_env": "AICLOUD_API_KEY",
+  "timeout_seconds": 600
+}

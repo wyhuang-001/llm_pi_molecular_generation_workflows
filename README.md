@@ -104,7 +104,7 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
   --budgets 0
 ```
 
-也可以直接使用项目根目录的一键脚本运行严格的 DeepSeek 官方 API 对比测试。脚本默认使用 `deepseek-v4-pro`、配体周围 6 Å 口袋坐标和宿主生成的 `ligand_atom_map`，默认从 `$HOME/.deepseek_api_key` 读取纯文本 key，不再要求每次执行前导出环境变量。这里不会把完整 PDB 发送给 LLM。该 key 文件位于项目目录之外，不会被 Git 跟踪：
+也可以直接使用项目根目录的一键脚本运行 AI 智算云官方 API 对比测试。脚本默认使用 `glm-5.2`、配体周围 6 Å 口袋坐标和宿主生成的 `ligand_atom_map`，默认从 `$HOME/.aicloud_api_key` 读取纯文本 key，不再要求每次执行前导出环境变量。这里不会把完整 PDB 发送给 LLM。该 key 文件位于项目目录之外，不会被 Git 跟踪：
 
 ```bash
 ./run_ablation.sh
@@ -113,35 +113,43 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
 如果要使用其他独立 key 文件，把 key 单独写入指定文件，然后运行：
 
 ```bash
-DEEPSEEK_KEY_FILE=.deepseek_api_key ./run_ablation.sh
+AICLOUD_KEY_FILE=/path/to/aicloud.key ./run_ablation.sh
 ```
 
-`.deepseek_api_key` 已加入 `.gitignore`，不会提交到 GitHub。也可以用 `DEEPSEEK_API_KEY` 环境变量临时覆盖文件读取。
-
-默认输出到 `runs/ablation-deepseek-pocket-6A-mapped/`，等价于运行预算 `0 1 2 3 4 5` 的 6 Å 口袋坐标 + 原子映射实验。原子映射是固定输入元数据，不计入工具预算。常用覆盖方式：
+当前默认 key 文件是空模板。填入 key 后验证：
 
 ```bash
-BUDGETS="0 1 2" OUTPUT_ROOT=runs/ablation-deepseek-smoke ./run_ablation.sh
-ABLATION_MODEL=deepseek-v4-pro ./run_ablation.sh
-COORDINATE_SCOPE=pocket POCKET_RADIUS=6.0 OUTPUT_ROOT=runs/ablation-deepseek-pocket-6A-mapped-rerun ./run_ablation.sh
+printf '%s\n' '你的AI智算云API_KEY' > /home/hwy/.aicloud_api_key
+chmod 600 /home/hwy/.aicloud_api_key
+pi --list-models 'aicloud/*'
 ```
 
-测试脚本使用官方 DeepSeek Chat Completions API：
+`.aicloud_api_key` 已加入 `.gitignore`，不会提交到 GitHub。也可以用 `AICLOUD_API_KEY` 环境变量临时覆盖文件读取。
+
+默认输出到 `runs/ablation-aicloud-pocket-6A-mapped/`，等价于运行预算 `0 1 2 3 4 5` 的 6 Å 口袋坐标 + 原子映射实验。原子映射是固定输入元数据，不计入工具预算。常用覆盖方式：
+
+```bash
+BUDGETS="0 1 2" OUTPUT_ROOT=runs/ablation-aicloud-smoke ./run_ablation.sh
+ABLATION_MODEL=glm-5.2 ./run_ablation.sh
+COORDINATE_SCOPE=pocket POCKET_RADIUS=6.0 OUTPUT_ROOT=runs/ablation-aicloud-pocket-6A-mapped-rerun ./run_ablation.sh
+```
+
+测试脚本使用 AI 智算云 OpenAI-compatible Chat Completions API：
 
 ```text
-https://api.deepseek.com/v1/chat/completions
+https://llmapi.blsc.cn/v1/chat/completions
 ```
 
-如果需要切换到兼容 DeepSeek 模型的其他网关，可以只给测试脚本覆盖 URL：
+如果需要切换到其他兼容网关，可以只给测试脚本覆盖 URL：
 
 ```bash
-DEEPSEEK_API_KEY='...' \
-ABLATION_BASE_URL="https://your-deepseek-compatible-endpoint/v1" \
-ABLATION_MODEL=deepseek-v4-pro \
+AICLOUD_API_KEY='...' \
+ABLATION_BASE_URL="https://your-compatible-endpoint/v1" \
+ABLATION_MODEL=glm-5.2 \
 ./run_ablation.sh
 ```
 
-主工作流仍读取 `config.json` 中的模型和端点，不受 `ABLATION_MODEL` 或 `ABLATION_BASE_URL` 影响。
+主工作流仍读取 `config.json` 中的模型和端点，不受 `ABLATION_MODEL` 或 `ABLATION_BASE_URL` 影响。AI 智算云 key 未填入前，pi 不会显示 `aicloud/glm-5.2` 为可用模型；填入后重新打开 pi 或重新执行模型列表即可。
 
 严格对比结果时读取各目录的 `result.json` 和根目录的 `summary.json`。每组的 `input.json` 还保存了固定的 `ligand_atom_map`，可检查 `rdkit_index`、PDB serial 和配体原子名的映射。重点比较 `status`、`tool_call_count`、`decision_count`、`result.decision`、`result.validation.property_delta`、`result.validation.structure_change` 和 `error`。这项实验只能比较信息预算与工具使用对方案的影响，不能直接比较活性；后续接入 docking/RBFE 时，应在相同候选评估协议下追加结果。
 

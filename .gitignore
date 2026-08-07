@@ -1,5 +1,6 @@
 config.json
 .deepseek_api_key
+.aicloud_api_key
 runs/*
 !runs/.gitkeep
 __pycache__/

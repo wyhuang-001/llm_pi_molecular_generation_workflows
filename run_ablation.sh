@@ -8,22 +8,22 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'HELP'
 Usage: ./run_ablation.sh
 
-Runs the strict mapped-pocket-coordinate DeepSeek tool-budget experiment for budgets 0..5.
+Runs the strict mapped-pocket-coordinate AI Cloud tool-budget experiment for budgets 0..5.
 Override with TASK_PATH, CONFIG_PATH, OUTPUT_ROOT, COORDINATE_SCOPE,
-POCKET_RADIUS, BUDGETS, ABLATION_MODEL, ABLATION_BASE_URL, or DEEPSEEK_KEY_FILE environment variables.
+POCKET_RADIUS, BUDGETS, ABLATION_MODEL, ABLATION_BASE_URL, or AICLOUD_KEY_FILE environment variables.
 HELP
   exit 0
 fi
 
 TASK_PATH="${TASK_PATH:-input/task.json}"
-CONFIG_PATH="${CONFIG_PATH:-config.json}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-deepseek-pocket-6A-mapped}"
+CONFIG_PATH="${CONFIG_PATH:-config.aicloud.json}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-aicloud-pocket-6A-mapped}"
 COORDINATE_SCOPE="${COORDINATE_SCOPE:-pocket}"
 POCKET_RADIUS="${POCKET_RADIUS:-6.0}"
 BUDGETS="${BUDGETS:-0 1 2 3 4 5}"
-ABLATION_MODEL="${ABLATION_MODEL:-deepseek-v4-pro}"
-ABLATION_BASE_URL="${ABLATION_BASE_URL:-https://api.deepseek.com/v1}"
-DEEPSEEK_KEY_FILE="${DEEPSEEK_KEY_FILE:-$HOME/.deepseek_api_key}"
+ABLATION_MODEL="${ABLATION_MODEL:-glm-5.2}"
+ABLATION_BASE_URL="${ABLATION_BASE_URL:-https://llmapi.blsc.cn/v1}"
+AICLOUD_KEY_FILE="${AICLOUD_KEY_FILE:-$HOME/.aicloud_api_key}"
 
 if ! command -v mamba >/dev/null 2>&1; then
   echo "error: mamba was not found in PATH" >&2
@@ -40,12 +40,12 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
   exit 1
 fi
 
-if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
-  if [[ ! -f "$DEEPSEEK_KEY_FILE" ]]; then
-    echo "error: DeepSeek key file not found: $DEEPSEEK_KEY_FILE" >&2
+if [[ -z "${AICLOUD_API_KEY:-}" ]]; then
+  if [[ ! -f "$AICLOUD_KEY_FILE" ]]; then
+    echo "error: AI Cloud key file not found: $AICLOUD_KEY_FILE" >&2
     exit 1
   fi
-  DEEPSEEK_API_KEY="$(python3 - "$DEEPSEEK_KEY_FILE" <<'PY'
+  AICLOUD_API_KEY="$(python3 - "$AICLOUD_KEY_FILE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -54,15 +54,15 @@ path = Path(sys.argv[1])
 text = path.read_text(encoding="utf-8").strip()
 if path.suffix == ".json":
     data = json.loads(text)
-    key = data.get("deepseek", {}).get("key", "")
+    key = data.get("aicloud", {}).get("key", "")
 else:
     key = text
 if not key:
-    raise SystemExit("no DeepSeek key found in key file")
+    raise SystemExit("no AI Cloud key found in key file")
 print(key)
 PY
   )"
-  export DEEPSEEK_API_KEY
+  export AICLOUD_API_KEY
 fi
 
 read -r -a BUDGET_ARGS <<< "$BUDGETS"
@@ -83,14 +83,14 @@ with open(source, encoding="utf-8") as handle:
 config.update({
     "model": model,
     "base_url": base_url.rstrip("/"),
-    "api_key_env": "DEEPSEEK_API_KEY",
+    "api_key_env": "AICLOUD_API_KEY",
 })
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(config, handle, ensure_ascii=False, indent=2)
     handle.write("\n")
 PY
 
-printf '%s\n' "Running independent LLM tool-budget ablation"
+printf '%s\n' "Running independent AI Cloud LLM tool-budget ablation"
 printf '  model:            %s\n' "$ABLATION_MODEL"
 printf '  base URL:         %s\n' "${ABLATION_BASE_URL:-from config}"
 printf '  task:             %s\n' "$TASK_PATH"
