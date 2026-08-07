@@ -22,7 +22,7 @@ COORDINATE_SCOPE="${COORDINATE_SCOPE:-pocket}"
 POCKET_RADIUS="${POCKET_RADIUS:-6.0}"
 BUDGETS="${BUDGETS:-0 1 2 3 4 5}"
 ABLATION_MODEL="${ABLATION_MODEL:-deepseek-v4-pro}"
-ABLATION_BASE_URL="${ABLATION_BASE_URL:-}"
+ABLATION_BASE_URL="${ABLATION_BASE_URL:-https://api.deepseek.com/v1}"
 
 if ! command -v mamba >/dev/null 2>&1; then
   echo "error: mamba was not found in PATH" >&2
@@ -39,27 +39,10 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
   exit 1
 fi
 
-# Prefer an explicitly exported key. Otherwise reuse pi's local key only for this process.
-if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  AUTH_PATH="${PI_AUTH_PATH:-$HOME/.pi/agent/auth.json}"
-  if [[ ! -f "$AUTH_PATH" ]]; then
-    echo "error: OPENAI_API_KEY is unset and auth file was not found: $AUTH_PATH" >&2
-    exit 1
-  fi
-  OPENAI_API_KEY="$(python3 - "$AUTH_PATH" <<'PY'
-import json
-import sys
-
-path = sys.argv[1]
-with open(path, encoding="utf-8") as handle:
-    auth = json.load(handle)
-key = auth.get("openai", {}).get("key", "")
-if not key:
-    raise SystemExit("no openai.key found in pi auth file")
-print(key)
-PY
-  )"
-  export OPENAI_API_KEY
+if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
+  echo "error: DEEPSEEK_API_KEY is not set" >&2
+  echo "Export your official DeepSeek API key before running this ablation." >&2
+  exit 1
 fi
 
 read -r -a BUDGET_ARGS <<< "$BUDGETS"
@@ -77,9 +60,11 @@ import sys
 source, target, model, base_url = sys.argv[1:]
 with open(source, encoding="utf-8") as handle:
     config = json.load(handle)
-config["model"] = model
-if base_url:
-    config["base_url"] = base_url.rstrip("/")
+config.update({
+    "model": model,
+    "base_url": base_url.rstrip("/"),
+    "api_key_env": "DEEPSEEK_API_KEY",
+})
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(config, handle, ensure_ascii=False, indent=2)
     handle.write("\n")

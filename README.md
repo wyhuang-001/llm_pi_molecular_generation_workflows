@@ -104,7 +104,7 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
   --budgets 0
 ```
 
-也可以直接使用项目根目录的一键脚本运行 DeepSeek 测试。它会优先使用已导出的 `OPENAI_API_KEY`；如果未导出，则临时读取 `$HOME/.pi/agent/auth.json` 中的 key，不写入项目文件。脚本默认使用 `deepseek-v4-pro`，并通过临时配置副本传递模型和可选端点，不修改主 `config.json`：
+也可以直接使用项目根目录的一键脚本运行 DeepSeek 官方 API 测试。运行前需要导出你自己的 `DEEPSEEK_API_KEY`；脚本默认使用 `deepseek-v4-pro` 和官方 `https://api.deepseek.com/v1`，通过临时配置副本传递模型和端点，不修改主 `config.json`：
 
 ```bash
 ./run_ablation.sh
@@ -118,9 +118,16 @@ ABLATION_MODEL=deepseek-v4-pro ./run_ablation.sh
 COORDINATE_SCOPE=pocket POCKET_RADIUS=6.0 ./run_ablation.sh
 ```
 
-模型名称必须是当前第三方 OpenAI-compatible 端点支持的模型 ID。当前 `config.json` 中的 `https://api.p1-103n1x.com/v1` 未配置 `deepseek-v4-pro`，该端点会返回 HTTP 404 `model_not_found`。拿到支持该模型的端点后，只给测试脚本覆盖 URL：
+测试脚本使用官方 DeepSeek Chat Completions API：
+
+```text
+https://api.deepseek.com/v1/chat/completions
+```
+
+如果需要切换到兼容 DeepSeek 模型的其他网关，可以只给测试脚本覆盖 URL：
 
 ```bash
+DEEPSEEK_API_KEY='...' \
 ABLATION_BASE_URL="https://your-deepseek-compatible-endpoint/v1" \
 ABLATION_MODEL=deepseek-v4-pro \
 ./run_ablation.sh
