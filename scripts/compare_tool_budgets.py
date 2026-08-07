@@ -262,11 +262,25 @@ def run_budget(
                 )
                 candidate_path = run_dir / "candidate.sdf"
                 write_sdf(edit_result, candidate_path, name=f"budget-{budget:02d}")
-                status = "candidate_accepted" if edit_result.report["status"] == "accepted" else "candidate_rejected"
+                status = (
+                    "candidate_geometry_accepted"
+                    if edit_result.report["status"] == "accepted"
+                    else "candidate_geometry_rejected"
+                )
                 result = {
                     "decision": final_decision,
                     "validation": edit_result.report,
                     "candidate_path": str(candidate_path),
+                    "evaluation_scope": {
+                        "site_evidence": "not_verified_by_ablation_gate",
+                        "affinity": "not_evaluated",
+                        "docking": "not_configured",
+                        "fep": "not_configured",
+                        "meaning": (
+                            "Acceptance only means RDKit construction and the rigid-protein "
+                            "clash threshold passed; it is not a binding or activity result."
+                        ),
+                    },
                 }
             except Exception as exc:
                 status = "edit_validation_failed"

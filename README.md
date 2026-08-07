@@ -104,7 +104,7 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
   --budgets 0
 ```
 
-也可以直接使用项目根目录的一键脚本运行 AI 智算云官方 API 对比测试。脚本默认使用 `glm-5.2`、配体周围 6 Å 口袋坐标和宿主生成的 `ligand_atom_map`，默认从 `$HOME/.aicloud_api_key` 读取纯文本 key，不再要求每次执行前导出环境变量。这里不会把完整 PDB 发送给 LLM。该 key 文件位于项目目录之外，不会被 Git 跟踪：
+也可以直接使用项目根目录的一键脚本运行 AI 智算云官方 API 对比测试。脚本默认使用 `GLM-5.2`、配体周围 6 Å 口袋坐标和宿主生成的 `ligand_atom_map`，默认从 `$HOME/.aicloud_api_key` 读取纯文本 key，不再要求每次执行前导出环境变量。这里不会把完整 PDB 发送给 LLM。该 key 文件位于项目目录之外，不会被 Git 跟踪：
 
 ```bash
 ./run_ablation.sh
@@ -130,7 +130,7 @@ pi --list-models 'aicloud/*'
 
 ```bash
 BUDGETS="0 1 2" OUTPUT_ROOT=runs/ablation-aicloud-smoke ./run_ablation.sh
-ABLATION_MODEL=glm-5.2 ./run_ablation.sh
+ABLATION_MODEL=GLM-5.2 ./run_ablation.sh
 COORDINATE_SCOPE=pocket POCKET_RADIUS=6.0 OUTPUT_ROOT=runs/ablation-aicloud-pocket-6A-mapped-rerun ./run_ablation.sh
 ```
 
@@ -145,11 +145,11 @@ https://llmapi.blsc.cn/v1/chat/completions
 ```bash
 AICLOUD_API_KEY='...' \
 ABLATION_BASE_URL="https://your-compatible-endpoint/v1" \
-ABLATION_MODEL=glm-5.2 \
+ABLATION_MODEL=GLM-5.2 \
 ./run_ablation.sh
 ```
 
-主工作流仍读取 `config.json` 中的模型和端点，不受 `ABLATION_MODEL` 或 `ABLATION_BASE_URL` 影响。AI 智算云 key 未填入前，pi 不会显示 `aicloud/glm-5.2` 为可用模型；填入后重新打开 pi 或重新执行模型列表即可。
+主工作流仍读取 `config.json` 中的模型和端点，不受 `ABLATION_MODEL` 或 `ABLATION_BASE_URL` 影响。AI 智算云 key 未填入前，pi 不会显示 `aicloud/GLM-5.2` 为可用模型；填入后重新打开 pi 或重新执行模型列表即可。
 
 严格对比结果时读取各目录的 `result.json` 和根目录的 `summary.json`。每组的 `input.json` 还保存了固定的 `ligand_atom_map`，可检查 `rdkit_index`、PDB serial 和配体原子名的映射。重点比较 `status`、`tool_call_count`、`decision_count`、`result.decision`、`result.validation.property_delta`、`result.validation.structure_change` 和 `error`。这项实验只能比较信息预算与工具使用对方案的影响，不能直接比较活性；后续接入 docking/RBFE 时，应在相同候选评估协议下追加结果。
 

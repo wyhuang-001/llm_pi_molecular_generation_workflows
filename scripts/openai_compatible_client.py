@@ -49,7 +49,9 @@ class OpenAICompatibleChatClient:
             ]
             result = subprocess.run(command, capture_output=True, text=True)
             if result.returncode != 0:
-                detail = (result.stderr or response_path.read_text(errors="replace")).strip()
+                response_detail = response_path.read_text(errors="replace").strip()
+                stderr_detail = result.stderr.strip()
+                detail = response_detail or stderr_detail
                 raise RuntimeError(f"Chat API curl request failed ({result.returncode}): {detail[:1500]}")
             try:
                 data = json.loads(response_path.read_text(encoding="utf-8"))
