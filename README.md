@@ -104,7 +104,7 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
   --budgets 0
 ```
 
-也可以直接使用项目根目录的一键脚本运行 DeepSeek 官方 API 测试。脚本默认使用 `deepseek-v4-pro` 和官方 `https://api.deepseek.com/v1`，默认从 `$HOME/.deepseek_api_key` 读取纯文本 key，不再要求每次执行前导出环境变量。该文件位于项目目录之外，不会被 Git 跟踪：
+也可以直接使用项目根目录的一键脚本运行严格的 DeepSeek 官方 API 对比测试。脚本默认使用 `deepseek-v4-pro`、配体周围 6 Å 口袋坐标和宿主生成的 `ligand_atom_map`，默认从 `$HOME/.deepseek_api_key` 读取纯文本 key，不再要求每次执行前导出环境变量。这里不会把完整 PDB 发送给 LLM。该 key 文件位于项目目录之外，不会被 Git 跟踪：
 
 ```bash
 ./run_ablation.sh
@@ -118,12 +118,12 @@ DEEPSEEK_KEY_FILE=.deepseek_api_key ./run_ablation.sh
 
 `.deepseek_api_key` 已加入 `.gitignore`，不会提交到 GitHub。也可以用 `DEEPSEEK_API_KEY` 环境变量临时覆盖文件读取。
 
-默认输出到 `runs/ablation-deepseek-pocket-6A/`，等价于运行预算 `0 1 2 3 4 5` 的 6 Å 口袋坐标实验。常用覆盖方式：
+默认输出到 `runs/ablation-deepseek-pocket-6A-mapped/`，等价于运行预算 `0 1 2 3 4 5` 的 6 Å 口袋坐标 + 原子映射实验。原子映射是固定输入元数据，不计入工具预算。常用覆盖方式：
 
 ```bash
 BUDGETS="0 1 2" OUTPUT_ROOT=runs/ablation-deepseek-smoke ./run_ablation.sh
 ABLATION_MODEL=deepseek-v4-pro ./run_ablation.sh
-COORDINATE_SCOPE=pocket POCKET_RADIUS=6.0 ./run_ablation.sh
+COORDINATE_SCOPE=pocket POCKET_RADIUS=6.0 OUTPUT_ROOT=runs/ablation-deepseek-pocket-6A-mapped-rerun ./run_ablation.sh
 ```
 
 测试脚本使用官方 DeepSeek Chat Completions API：
@@ -143,7 +143,7 @@ ABLATION_MODEL=deepseek-v4-pro \
 
 主工作流仍读取 `config.json` 中的模型和端点，不受 `ABLATION_MODEL` 或 `ABLATION_BASE_URL` 影响。
 
-比较结果时读取各目录的 `result.json` 和根目录的 `summary.json`，重点比较 `status`、`tool_call_count`、`decision_count`、`result.decision`、`result.validation.property_delta`、`result.validation.structure_change` 和 `error`。这项实验只能比较信息预算与工具使用对方案的影响，不能直接比较活性；后续接入 docking/RBFE 时，应在相同候选评估协议下追加结果。
+严格对比结果时读取各目录的 `result.json` 和根目录的 `summary.json`。每组的 `input.json` 还保存了固定的 `ligand_atom_map`，可检查 `rdkit_index`、PDB serial 和配体原子名的映射。重点比较 `status`、`tool_call_count`、`decision_count`、`result.decision`、`result.validation.property_delta`、`result.validation.structure_change` 和 `error`。这项实验只能比较信息预算与工具使用对方案的影响，不能直接比较活性；后续接入 docking/RBFE 时，应在相同候选评估协议下追加结果。
 
 ## 测试
 

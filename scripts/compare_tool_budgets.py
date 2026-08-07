@@ -30,11 +30,56 @@ When asked to return READY, include all required fields and propose one small co
 with exactly one mapped dummy atom [*:1]. Preserve the scaffold, formal charge, and stereochemistry
 where possible. A design is only a hypothesis; deterministic RDKit and rigid-protein checks decide
 whether a candidate can be written. Never invent an affinity improvement.
+
+The host provides ligand_atom_map as fixed input metadata. When choosing edit_atom_index,
+use the zero-based rdkit_index from that map. Never use PDB serial numbers, protein atom
+serials, or residue numbers as edit_atom_index.
 """
 
 
 def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ligand_atom_map(context: ComplexContext) -> list[dict[str, Any]]:
+    conformer = context.ligand.GetConformer()
+    available = set(range(len(context.ligand_pdb_atoms)))
+    rows = []
+    for rdkit_atom in context.ligand.GetAtoms():
+        point = conformer.GetAtomPosition(rdkit_atom.GetIdx())
+        candidates = []
+        for pdb_index in available:
+            pdb_atom = context.ligand_pdb_atoms[pdb_index]
+            if pdb_atom.element != rdkit_atom.GetSymbol().upper():
+                continue
+            squared_distance = (
+                (pdb_atom.xyz[0] - point.x) ** 2
+                + (pdb_atom.xyz[1] - point.y) ** 2
+                + (pdb_atom.xyz[2] - point.z) ** 2
+            )
+            candidates.append((squared_distance, pdb_index, pdb_atom))
+        if not candidates:
+            raise ValueError(f"No PDB coordinate match for RDKit ligand atom {rdkit_atom.GetIdx()}")
+        squared_distance, pdb_index, pdb_atom = min(candidates)
+        if squared_distance > 1e-6:
+            raise ValueError(
+                f"PDB/RDKit coordinate mismatch for ligand atom {rdkit_atom.GetIdx()}: "
+                f"{squared_distance ** 0.5:.4f} A"
+            )
+        available.remove(pdb_index)
+        rows.append({
+            "rdkit_index": rdkit_atom.GetIdx(),
+            "pdb_serial": pdb_atom.serial,
+            "pdb_atom_name": pdb_atom.name,
+            "element": rdkit_atom.GetSymbol(),
+            "aromatic": rdkit_atom.GetIsAromatic(),
+            "replaceable_hydrogens": rdkit_atom.GetTotalNumHs(),
+            "xyz": [round(point.x, 3), round(point.y, 3), round(point.z, 3)],
+            "bonded_rdkit_indices": sorted(neighbor.GetIdx() for neighbor in rdkit_atom.GetNeighbors()),
+        })
+    if available:
+        raise ValueError("Some ligand PDB atoms were not mapped to the reconstructed ligand")
+    return rows
 
 
 def coordinate_text(context: ComplexContext, scope: str, pocket_radius: float) -> str:
@@ -130,11 +175,13 @@ def run_budget(
     run_dir = output_root / f"budget-{budget:02d}"
     run_dir.mkdir(parents=True, exist_ok=True)
     coordinates = coordinate_text(context, coordinate_scope, pocket_radius)
+    atom_map = ligand_atom_map(context)
     state: dict[str, Any] = {
         "budget": budget,
         "model": config_data.get("model"),
         "coordinate_scope": coordinate_scope,
         "coordinate_chars": len(coordinates),
+        "ligand_atom_map_count": len(atom_map),
         "tool_calls": [],
         "decisions": [],
     }
@@ -143,6 +190,7 @@ def run_budget(
         "coordinate_scope": coordinate_scope,
         "coordinate_chars": len(coordinates),
         "complex_path": str(context.complex_path),
+        "ligand_atom_map": atom_map,
         "coordinates": coordinates,
     })
     from molecular_agent.tools import ToolRegistry
@@ -164,7 +212,14 @@ def run_budget(
             )
             payload = base_payload(
                 context, coordinates, catalog, budget, state,
-                extra={"instruction": instruction},
+                extra={
+                    "instruction": instruction,
+                    "ligand_atom_map": atom_map,
+                    "metadata_contract": (
+                        "The ligand_atom_map is fixed host metadata, not a tool result and not part "
+                        "of the tool budget. Use rdkit_index for edit_atom_index."
+                    ),
+                },
             )
             decision = client.complete_json(payload)
             state["decisions"].append(decision)

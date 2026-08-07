@@ -8,7 +8,7 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'HELP'
 Usage: ./run_ablation.sh
 
-Runs the independent DeepSeek tool-budget experiment for budgets 0..5.
+Runs the strict mapped-pocket-coordinate DeepSeek tool-budget experiment for budgets 0..5.
 Override with TASK_PATH, CONFIG_PATH, OUTPUT_ROOT, COORDINATE_SCOPE,
 POCKET_RADIUS, BUDGETS, ABLATION_MODEL, ABLATION_BASE_URL, or DEEPSEEK_KEY_FILE environment variables.
 HELP
@@ -17,7 +17,7 @@ fi
 
 TASK_PATH="${TASK_PATH:-input/task.json}"
 CONFIG_PATH="${CONFIG_PATH:-config.json}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-deepseek-pocket-6A}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-deepseek-pocket-6A-mapped}"
 COORDINATE_SCOPE="${COORDINATE_SCOPE:-pocket}"
 POCKET_RADIUS="${POCKET_RADIUS:-6.0}"
 BUDGETS="${BUDGETS:-0 1 2 3 4 5}"

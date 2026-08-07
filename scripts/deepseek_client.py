@@ -29,6 +29,7 @@ class DeepSeekChatClient:
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
             "response_format": {"type": "json_object"},
+            "temperature": 0,
         }
         with tempfile.TemporaryDirectory(prefix="simple-agent-deepseek-") as tmp:
             request_path = Path(tmp) / "request.json"
