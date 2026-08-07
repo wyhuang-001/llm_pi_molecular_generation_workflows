@@ -10,7 +10,7 @@ Usage: ./run_ablation.sh
 
 Runs the independent DeepSeek tool-budget experiment for budgets 0..5.
 Override with TASK_PATH, CONFIG_PATH, OUTPUT_ROOT, COORDINATE_SCOPE,
-POCKET_RADIUS, BUDGETS, or ABLATION_MODEL environment variables.
+POCKET_RADIUS, BUDGETS, ABLATION_MODEL, or ABLATION_BASE_URL environment variables.
 HELP
   exit 0
 fi
@@ -22,6 +22,7 @@ COORDINATE_SCOPE="${COORDINATE_SCOPE:-pocket}"
 POCKET_RADIUS="${POCKET_RADIUS:-6.0}"
 BUDGETS="${BUDGETS:-0 1 2 3 4 5}"
 ABLATION_MODEL="${ABLATION_MODEL:-deepseek-v4-pro}"
+ABLATION_BASE_URL="${ABLATION_BASE_URL:-}"
 
 if ! command -v mamba >/dev/null 2>&1; then
   echo "error: mamba was not found in PATH" >&2
@@ -69,14 +70,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-python3 - "$CONFIG_PATH" "$TEMP_CONFIG" "$ABLATION_MODEL" <<'PY'
+python3 - "$CONFIG_PATH" "$TEMP_CONFIG" "$ABLATION_MODEL" "$ABLATION_BASE_URL" <<'PY'
 import json
 import sys
 
-source, target, model = sys.argv[1:]
+source, target, model, base_url = sys.argv[1:]
 with open(source, encoding="utf-8") as handle:
     config = json.load(handle)
 config["model"] = model
+if base_url:
+    config["base_url"] = base_url.rstrip("/")
 with open(target, "w", encoding="utf-8") as handle:
     json.dump(config, handle, ensure_ascii=False, indent=2)
     handle.write("\n")
@@ -84,6 +87,7 @@ PY
 
 printf '%s\n' "Running independent LLM tool-budget ablation"
 printf '  model:            %s\n' "$ABLATION_MODEL"
+printf '  base URL:         %s\n' "${ABLATION_BASE_URL:-from config}"
 printf '  task:             %s\n' "$TASK_PATH"
 printf '  config source:    %s\n' "$CONFIG_PATH"
 printf '  output:           %s\n' "$OUTPUT_ROOT"

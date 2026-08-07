@@ -104,7 +104,7 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
   --budgets 0
 ```
 
-也可以直接使用项目根目录的一键脚本运行 DeepSeek 测试。它会优先使用已导出的 `OPENAI_API_KEY`；如果未导出，则临时读取 `$HOME/.pi/agent/auth.json` 中的 key，不写入项目文件。脚本默认使用 `deepseek-v4-pro`，并通过临时配置副本传递模型，不修改主 `config.json`：
+也可以直接使用项目根目录的一键脚本运行 DeepSeek 测试。它会优先使用已导出的 `OPENAI_API_KEY`；如果未导出，则临时读取 `$HOME/.pi/agent/auth.json` 中的 key，不写入项目文件。脚本默认使用 `deepseek-v4-pro`，并通过临时配置副本传递模型和可选端点，不修改主 `config.json`：
 
 ```bash
 ./run_ablation.sh
@@ -118,7 +118,15 @@ ABLATION_MODEL=deepseek-v4-pro ./run_ablation.sh
 COORDINATE_SCOPE=pocket POCKET_RADIUS=6.0 ./run_ablation.sh
 ```
 
-模型名称必须是当前第三方 OpenAI-compatible 端点支持的模型 ID。主工作流仍读取 `config.json` 中的模型，不受 `ABLATION_MODEL` 影响。
+模型名称必须是当前第三方 OpenAI-compatible 端点支持的模型 ID。当前 `config.json` 中的 `https://api.p1-103n1x.com/v1` 未配置 `deepseek-v4-pro`，该端点会返回 HTTP 404 `model_not_found`。拿到支持该模型的端点后，只给测试脚本覆盖 URL：
+
+```bash
+ABLATION_BASE_URL="https://your-deepseek-compatible-endpoint/v1" \
+ABLATION_MODEL=deepseek-v4-pro \
+./run_ablation.sh
+```
+
+主工作流仍读取 `config.json` 中的模型和端点，不受 `ABLATION_MODEL` 或 `ABLATION_BASE_URL` 影响。
 
 比较结果时读取各目录的 `result.json` 和根目录的 `summary.json`，重点比较 `status`、`tool_call_count`、`decision_count`、`result.decision`、`result.validation.property_delta`、`result.validation.structure_change` 和 `error`。这项实验只能比较信息预算与工具使用对方案的影响，不能直接比较活性；后续接入 docking/RBFE 时，应在相同候选评估协议下追加结果。
 
