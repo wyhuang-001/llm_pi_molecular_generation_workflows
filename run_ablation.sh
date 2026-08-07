@@ -21,7 +21,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-deepseek-pocket-6A}"
 COORDINATE_SCOPE="${COORDINATE_SCOPE:-pocket}"
 POCKET_RADIUS="${POCKET_RADIUS:-6.0}"
 BUDGETS="${BUDGETS:-0 1 2 3 4 5}"
-ABLATION_MODEL="${ABLATION_MODEL:-deepseek-chat}"
+ABLATION_MODEL="${ABLATION_MODEL:-deepseek-v4-pro}"
 
 if ! command -v mamba >/dev/null 2>&1; then
   echo "error: mamba was not found in PATH" >&2

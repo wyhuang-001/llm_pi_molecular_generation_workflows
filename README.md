@@ -104,7 +104,7 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
   --budgets 0
 ```
 
-也可以直接使用项目根目录的一键脚本运行 DeepSeek 测试。它会优先使用已导出的 `OPENAI_API_KEY`；如果未导出，则临时读取 `$HOME/.pi/agent/auth.json` 中的 key，不写入项目文件。脚本默认使用 `deepseek-chat`，并通过临时配置副本传递模型，不修改主 `config.json`：
+也可以直接使用项目根目录的一键脚本运行 DeepSeek 测试。它会优先使用已导出的 `OPENAI_API_KEY`；如果未导出，则临时读取 `$HOME/.pi/agent/auth.json` 中的 key，不写入项目文件。脚本默认使用 `deepseek-v4-pro`，并通过临时配置副本传递模型，不修改主 `config.json`：
 
 ```bash
 ./run_ablation.sh
@@ -114,7 +114,7 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
 
 ```bash
 BUDGETS="0 1 2" OUTPUT_ROOT=runs/ablation-deepseek-smoke ./run_ablation.sh
-ABLATION_MODEL=deepseek-reasoner ./run_ablation.sh
+ABLATION_MODEL=deepseek-v4-pro ./run_ablation.sh
 COORDINATE_SCOPE=pocket POCKET_RADIUS=6.0 ./run_ablation.sh
 ```
 
