@@ -10,7 +10,7 @@ Usage: ./run_ablation.sh
 
 Runs the independent DeepSeek tool-budget experiment for budgets 0..5.
 Override with TASK_PATH, CONFIG_PATH, OUTPUT_ROOT, COORDINATE_SCOPE,
-POCKET_RADIUS, BUDGETS, ABLATION_MODEL, or ABLATION_BASE_URL environment variables.
+POCKET_RADIUS, BUDGETS, ABLATION_MODEL, ABLATION_BASE_URL, or DEEPSEEK_KEY_FILE environment variables.
 HELP
   exit 0
 fi
@@ -23,6 +23,7 @@ POCKET_RADIUS="${POCKET_RADIUS:-6.0}"
 BUDGETS="${BUDGETS:-0 1 2 3 4 5}"
 ABLATION_MODEL="${ABLATION_MODEL:-deepseek-v4-pro}"
 ABLATION_BASE_URL="${ABLATION_BASE_URL:-https://api.deepseek.com/v1}"
+DEEPSEEK_KEY_FILE="${DEEPSEEK_KEY_FILE:-$HOME/.deepseek_api_key}"
 
 if ! command -v mamba >/dev/null 2>&1; then
   echo "error: mamba was not found in PATH" >&2
@@ -40,9 +41,28 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 fi
 
 if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
-  echo "error: DEEPSEEK_API_KEY is not set" >&2
-  echo "Export your official DeepSeek API key before running this ablation." >&2
-  exit 1
+  if [[ ! -f "$DEEPSEEK_KEY_FILE" ]]; then
+    echo "error: DeepSeek key file not found: $DEEPSEEK_KEY_FILE" >&2
+    exit 1
+  fi
+  DEEPSEEK_API_KEY="$(python3 - "$DEEPSEEK_KEY_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8").strip()
+if path.suffix == ".json":
+    data = json.loads(text)
+    key = data.get("deepseek", {}).get("key", "")
+else:
+    key = text
+if not key:
+    raise SystemExit("no DeepSeek key found in key file")
+print(key)
+PY
+  )"
+  export DEEPSEEK_API_KEY
 fi
 
 read -r -a BUDGET_ARGS <<< "$BUDGETS"

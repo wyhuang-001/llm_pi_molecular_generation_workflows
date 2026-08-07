@@ -104,11 +104,19 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
   --budgets 0
 ```
 
-也可以直接使用项目根目录的一键脚本运行 DeepSeek 官方 API 测试。运行前需要导出你自己的 `DEEPSEEK_API_KEY`；脚本默认使用 `deepseek-v4-pro` 和官方 `https://api.deepseek.com/v1`，通过临时配置副本传递模型和端点，不修改主 `config.json`：
+也可以直接使用项目根目录的一键脚本运行 DeepSeek 官方 API 测试。脚本默认使用 `deepseek-v4-pro` 和官方 `https://api.deepseek.com/v1`，默认从 `$HOME/.deepseek_api_key` 读取纯文本 key，不再要求每次执行前导出环境变量。该文件位于项目目录之外，不会被 Git 跟踪：
 
 ```bash
 ./run_ablation.sh
 ```
+
+如果要使用其他独立 key 文件，把 key 单独写入指定文件，然后运行：
+
+```bash
+DEEPSEEK_KEY_FILE=.deepseek_api_key ./run_ablation.sh
+```
+
+`.deepseek_api_key` 已加入 `.gitignore`，不会提交到 GitHub。也可以用 `DEEPSEEK_API_KEY` 环境变量临时覆盖文件读取。
 
 默认输出到 `runs/ablation-deepseek-pocket-6A/`，等价于运行预算 `0 1 2 3 4 5` 的 6 Å 口袋坐标实验。常用覆盖方式：
 
