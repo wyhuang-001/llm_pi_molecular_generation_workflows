@@ -8,9 +8,10 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'HELP'
 Usage: ./run_ablation.sh
 
-Runs the strict mapped-pocket-coordinate AI Cloud tool-budget experiment for budgets 0..5.
-Override with TASK_PATH, CONFIG_PATH, OUTPUT_ROOT, COORDINATE_SCOPE,
-POCKET_RADIUS, BUDGETS, ABLATION_MODEL, ABLATION_BASE_URL, or AICLOUD_KEY_FILE environment variables.
+Runs the mapped-pocket-coordinate AI Cloud ablation for budgets 0..5, then a final
+budget-06 verification run with unlimited tool calls and a strict site-evidence gate.
+Override with TASK_PATH, CONFIG_PATH, OUTPUT_ROOT, COORDINATE_SCOPE, POCKET_RADIUS,
+BUDGETS, FINAL_BUDGET, ABLATION_MODEL, ABLATION_BASE_URL, or AICLOUD_KEY_FILE environment variables.
 HELP
   exit 0
 fi
@@ -21,6 +22,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-aicloud-pocket-6A-mapped-01}"
 COORDINATE_SCOPE="${COORDINATE_SCOPE:-pocket}"
 POCKET_RADIUS="${POCKET_RADIUS:-6.0}"
 BUDGETS="${BUDGETS:-0 1 2 3 4 5}"
+FINAL_BUDGET="${FINAL_BUDGET:-6}"
 ABLATION_MODEL="${ABLATION_MODEL:-GLM-5.2}"
 ABLATION_BASE_URL="${ABLATION_BASE_URL:-https://llmapi.blsc.cn/v1}"
 AICLOUD_KEY_FILE="${AICLOUD_KEY_FILE:-$HOME/.aicloud_api_key}"
@@ -107,6 +109,7 @@ mamba run -n molecular-agent \
   --output-root "$OUTPUT_ROOT" \
   --budgets "${BUDGET_ARGS[@]}" \
   --coordinate-scope "$COORDINATE_SCOPE" \
-  --pocket-radius "$POCKET_RADIUS"
+  --pocket-radius "$POCKET_RADIUS" \
+  --unbounded-budget "$FINAL_BUDGET"
 
 printf '\nResults written to: %s\n' "$SCRIPT_DIR/$OUTPUT_ROOT"

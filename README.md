@@ -66,7 +66,7 @@ mamba run -n molecular-agent python -m molecular_agent.cli \
 
 该测试默认发送：配体坐标 + 配体周围 `6.0 Å` 内命中的蛋白残基的完整坐标。这样可以避免在每组实验请求中重复发送整个大型 PDB。完整复合物坐标仍可用 `--coordinate-scope full` 显式启用。
 
-预算 `k` 的含义是：该组最多执行 `k` 次工具调用。预算耗尽后，脚本要求 LLM 直接返回 `READY`；如果模型仍要求工具，该组记录为未完成，不会超预算执行。默认严格模式还复用主工作流的最终位点证据门：`READY` 选择的同一个 `edit_atom_index` 必须同时有 `get_atom_environment` 和 `check_growth_space` 记录，否则状态为 `site_evidence_gate_failed`，不生成候选。每组保存输入坐标、LLM 决策、工具结果、最终改造计划、候选 SDF、RDKit/刚性碰撞验证和 `result.json`。其中 `budget-00` 是只给坐标、不调用工具的直接输入基线，因此在严格模式下预期会因缺少位点证据而阻断。
+预算 `k` 的含义是：`budget-00` 到 `budget-05` 各组最多执行 `k` 次工具调用。预算耗尽后，脚本要求 LLM 直接返回 `READY`；如果模型仍要求工具，该组记录为未完成，不会超预算执行。这六组保持原有 ablation 协议，不启用主工作流的严格位点证据门。随后追加的 `budget-06` 是最终验证组，不限制工具调用次数；它允许 LLM 继续查询，直到自行返回 READY，并要求 READY 选择的同一个 `edit_atom_index` 同时有 `get_atom_environment` 和 `check_growth_space` 记录，否则状态为 `site_evidence_gate_failed`，不生成候选。每组保存输入坐标、LLM 决策、工具结果、最终改造计划、候选 SDF、RDKit/刚性碰撞验证和 `result.json`。
 
 显式使用完整复合物坐标模式：
 
@@ -126,7 +126,7 @@ pi --list-models 'aicloud/*'
 
 `.aicloud_api_key` 已加入 `.gitignore`，不会提交到 GitHub。也可以用 `AICLOUD_API_KEY` 环境变量临时覆盖文件读取。
 
-默认输出到 `runs/ablation-aicloud-pocket-6A-mapped-01/`，等价于运行预算 `0 1 2 3 4 5` 的 6 Å 口袋坐标 + 原子映射实验。原子映射是固定输入元数据，不计入工具预算。每个 `budget-XX` 子目录在该预算开始时会清理，避免旧决策文件污染本次结果。常用覆盖方式：
+默认输出到 `runs/ablation-aicloud-pocket-6A-mapped-01/`，等价于运行 `budget-00` 到 `budget-05` 的 6 Å 口袋坐标 + 原子映射 ablation，再追加不限制工具调用且启用严格位点证据门的 `budget-06` 最终验证组。原子映射是固定输入元数据，不计入工具预算。每个 `budget-XX` 子目录在该预算开始时会清理，避免旧决策文件污染本次结果。常用覆盖方式：
 
 ```bash
 BUDGETS="0 1 2" OUTPUT_ROOT=runs/ablation-aicloud-smoke-01 ./run_ablation.sh
@@ -151,7 +151,7 @@ ABLATION_MODEL=GLM-5.2 \
 
 主工作流仍读取 `config.json` 中的模型和端点，不受 `ABLATION_MODEL` 或 `ABLATION_BASE_URL` 影响。AI 智算云 key 未填入前，pi 不会显示 `aicloud/GLM-5.2` 为可用模型；填入后重新打开 pi 或重新执行模型列表即可。
 
-严格对比结果时读取各目录的 `result.json` 和根目录的 `summary.json`。每组的 `input.json` 还保存了固定的 `ligand_atom_map`，可检查 `rdkit_index`、PDB serial 和配体原子名的映射。重点比较 `status`、`tool_call_count`、`decision_count`、`result.ready_gate`、`result.decision`、`result.validation.property_delta`、`result.validation.structure_change` 和 `error`。 `status`、`tool_call_count`、`decision_count`、`result.decision`、`result.validation.property_delta`、`result.validation.structure_change` 和 `error`。这项实验只能比较信息预算与工具使用对方案的影响，不能直接比较活性；后续接入 docking/RBFE 时，应在相同候选评估协议下追加结果。
+严格对比结果时读取各目录的 `result.json` 和根目录的 `summary.json`。其中只有 `budget-06` 的 `state.site_evidence_gate_required` 应为 `true`；`budget-00` 到 `budget-05` 应为 `false`。每组的 `input.json` 还保存了固定的 `ligand_atom_map`，可检查 `rdkit_index`、PDB serial 和配体原子名的映射。重点比较 `status`、`tool_call_count`、`decision_count`、`result.ready_gate`、`result.decision`、`result.validation.property_delta`、`result.validation.structure_change` 和 `error`。这项实验只能比较信息预算与工具使用对方案的影响，不能直接比较活性；后续接入 docking/RBFE 时，应在相同候选评估协议下追加结果。
 
 ## 测试
 

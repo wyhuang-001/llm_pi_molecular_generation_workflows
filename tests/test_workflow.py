@@ -168,7 +168,48 @@ class EnvironmentOnlyAblationClient:
         raise AssertionError(payload["mode"])
 
 
-def test_ablation_site_gate_requires_environment_and_growth_space(tmp_path):
+class SevenQueryAblationClient:
+    def complete_json(self, payload):
+        if payload["mode"] != "collect_context":
+            raise AssertionError(payload["mode"])
+        if len(payload["state"]["tool_calls"]) < 7:
+            return {
+                "action": "QUERY",
+                "question": "additional context",
+                "tool": "get_ligand_info",
+                "arguments": {},
+            }
+        return {
+            "action": "READY",
+            "understanding": "seven queries before final decision",
+            "edit_atom_index": 10,
+            "edit_hypothesis": "small edit",
+            "fragment_smiles": "[*:1]F",
+        }
+
+
+def test_final_unbounded_run_is_not_forced_ready_at_budget_number(tmp_path):
+    from scripts.compare_tool_budgets import run_budget
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        '{"base_url":"https://example.invalid/v1","model":"test","api_key_env":"TEST_KEY"}'
+    )
+    module = __import__("scripts.compare_tool_budgets", fromlist=["OpenAICompatibleChatClient"])
+    original = module.OpenAICompatibleChatClient
+    module.OpenAICompatibleChatClient = lambda *_args, **_kwargs: SevenQueryAblationClient()
+    try:
+        result = run_budget(
+            TASK, config, tmp_path / "run", 6, "pocket", 6.0,
+            require_site_evidence=True, unbounded=True,
+        )
+    finally:
+        module.OpenAICompatibleChatClient = original
+    assert result["tool_call_count"] == 7
+    assert result["status"] == "site_evidence_gate_failed"
+
+
+def test_final_unbounded_ablation_requires_site_evidence(tmp_path):
     from scripts.compare_tool_budgets import run_budget
 
     config = tmp_path / "config.json"
@@ -179,9 +220,31 @@ def test_ablation_site_gate_requires_environment_and_growth_space(tmp_path):
     module = __import__("scripts.compare_tool_budgets", fromlist=["OpenAICompatibleChatClient"])
     module.OpenAICompatibleChatClient = lambda *_args, **_kwargs: EnvironmentOnlyAblationClient()
     try:
-        result = run_budget(TASK, config, tmp_path / "run", 1, "pocket", 6.0, True)
+        result = run_budget(
+            TASK, config, tmp_path / "run", 6, "pocket", 6.0,
+            require_site_evidence=True, unbounded=True,
+        )
     finally:
         module.OpenAICompatibleChatClient = original
     assert result["status"] == "site_evidence_gate_failed"
+    assert result["state"]["unbounded_tool_calls"] is True
     assert result["result"]["ready_gate"]["missing"] == ["edit_site_geometry"]
-    assert not (tmp_path / "run" / "budget-01" / "candidate.sdf").exists()
+    assert not (tmp_path / "run" / "budget-06" / "candidate.sdf").exists()
+
+
+def test_legacy_budget_does_not_require_site_evidence(tmp_path):
+    from scripts.compare_tool_budgets import run_budget
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        '{"base_url":"https://example.invalid/v1","model":"test","api_key_env":"TEST_KEY"}'
+    )
+    original = __import__("scripts.compare_tool_budgets", fromlist=["OpenAICompatibleChatClient"]).OpenAICompatibleChatClient
+    module = __import__("scripts.compare_tool_budgets", fromlist=["OpenAICompatibleChatClient"])
+    module.OpenAICompatibleChatClient = lambda *_args, **_kwargs: EnvironmentOnlyAblationClient()
+    try:
+        result = run_budget(TASK, config, tmp_path / "run", 1, "pocket", 6.0)
+    finally:
+        module.OpenAICompatibleChatClient = original
+    assert result["status"] != "site_evidence_gate_failed"
+    assert result["state"]["site_evidence_gate_required"] is False

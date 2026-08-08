@@ -175,11 +175,13 @@ def validate_ready(
     environment_verified = any(
         call["tool"] == "get_atom_environment"
         and call["arguments"].get("atom_index") == index
+        and "edit_site_environment" in call.get("evidence", [])
         for call in tool_calls
     )
     growth_verified = any(
         call["tool"] == "check_growth_space"
         and call["arguments"].get("atom_index") == index
+        and "edit_site_geometry" in call.get("evidence", [])
         for call in tool_calls
     )
     report = {
@@ -207,7 +209,8 @@ def run_budget(
     budget: int,
     coordinate_scope: str,
     pocket_radius: float,
-    require_site_evidence: bool,
+    require_site_evidence: bool = False,
+    unbounded: bool = False,
 ) -> dict[str, Any]:
     context = ComplexContext(task_path)
     config_data = json.loads(config_path.read_text(encoding="utf-8"))
@@ -220,6 +223,7 @@ def run_budget(
     atom_map = ligand_atom_map(context)
     state: dict[str, Any] = {
         "budget": budget,
+        "unbounded_tool_calls": unbounded,
         "model": config_data.get("model"),
         "coordinate_scope": coordinate_scope,
         "coordinate_chars": len(coordinates),
@@ -247,17 +251,24 @@ def run_budget(
 
     try:
         while True:
-            remaining = budget - len(state["tool_calls"])
-            force_ready = remaining <= 0
+            remaining = None if unbounded else budget - len(state["tool_calls"])
+            force_ready = remaining is not None and remaining <= 0
             instruction = (
-                "Tool budget is exhausted. Return READY now; do not return QUERY or PROPOSE_TOOL."
-                if force_ready
-                else "You may QUERY one registered tool or return READY."
+                "There is no tool-call limit for this final verification run. Query any registered "
+                "tools needed to verify the proposed edit site, then return READY."
+                if unbounded
+                else (
+                    "Tool budget is exhausted. Return READY now; do not return QUERY or PROPOSE_TOOL."
+                    if force_ready
+                    else "You may QUERY one registered tool or return READY."
+                )
             )
             payload = base_payload(
                 context, coordinates, catalog, budget, state,
                 extra={
                     "instruction": instruction,
+                    "tool_budget": None if unbounded else budget,
+                    "tool_call_limit": None if unbounded else budget,
                     "ligand_atom_map": atom_map,
                     "metadata_contract": (
                         "The ligand_atom_map is fixed host metadata, not a tool result and not part "
@@ -373,9 +384,11 @@ def main() -> None:
     parser.add_argument("--coordinate-scope", choices=["full", "pocket"], default="pocket")
     parser.add_argument("--pocket-radius", type=float, default=6.0)
     parser.add_argument(
-        "--allow-unverified-site",
-        action="store_true",
-        help="Ablation-only escape hatch; do not require main-workflow site evidence before READY.",
+        "--unbounded-budget",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Run final budget-N with unlimited tool queries and strict site evidence gate.",
     )
     args = parser.parse_args()
 
@@ -388,7 +401,7 @@ def main() -> None:
             result = run_budget(
                 args.task.resolve(), args.config.resolve(), args.output_root.resolve(),
                 budget, args.coordinate_scope, args.pocket_radius,
-                require_site_evidence=not args.allow_unverified_site,
+                require_site_evidence=False,
             )
         except Exception as exc:
             result = {"budget": budget, "status": "run_failed", "error": str(exc)}
@@ -401,6 +414,34 @@ def main() -> None:
             "candidate_path": result.get("result", {}).get("candidate_path"),
         })
         print(json.dumps(summaries[-1], ensure_ascii=False), flush=True)
+
+    if args.unbounded_budget is not None:
+        if args.unbounded_budget < 0:
+            parser.error("unbounded budget must be non-negative")
+        if args.unbounded_budget in args.budgets:
+            parser.error("unbounded budget must not duplicate a limited budget")
+        budget = args.unbounded_budget
+        print(f"[ablation] starting unbounded final budget={budget}", flush=True)
+        try:
+            result = run_budget(
+                args.task.resolve(), args.config.resolve(), args.output_root.resolve(),
+                budget, args.coordinate_scope, args.pocket_radius,
+                require_site_evidence=True,
+                unbounded=True,
+            )
+        except Exception as exc:
+            result = {"budget": budget, "status": "run_failed", "error": str(exc)}
+        summaries.append({
+            "budget": budget,
+            "unbounded_tool_calls": True,
+            "status": result.get("status"),
+            "error": result.get("error"),
+            "tool_call_count": result.get("tool_call_count", 0),
+            "decision_count": result.get("decision_count", 0),
+            "candidate_path": result.get("result", {}).get("candidate_path"),
+        })
+        print(json.dumps(summaries[-1], ensure_ascii=False), flush=True)
+
     write_json(args.output_root.resolve() / "summary.json", summaries)
     print(json.dumps(summaries, ensure_ascii=False, indent=2))
 
