@@ -17,7 +17,7 @@ fi
 
 TASK_PATH="${TASK_PATH:-input/task.json}"
 CONFIG_PATH="${CONFIG_PATH:-config.aicloud.json}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-aicloud-pocket-6A-mapped}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-aicloud-pocket-6A-mapped-01}"
 COORDINATE_SCOPE="${COORDINATE_SCOPE:-pocket}"
 POCKET_RADIUS="${POCKET_RADIUS:-6.0}"
 BUDGETS="${BUDGETS:-0 1 2 3 4 5}"

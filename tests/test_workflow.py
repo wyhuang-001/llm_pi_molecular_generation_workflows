@@ -146,3 +146,42 @@ def test_edit_retry_can_query_before_ready(tmp_path):
     assert len(result["state"]["decisions"]) == 5
     assert (tmp_path / "decision-04.json").exists()
     assert (tmp_path / "decision-05.json").exists()
+
+
+class EnvironmentOnlyAblationClient:
+    def complete_json(self, payload):
+        if payload["mode"] == "collect_context":
+            if not payload["state"]["tool_calls"]:
+                return {
+                    "action": "QUERY",
+                    "question": "environment",
+                    "tool": "get_atom_environment",
+                    "arguments": {"atom_index": 10, "radius": 4.0},
+                }
+            return {
+                "action": "READY",
+                "understanding": "environment only",
+                "edit_atom_index": 10,
+                "edit_hypothesis": "small edit",
+                "fragment_smiles": "[*:1]F",
+            }
+        raise AssertionError(payload["mode"])
+
+
+def test_ablation_site_gate_requires_environment_and_growth_space(tmp_path):
+    from scripts.compare_tool_budgets import run_budget
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        '{"base_url":"https://example.invalid/v1","model":"test","api_key_env":"TEST_KEY"}'
+    )
+    original = __import__("scripts.compare_tool_budgets", fromlist=["OpenAICompatibleChatClient"]).OpenAICompatibleChatClient
+    module = __import__("scripts.compare_tool_budgets", fromlist=["OpenAICompatibleChatClient"])
+    module.OpenAICompatibleChatClient = lambda *_args, **_kwargs: EnvironmentOnlyAblationClient()
+    try:
+        result = run_budget(TASK, config, tmp_path / "run", 1, "pocket", 6.0, True)
+    finally:
+        module.OpenAICompatibleChatClient = original
+    assert result["status"] == "site_evidence_gate_failed"
+    assert result["result"]["ready_gate"]["missing"] == ["edit_site_geometry"]
+    assert not (tmp_path / "run" / "budget-01" / "candidate.sdf").exists()

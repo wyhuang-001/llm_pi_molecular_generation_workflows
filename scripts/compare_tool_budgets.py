@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import sys
 import json
+import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -151,7 +152,19 @@ def base_payload(
     return payload
 
 
-def validate_ready(context: ComplexContext, decision: dict[str, Any]) -> None:
+class SiteEvidenceGateError(ValueError):
+    def __init__(self, decision: dict[str, Any], report: dict[str, Any]):
+        self.decision = decision
+        self.report = report
+        super().__init__(json.dumps(report, ensure_ascii=False))
+
+
+def validate_ready(
+    context: ComplexContext,
+    decision: dict[str, Any],
+    tool_calls: list[dict[str, Any]],
+    require_site_evidence: bool = True,
+) -> dict[str, Any]:
     required = ("understanding", "edit_atom_index", "edit_hypothesis", "fragment_smiles")
     missing = [key for key in required if not decision.get(key)]
     if missing:
@@ -159,6 +172,32 @@ def validate_ready(context: ComplexContext, decision: dict[str, Any]) -> None:
     index = decision["edit_atom_index"]
     if not isinstance(index, int) or not 0 <= index < context.ligand.GetNumAtoms():
         raise ValueError(f"Invalid edit_atom_index: {index!r}")
+    environment_verified = any(
+        call["tool"] == "get_atom_environment"
+        and call["arguments"].get("atom_index") == index
+        for call in tool_calls
+    )
+    growth_verified = any(
+        call["tool"] == "check_growth_space"
+        and call["arguments"].get("atom_index") == index
+        for call in tool_calls
+    )
+    report = {
+        "status": "passed" if (not require_site_evidence or environment_verified and growth_verified) else "failed",
+        "required": require_site_evidence,
+        "edit_atom_index": index,
+        "edit_site_environment_verified": environment_verified,
+        "edit_site_geometry_verified": growth_verified,
+        "missing": [
+            name for name, verified in (
+                ("edit_site_environment", environment_verified),
+                ("edit_site_geometry", growth_verified),
+            ) if require_site_evidence and not verified
+        ],
+    }
+    if report["status"] != "passed":
+        raise SiteEvidenceGateError(decision, report)
+    return report
 
 
 def run_budget(
@@ -168,11 +207,14 @@ def run_budget(
     budget: int,
     coordinate_scope: str,
     pocket_radius: float,
+    require_site_evidence: bool,
 ) -> dict[str, Any]:
     context = ComplexContext(task_path)
     config_data = json.loads(config_path.read_text(encoding="utf-8"))
     client = OpenAICompatibleChatClient(config_path, system_prompt=ABLATION_PROMPT)
     run_dir = output_root / f"budget-{budget:02d}"
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     coordinates = coordinate_text(context, coordinate_scope, pocket_radius)
     atom_map = ligand_atom_map(context)
@@ -182,6 +224,7 @@ def run_budget(
         "coordinate_scope": coordinate_scope,
         "coordinate_chars": len(coordinates),
         "ligand_atom_map_count": len(atom_map),
+        "site_evidence_gate_required": require_site_evidence,
         "tool_calls": [],
         "decisions": [],
     }
@@ -198,6 +241,7 @@ def run_budget(
     tools = ToolRegistry(context)
     catalog = tools.catalog()
     final_decision: dict[str, Any] | None = None
+    ready_gate: dict[str, Any] | None = None
     status = "incomplete"
     error: str | None = None
 
@@ -226,7 +270,9 @@ def run_budget(
             write_json(run_dir / f"decision-{len(state['decisions']):02d}.json", decision)
             action = decision.get("action")
             if action == "READY":
-                validate_ready(context, decision)
+                ready_gate = validate_ready(
+                    context, decision, state["tool_calls"], require_site_evidence
+                )
                 final_decision = decision
                 break
             if action == "PROPOSE_TOOL":
@@ -271,8 +317,9 @@ def run_budget(
                     "decision": final_decision,
                     "validation": edit_result.report,
                     "candidate_path": str(candidate_path),
+                    "ready_gate": ready_gate,
                     "evaluation_scope": {
-                        "site_evidence": "not_verified_by_ablation_gate",
+                        "site_evidence": "verified_by_ablation_gate" if require_site_evidence else "not_required", 
                         "affinity": "not_evaluated",
                         "docking": "not_configured",
                         "fep": "not_configured",
@@ -287,6 +334,19 @@ def run_budget(
                 result = {"decision": final_decision, "validation_error": str(exc)}
         else:
             result = {}
+    except SiteEvidenceGateError as exc:
+        status = "site_evidence_gate_failed"
+        error = str(exc)
+        result = {
+            "decision": exc.decision,
+            "ready_gate": exc.report,
+            "evaluation_scope": {
+                "site_evidence": "required_and_failed",
+                "affinity": "not_evaluated",
+                "docking": "not_configured",
+                "fep": "not_configured",
+            },
+        }
     except Exception as exc:
         error = str(exc)
         result = {}
@@ -312,6 +372,11 @@ def main() -> None:
     parser.add_argument("--budgets", type=int, nargs="+", default=[0, 1, 2, 3, 4, 5])
     parser.add_argument("--coordinate-scope", choices=["full", "pocket"], default="pocket")
     parser.add_argument("--pocket-radius", type=float, default=6.0)
+    parser.add_argument(
+        "--allow-unverified-site",
+        action="store_true",
+        help="Ablation-only escape hatch; do not require main-workflow site evidence before READY.",
+    )
     args = parser.parse_args()
 
     summaries = []
@@ -323,6 +388,7 @@ def main() -> None:
             result = run_budget(
                 args.task.resolve(), args.config.resolve(), args.output_root.resolve(),
                 budget, args.coordinate_scope, args.pocket_radius,
+                require_site_evidence=not args.allow_unverified_site,
             )
         except Exception as exc:
             result = {"budget": budget, "status": "run_failed", "error": str(exc)}
