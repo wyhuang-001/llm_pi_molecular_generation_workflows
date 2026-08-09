@@ -99,7 +99,7 @@ class ToolRegistry:
             ),
         }
 
-    def catalog(self) -> dict[str, Any]:
+    def catalog(self, include_candidate_geometry: bool = True) -> dict[str, Any]:
         requirements = {
             "get_ligand_info": "Any successful call covers ligand identity.",
             "get_pocket_residues": "radius must be at least 5.0 A to cover pocket environment.",
@@ -110,14 +110,16 @@ class ToolRegistry:
             "get_fragment_properties": "Any valid fragment returns deterministic fragment properties.",
             "get_ligand_fragment": "Any valid atom and bond radius returns a local ligand fragment.",
         }
-        return {
+        catalog = {
             name: {
                 "input_schema": schema,
                 "potential_evidence": sorted(evidence),
                 "coverage_requirement": requirements[name],
             }
             for name, (_, evidence, schema) in self._tools.items()
+            if include_candidate_geometry or name != "validate_candidate_geometry"
         }
+        return catalog
 
     def execute(self, name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], set[str]]:
         if name not in self._tools:

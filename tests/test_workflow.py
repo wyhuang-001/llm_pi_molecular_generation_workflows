@@ -67,6 +67,12 @@ def test_ligand_fragment_returns_connected_atom_and_bond_subgraph():
     assert result["properties"]["heavy_atoms"] == len(result["atom_indices"])
 
 
+def test_ablation_tool_catalog_keeps_candidate_geometry_final_only():
+    tools = ToolRegistry(ComplexContext(TASK))
+    assert "validate_candidate_geometry" not in tools.catalog(include_candidate_geometry=False)
+    assert "validate_candidate_geometry" in tools.catalog(include_candidate_geometry=True)
+
+
 def test_candidate_geometry_evidence_records_exact_candidate_check():
     tools = ToolRegistry(ComplexContext(TASK))
     rejected, evidence = tools.execute(

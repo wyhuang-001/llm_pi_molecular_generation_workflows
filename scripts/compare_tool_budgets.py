@@ -272,7 +272,7 @@ def run_budget(
     from molecular_agent.tools import ToolRegistry
 
     tools = ToolRegistry(context)
-    catalog = tools.catalog()
+    catalog = tools.catalog(include_candidate_geometry=unbounded)
     final_decision: dict[str, Any] | None = None
     ready_gate: dict[str, Any] | None = None
     status = "incomplete"
@@ -331,6 +331,8 @@ def run_budget(
             arguments = decision.get("arguments", {})
             if not isinstance(tool_name, str) or not isinstance(arguments, dict):
                 raise ValueError("QUERY requires a tool name and object arguments")
+            if tool_name not in catalog:
+                raise ValueError(f"Tool is not available in this ablation group: {tool_name}")
             result, evidence = tools.execute(tool_name, arguments)
             call = {
                 "tool": tool_name,
