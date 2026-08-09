@@ -271,6 +271,49 @@ class EnvironmentOnlyAblationClient:
         raise AssertionError(payload["mode"])
 
 
+class GateFeedbackAblationClient:
+    def complete_json(self, payload):
+        if payload["state"]["decisions"] and "ready_gate_feedback" not in payload:
+            raise AssertionError("gate feedback was not returned to the LLM")
+        if not payload["state"]["decisions"]:
+            return {
+                "action": "READY",
+                "understanding": "initial hypothesis without site evidence",
+                "edit_atom_index": 9,
+                "edit_hypothesis": "fluorinate the aniline ring",
+                "fragment_smiles": "[*:1]F",
+            }
+        calls = payload["state"]["tool_calls"]
+        if len(calls) == 0:
+            return {
+                "action": "QUERY",
+                "question": "environment after gate feedback",
+                "tool": "get_atom_environment",
+                "arguments": {"atom_index": 9, "radius": 5.0},
+            }
+        if len(calls) == 1:
+            return {
+                "action": "QUERY",
+                "question": "growth space after gate feedback",
+                "tool": "check_growth_space",
+                "arguments": {"atom_index": 9, "distance": 2.0},
+            }
+        if len(calls) == 2:
+            return {
+                "action": "QUERY",
+                "question": "validate revised fluorine candidate",
+                "tool": "validate_candidate_geometry",
+                "arguments": {"atom_index": 9, "fragment_smiles": "[*:1]F"},
+            }
+        return {
+            "action": "READY",
+            "understanding": "site evidence and candidate geometry are verified",
+            "edit_atom_index": 9,
+            "edit_hypothesis": "fluorinate the aniline ring",
+            "fragment_smiles": "[*:1]F",
+        }
+
+
 class SevenQueryAblationClient:
     def complete_json(self, payload):
         if payload["mode"] != "collect_context":
@@ -289,6 +332,29 @@ class SevenQueryAblationClient:
             "edit_hypothesis": "small edit",
             "fragment_smiles": "[*:1]F",
         }
+
+
+def test_final_unbounded_gate_feedback_allows_learning_and_revision(tmp_path):
+    from scripts.compare_tool_budgets import run_budget
+
+    config = tmp_path / "config.json"
+    config.write_text(
+        '{"base_url":"https://example.invalid/v1","model":"test","api_key_env":"TEST_KEY"}'
+    )
+    module = __import__("scripts.compare_tool_budgets", fromlist=["OpenAICompatibleChatClient"])
+    original = module.OpenAICompatibleChatClient
+    module.OpenAICompatibleChatClient = lambda *_args, **_kwargs: GateFeedbackAblationClient()
+    try:
+        result = run_budget(
+            TASK, config, tmp_path / "run", 6, "pocket", 6.0,
+            require_site_evidence=True, unbounded=True,
+        )
+    finally:
+        module.OpenAICompatibleChatClient = original
+    assert result["status"] == "candidate_geometry_accepted"
+    assert result["tool_call_count"] == 3
+    assert result["decision_count"] == 5
+    assert result["result"]["ready_gate"]["status"] == "passed"
 
 
 def test_final_unbounded_run_is_not_forced_ready_at_budget_number(tmp_path):

@@ -277,6 +277,8 @@ def run_budget(
     ready_gate: dict[str, Any] | None = None
     status = "incomplete"
     error: str | None = None
+    gate_retry_tool_count: int | None = None
+    gate_retry_decision: dict[str, Any] | None = None
 
     try:
         while True:
@@ -292,6 +294,18 @@ def run_budget(
                     else "You may QUERY one registered tool or return READY."
                 )
             )
+            feedback = {}
+            if gate_retry_decision is not None:
+                feedback = {
+                    "previous_ready": gate_retry_decision,
+                    "ready_gate_feedback": ready_gate,
+                    "instruction": (
+                        "The previous READY was rejected by deterministic evidence or candidate "
+                        "geometry. Use the feedback to identify the missing knowledge, query new "
+                        "tools, and return a revised READY with a new or newly validated edit. "
+                        "Do not repeat READY without new evidence."
+                    ),
+                }
             payload = base_payload(
                 context, coordinates, catalog, budget, state,
                 extra={
@@ -299,6 +313,7 @@ def run_budget(
                     "tool_budget": None if unbounded else budget,
                     "tool_call_limit": None if unbounded else budget,
                     "ligand_atom_map": atom_map,
+                    **feedback,
                     "metadata_contract": (
                         "The ligand_atom_map is fixed host metadata, not a tool result and not part "
                         "of the tool budget. Use rdkit_index for edit_atom_index."
@@ -314,9 +329,23 @@ def run_budget(
             write_json(run_dir / f"decision-{len(state['decisions']):02d}.json", decision)
             action = decision.get("action")
             if action == "READY":
-                ready_gate = validate_ready(
-                    context, decision, state["tool_calls"], require_site_evidence
-                )
+                try:
+                    ready_gate = validate_ready(
+                        context, decision, state["tool_calls"], require_site_evidence
+                    )
+                except SiteEvidenceGateError as exc:
+                    if not unbounded:
+                        raise
+                    ready_gate = exc.report
+                    current_tool_count = len(state["tool_calls"])
+                    if (
+                        gate_retry_tool_count is not None
+                        and current_tool_count == gate_retry_tool_count
+                    ):
+                        raise
+                    gate_retry_tool_count = current_tool_count
+                    gate_retry_decision = decision
+                    continue
                 final_decision = decision
                 break
             if action == "PROPOSE_TOOL":
