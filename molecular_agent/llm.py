@@ -15,7 +15,10 @@ QUERY schema: {"action":"QUERY","question":"...","tool":"registered tool","argum
 READY schema: {"action":"READY","understanding":"...","edit_atom_index":0,"edit_hypothesis":"...","fragment_smiles":"[*:1]...","knowledge_gaps":[]}.
 PROPOSE_TOOL schema: {"action":"PROPOSE_TOOL","name":"...","purpose":"...","input_schema":{},"implementation_plan":"...","why_existing_tools_are_insufficient":"..."}.
 You decide what knowledge is needed; the tool catalog is a capability menu, not a fixed query sequence. You may choose fragment properties, pharmacophore, protonation, synthetic, literature, or other available knowledge before READY.
-The host only enforces basic safety: a proposed edit site must have site-specific evidence, and chemistry must pass deterministic validation.
+Before READY, query get_atom_environment and check_growth_space for the same edit atom, and query
+validate_candidate_geometry for the exact edit_atom_index + fragment_smiles. The latter uses the
+host's deterministic RDKit/UFF and rigid-protein check; a rejected result must trigger a retry,
+not READY. The host does not accept invented geometry or affinity claims.
 fragment_smiles must be one connected fragment containing exactly one mapped dummy atom [*:1].
 Prefer one small local edit and preserve the scaffold, formal charge, and stereochemistry.
 """

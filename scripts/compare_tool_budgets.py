@@ -11,7 +11,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from molecular_agent.editing import apply_substituent, write_sdf
+from molecular_agent.adapters import configured_adapters
+from molecular_agent.editing import EditResult, apply_substituent, write_sdf
 from scripts.openai_compatible_client import OpenAICompatibleChatClient
 from molecular_agent.structure import ComplexContext
 
@@ -35,6 +36,8 @@ whether a candidate can be written. Never invent an affinity improvement.
 The host provides ligand_atom_map as fixed input metadata. When choosing edit_atom_index,
 use the zero-based rdkit_index from that map. Never use PDB serial numbers, protein atom
 serials, or residue numbers as edit_atom_index.
+For the final unbounded verification run, query get_atom_environment, check_growth_space,
+and validate_candidate_geometry for the same atom and proposed fragment before READY.
 """
 
 
@@ -152,6 +155,15 @@ def base_payload(
     return payload
 
 
+def _complete_json(client: Any, payload: dict[str, Any], diagnostic_path: Path) -> dict[str, Any]:
+    try:
+        return client.complete_json(payload, diagnostic_path=diagnostic_path)
+    except TypeError as error:
+        if "diagnostic_path" not in str(error):
+            raise
+        return client.complete_json(payload)
+
+
 class SiteEvidenceGateError(ValueError):
     def __init__(self, decision: dict[str, Any], report: dict[str, Any]):
         self.decision = decision
@@ -184,16 +196,33 @@ def validate_ready(
         and "edit_site_geometry" in call.get("evidence", [])
         for call in tool_calls
     )
+    candidate_verified = any(
+        call["tool"] == "validate_candidate_geometry"
+        and call["arguments"].get("atom_index") == index
+        and call["arguments"].get("fragment_smiles") == decision.get("fragment_smiles")
+        and "candidate_geometry" in call.get("evidence", [])
+        and call.get("result", {}).get("status") == "accepted"
+        for call in tool_calls
+    )
     report = {
-        "status": "passed" if (not require_site_evidence or environment_verified and growth_verified) else "failed",
+        "status": (
+            "passed"
+            if (
+                not require_site_evidence
+                or environment_verified and growth_verified and candidate_verified
+            )
+            else "failed"
+        ),
         "required": require_site_evidence,
         "edit_atom_index": index,
         "edit_site_environment_verified": environment_verified,
         "edit_site_geometry_verified": growth_verified,
+        "candidate_geometry_verified": candidate_verified,
         "missing": [
             name for name, verified in (
                 ("edit_site_environment", environment_verified),
                 ("edit_site_geometry", growth_verified),
+                ("candidate_geometry", candidate_verified),
             ) if require_site_evidence and not verified
         ],
     }
@@ -276,7 +305,11 @@ def run_budget(
                     ),
                 },
             )
-            decision = client.complete_json(payload)
+            decision = _complete_json(
+                client,
+                payload,
+                run_dir / f"api-error-{len(state['decisions']) + 1:02d}.json",
+            )
             state["decisions"].append(decision)
             write_json(run_dir / f"decision-{len(state['decisions']):02d}.json", decision)
             action = decision.get("action")
@@ -324,16 +357,45 @@ def run_budget(
                     if edit_result.report["status"] == "accepted"
                     else "candidate_geometry_rejected"
                 )
+                docking = {"stage": "docking", "status": "not_run_geometry_rejected"}
+                rbfe = {"stage": "rbfe", "status": "not_run_geometry_rejected"}
+                reference_path = None
+                receptor_path = None
+                if status == "candidate_geometry_accepted":
+                    reference_path = run_dir / "reference-ligand.sdf"
+                    write_sdf(
+                        EditResult(context.ligand, {"status": "reference"}),
+                        reference_path,
+                        name="reference-ligand",
+                    )
+                    receptor_path = context.write_receptor_pdb(
+                        run_dir / "receptor-protein-only.pdb"
+                    )
+                    docking_adapter, rbfe_adapter = configured_adapters(config_path, run_dir)
+                    docking = docking_adapter.run(
+                        candidate_path=candidate_path,
+                        receptor_path=receptor_path,
+                    )
+                    rbfe = rbfe_adapter.run(
+                        candidate_path=candidate_path,
+                        receptor_path=receptor_path,
+                        reference_path=reference_path,
+                        docking_result=docking,
+                    )
                 result = {
                     "decision": final_decision,
                     "validation": edit_result.report,
                     "candidate_path": str(candidate_path),
+                    "reference_path": str(reference_path) if reference_path else None,
+                    "receptor_path": str(receptor_path) if receptor_path else None,
+                    "docking": docking,
+                    "rbfe": rbfe,
                     "ready_gate": ready_gate,
                     "evaluation_scope": {
-                        "site_evidence": "verified_by_ablation_gate" if require_site_evidence else "not_required", 
+                        "site_evidence": "verified_by_ablation_gate" if require_site_evidence else "not_required",
                         "affinity": "not_evaluated",
-                        "docking": "not_configured",
-                        "fep": "not_configured",
+                        "docking": docking["status"],
+                        "fep": rbfe["status"],
                         "meaning": (
                             "Acceptance only means RDKit construction and the rigid-protein "
                             "clash threshold passed; it is not a binding or activity result."

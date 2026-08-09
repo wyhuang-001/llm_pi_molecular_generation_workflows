@@ -2,5 +2,26 @@
   "base_url": "https://api.p1-103n1x.com/v1",
   "model": "gpt-5.6-sol",
   "api_key_env": "OPENAI_API_KEY",
-  "timeout_seconds": 600
+  "timeout_seconds": 600,
+  "docking": {
+    "enabled": false,
+    "timeout_seconds": 3600,
+    "command": [
+      "gnina",
+      "-r", "{receptor}",
+      "-l", "{candidate}",
+      "--num_modes", "20",
+      "-o", "{output_dir}/docked.sdf",
+      "--log", "{output_dir}/gnina.log"
+    ]
+  },
+  "rbfe": {
+    "enabled": false,
+    "timeout_seconds": 604800,
+    "script": "/mnt/f/doctoral_period_huangwy/PhD_project/external_model/AsyncFEP/tools/reference_rbfe_pipeline.py",
+    "target": "cdk2_1h1q",
+    "targets": "config/reference_targets.yaml",
+    "stage": "all",
+    "gpus": [0]
+  }
 }

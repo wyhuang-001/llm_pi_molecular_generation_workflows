@@ -7,6 +7,7 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import Crippen, Descriptors, Lipinski, rdMolDescriptors
 
+from .editing import apply_substituent
 from .structure import ComplexContext
 
 
@@ -61,6 +62,18 @@ class ToolRegistry:
                     "required": ["atom_index", "distance"],
                 },
             ),
+            "validate_candidate_geometry": (
+                self.validate_candidate_geometry,
+                {"candidate_geometry"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "atom_index": {"type": "integer", "minimum": 0},
+                        "fragment_smiles": {"type": "string", "minLength": 1},
+                    },
+                    "required": ["atom_index", "fragment_smiles"],
+                },
+            ),
             "get_fragment_properties": (
                 self.get_fragment_properties,
                 {"fragment_properties"},
@@ -93,6 +106,7 @@ class ToolRegistry:
             "detect_basic_interactions": "cutoff must be at least 4.0 A to cover key interactions.",
             "get_atom_environment": "radius must be at least 4.0 A for the final edit atom.",
             "check_growth_space": "probe distance must be at least 1.5 A for the final edit atom.",
+            "validate_candidate_geometry": "Runs the exact deterministic candidate construction and rigid-protein clash check for this atom and fragment.",
             "get_fragment_properties": "Any valid fragment returns deterministic fragment properties.",
             "get_ligand_fragment": "Any valid atom and bond radius returns a local ligand fragment.",
         }
@@ -116,6 +130,7 @@ class ToolRegistry:
             "detect_basic_interactions": float(arguments.get("cutoff", 0)) >= 4.0,
             "get_atom_environment": float(arguments.get("radius", 0)) >= 4.0,
             "check_growth_space": float(arguments.get("distance", 0)) >= 1.5,
+            "validate_candidate_geometry": True,
             "get_fragment_properties": True,
             "get_ligand_fragment": True,
         }[name]
@@ -246,6 +261,19 @@ class ToolRegistry:
             "minimum_clearance": round(nearest[0][1], 3),
             "limitation": "Rigid outward-vector probe; receptor flexibility and free energy are not modeled.",
         }
+
+    def validate_candidate_geometry(self, atom_index: int, fragment_smiles: str) -> dict[str, Any]:
+        try:
+            result = apply_substituent(
+                self.context.ligand,
+                atom_index,
+                fragment_smiles,
+                self.context.protein_atoms,
+                seed=17,
+            )
+        except Exception as exc:
+            return {"status": "rejected", "error": str(exc)}
+        return result.report
 
     def get_fragment_properties(self, smiles: str) -> dict[str, Any]:
         molecule = Chem.MolFromSmiles(smiles)

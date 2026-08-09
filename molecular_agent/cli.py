@@ -38,7 +38,7 @@ def main() -> None:
         )
         return
     client = ScriptedDemoClient() if args.scripted_demo else ResponsesClient(args.config)
-    result = Workflow(args.task, client, args.run_dir).run()
+    result = Workflow(args.task, client, args.run_dir, config_path=args.config).run()
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

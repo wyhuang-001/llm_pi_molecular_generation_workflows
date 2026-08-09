@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-SITE_EVIDENCE = {"edit_site_environment", "edit_site_geometry"}
+SITE_EVIDENCE = {"edit_site_environment", "edit_site_geometry", "candidate_geometry"}
 REQUIRED_EVIDENCE = SITE_EVIDENCE
 
 

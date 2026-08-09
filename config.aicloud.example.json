@@ -2,5 +2,27 @@
   "base_url": "https://llmapi.blsc.cn/v1",
   "model": "GLM-5.2",
   "api_key_env": "AICLOUD_API_KEY",
-  "timeout_seconds": 600
+  "timeout_seconds": 600,
+  "docking": {
+    "enabled": false,
+    "timeout_seconds": 3600,
+    "command": [
+      "gnina",
+      "-r", "{receptor}",
+      "-l", "{candidate}",
+      "--num_modes", "20",
+      "-o", "{output_dir}/docked.sdf",
+      "--log", "{output_dir}/gnina.log"
+    ]
+  },
+  "rbfe": {
+    "enabled": false,
+    "timeout_seconds": 604800,
+    "script": "/mnt/f/doctoral_period_huangwy/PhD_project/external_model/AsyncFEP/tools/reference_rbfe_pipeline.py",
+    "python": "python",
+    "target": "current_target",
+    "stage": "all",
+    "gpus": [0],
+    "ff_scheme": "ff14sb-gaff2-tip3p"
+  }
 }

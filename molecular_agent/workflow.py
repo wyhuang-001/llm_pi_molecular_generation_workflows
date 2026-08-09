@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 from typing import Any, Protocol
 
-from .adapters import NotConfiguredAdapter
-from .editing import apply_substituent, write_sdf
+from .adapters import NotConfiguredAdapter, configured_adapters
+from .editing import EditResult, apply_substituent, write_sdf
 from .models import AgentState, ToolObservation
 from .structure import ComplexContext
 from .tools import ToolRegistry
@@ -17,12 +17,25 @@ class DecisionClient(Protocol):
 
 
 class Workflow:
-    def __init__(self, task_path: Path, client: DecisionClient, run_dir: Path):
+    def __init__(
+        self,
+        task_path: Path,
+        client: DecisionClient,
+        run_dir: Path,
+        config_path: Path | None = None,
+    ):
         self.context = ComplexContext(task_path)
         self.client = client
         self.run_dir = run_dir.resolve()
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.tools = ToolRegistry(self.context)
+        if config_path is not None:
+            self.docking_adapter, self.rbfe_adapter = configured_adapters(
+                config_path.resolve(), self.run_dir
+            )
+        else:
+            self.docking_adapter = NotConfiguredAdapter("docking")
+            self.rbfe_adapter = NotConfiguredAdapter("rbfe")
         self.state = AgentState(
             task=self.context.task["task"],
             max_context_rounds=int(self.context.task.get("max_context_rounds", 8)),
@@ -161,9 +174,20 @@ class Workflow:
             for item in self.state.observations
             if item.tool == "check_growth_space"
         }
-        if index not in environment_sites or index not in geometry_sites:
+        candidate_geometry = {
+            (item.arguments.get("atom_index"), item.arguments.get("fragment_smiles"))
+            for item in self.state.observations
+            if item.tool == "validate_candidate_geometry"
+        }
+        fragment = decision["fragment_smiles"]
+        if (
+            index not in environment_sites
+            or index not in geometry_sites
+            or (index, fragment) not in candidate_geometry
+        ):
             raise RuntimeError(
-                f"Selected edit atom {index} lacks site-specific environment and growth-space evidence"
+                f"Selected edit {index} + {fragment} lacks environment, growth-space, "
+                "and candidate-geometry evidence"
             )
 
     def design(self, first_decision: dict[str, Any]) -> dict[str, Any]:
@@ -178,7 +202,7 @@ class Workflow:
                     decision["edit_atom_index"],
                     decision["fragment_smiles"],
                     self.context.protein_atoms,
-                    seed=17 + attempt,
+                    seed=17,
                 )
                 if result is not None:
                     attempt_path = self.run_dir / f"edit-attempt-{attempt:02d}.sdf"
@@ -202,12 +226,33 @@ class Workflow:
             if result is not None and result.report["status"] == "accepted":
                 candidate_path = self.run_dir / f"candidate-{attempt:02d}.sdf"
                 write_sdf(result, candidate_path, name=f"candidate-{attempt:02d}")
+                reference_path = self.run_dir / "reference-ligand.sdf"
+                write_sdf(
+                    EditResult(self.context.ligand, {"status": "reference"}),
+                    reference_path,
+                    name="reference-ligand",
+                )
+                receptor_path = self.context.write_receptor_pdb(
+                    self.run_dir / "receptor-protein-only.pdb"
+                )
+                docking = self.docking_adapter.run(
+                    candidate_path=candidate_path,
+                    receptor_path=receptor_path,
+                )
+                rbfe = self.rbfe_adapter.run(
+                    candidate_path=candidate_path,
+                    receptor_path=receptor_path,
+                    reference_path=reference_path,
+                    docking_result=docking,
+                )
                 return {
                     "status": "candidate_accepted",
                     "candidate_path": str(candidate_path),
+                    "reference_path": str(reference_path),
                     "attempts": history,
-                    "docking": NotConfiguredAdapter("docking").run(candidate_path),
-                    "fep": NotConfiguredAdapter("AsyncFEP").run(candidate_path),
+                    "docking": docking,
+                    "rbfe": rbfe,
+                    "fep": rbfe,
                 }
             if attempt < attempts:
                 decision = self._retry_ready_decision(decision, report["validation"])
@@ -249,6 +294,14 @@ class ScriptedDemoClient:
                 "tool": "check_growth_space",
                 "arguments": {"atom_index": 10, "distance": 2.0},
                 "expected_evidence": "growth space",
+            }
+        if "candidate_geometry" in missing:
+            return {
+                "action": "QUERY",
+                "question": "Does fluorination at atom 10 pass the exact candidate geometry check?",
+                "tool": "validate_candidate_geometry",
+                "arguments": {"atom_index": 10, "fragment_smiles": "[*:1]F"},
+                "expected_evidence": "candidate geometry",
             }
         return {
             "action": "READY",

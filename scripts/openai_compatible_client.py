@@ -22,7 +22,11 @@ class OpenAICompatibleChatClient:
         if not self.api_key:
             raise ValueError(f"Missing API key environment variable: {key_env}")
 
-    def complete_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def complete_json(
+        self,
+        payload: dict[str, Any],
+        diagnostic_path: Path | None = None,
+    ) -> dict[str, Any]:
         body = {
             "model": self.model,
             "messages": [
@@ -52,21 +56,91 @@ class OpenAICompatibleChatClient:
                 response_detail = response_path.read_text(errors="replace").strip()
                 stderr_detail = result.stderr.strip()
                 detail = response_detail or stderr_detail
+                if diagnostic_path is not None:
+                    self._write_diagnostic(
+                        diagnostic_path,
+                        payload,
+                        body,
+                        response_detail,
+                        None,
+                        None,
+                        f"curl_failed_{result.returncode}",
+                    )
                 raise RuntimeError(f"Chat API curl request failed ({result.returncode}): {detail[:1500]}")
+            raw_response = response_path.read_text(encoding="utf-8", errors="replace")
             try:
-                data = json.loads(response_path.read_text(encoding="utf-8"))
+                data = json.loads(raw_response)
             except json.JSONDecodeError as error:
-                raise RuntimeError("Chat API endpoint returned invalid JSON") from error
+                if diagnostic_path is not None:
+                    self._write_diagnostic(
+                        diagnostic_path, payload, body, raw_response, None, None,
+                        "endpoint_invalid_json",
+                    )
+                raise RuntimeError(
+                    f"Chat API endpoint returned invalid JSON: {raw_response[:1000]}"
+                ) from error
         try:
             text = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as error:
+            if diagnostic_path is not None:
+                self._write_diagnostic(
+                    diagnostic_path, payload, body, raw_response, data, None,
+                    "missing_assistant_message",
+                )
             raise RuntimeError("Chat API response contained no assistant message") from error
         if not text:
+            if diagnostic_path is not None:
+                self._write_diagnostic(
+                    diagnostic_path, payload, body, raw_response, data, text,
+                    "empty_assistant_content",
+                )
             raise RuntimeError("Chat API response contained empty assistant content")
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as error:
+            if diagnostic_path is not None:
+                self._write_diagnostic(
+                    diagnostic_path, payload, body, raw_response, data, text,
+                    "assistant_content_invalid_json",
+                )
             raise RuntimeError(f"Chat API did not return JSON: {text[:1000]}") from error
         if not isinstance(parsed, dict):
-            raise RuntimeError("Chat API JSON response must be an object")
+            if diagnostic_path is not None:
+                self._write_diagnostic(
+                    diagnostic_path, payload, body, raw_response, data, text,
+                    f"assistant_json_type_{type(parsed).__name__}",
+                )
+            raise RuntimeError(
+                "Chat API JSON response must be an object; "
+                f"got {type(parsed).__name__}: {text[:1000]}"
+            )
         return parsed
+
+    @staticmethod
+    def _write_diagnostic(
+        path: Path,
+        payload: dict[str, Any],
+        request_body: dict[str, Any],
+        raw_response: str,
+        endpoint_json: Any,
+        assistant_content: Any,
+        failure: str,
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        safe_request = dict(request_body)
+        path.write_text(
+            json.dumps(
+                {
+                    "failure": failure,
+                    "payload": payload,
+                    "request": safe_request,
+                    "raw_http_body": raw_response,
+                    "endpoint_json": endpoint_json,
+                    "assistant_content": assistant_content,
+                    "assistant_content_type": type(assistant_content).__name__,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )

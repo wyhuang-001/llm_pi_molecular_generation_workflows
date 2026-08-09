@@ -245,6 +245,19 @@ class ComplexContext:
             raise ValueError(f"Multiple equally large ligand candidates; add ligand_selector: {choices}")
         return candidates[0]
 
+    def write_receptor_pdb(self, path: Path) -> Path:
+        """Write the protein ATOM records without the selected/co-crystallized ligands."""
+        lines = [
+            line
+            for line in self.complex_path.read_text(encoding="utf-8").splitlines()
+            if line[:6].strip() == "ATOM"
+        ]
+        if not lines:
+            raise ValueError("Complex contains no protein ATOM records")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join([*lines, "END", ""]), encoding="utf-8")
+        return path
+
     def protein_near(self, xyz: np.ndarray, radius: float) -> list[tuple[PDBAtom, float]]:
         nearby = []
         for atom in self.protein_atoms:

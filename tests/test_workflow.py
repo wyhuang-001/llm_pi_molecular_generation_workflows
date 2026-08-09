@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 from rdkit import Chem
 
+from molecular_agent.adapters import NotConfiguredAdapter
 from molecular_agent.models import AgentState, REQUIRED_EVIDENCE
 from molecular_agent.structure import ComplexContext
 from molecular_agent.tools import ToolRegistry
 from molecular_agent.workflow import ScriptedDemoClient, Workflow
+from scripts.openai_compatible_client import OpenAICompatibleChatClient
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -64,6 +67,68 @@ def test_ligand_fragment_returns_connected_atom_and_bond_subgraph():
     assert result["properties"]["heavy_atoms"] == len(result["atom_indices"])
 
 
+def test_candidate_geometry_evidence_records_exact_candidate_check():
+    tools = ToolRegistry(ComplexContext(TASK))
+    rejected, evidence = tools.execute(
+        "validate_candidate_geometry", {"atom_index": 1, "fragment_smiles": "[*:1]C"}
+    )
+    assert rejected["status"] == "rejected"
+    assert evidence == {"candidate_geometry"}
+    accepted, evidence = tools.execute(
+        "validate_candidate_geometry", {"atom_index": 9, "fragment_smiles": "[*:1]F"}
+    )
+    assert accepted["status"] == "accepted"
+    assert evidence == {"candidate_geometry"}
+
+
+def test_receptor_export_excludes_co_crystal_hetero_atoms(tmp_path):
+    context = ComplexContext(TASK)
+    path = context.write_receptor_pdb(tmp_path / "receptor.pdb")
+    text = path.read_text(encoding="utf-8")
+    assert "ATOM" in text
+    assert "HETATM" not in text
+    assert "2A6" not in text
+
+
+def test_unconfigured_scoring_adapters_are_explicit(tmp_path):
+    docking = NotConfiguredAdapter("docking").run()
+    rbfe = NotConfiguredAdapter("rbfe").run()
+    assert docking["status"] == "not_configured"
+    assert rbfe["status"] == "not_configured"
+
+
+def test_api_non_object_response_is_diagnosed(tmp_path, monkeypatch):
+    fake_curl = tmp_path / "curl"
+    fake_curl.write_text(
+        "#!/bin/sh\n"
+        "output=''\n"
+        "while [ $# -gt 0 ]; do\n"
+        "  if [ \"$1\" = \"-o\" ]; then output=$2; shift 2; else shift; fi\n"
+        "done\n"
+        "printf '%s' '{\"choices\":[{\"message\":{\"content\":\"[1,2]\"}}]}' > \"$output\"\n",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{__import__('os').environ['PATH']}")
+    monkeypatch.setenv("TEST_API_KEY", "test-key")
+    config = tmp_path / "config.json"
+    config.write_text(
+        json.dumps({
+            "base_url": "https://example.invalid/v1",
+            "model": "test",
+            "api_key_env": "TEST_API_KEY",
+        }),
+        encoding="utf-8",
+    )
+    diagnostic = tmp_path / "api-error.json"
+    client = OpenAICompatibleChatClient(config, "test")
+    with pytest.raises(RuntimeError, match="got list"):
+        client.complete_json({"mode": "test"}, diagnostic_path=diagnostic)
+    report = json.loads(diagnostic.read_text(encoding="utf-8"))
+    assert report["failure"] == "assistant_json_type_list"
+    assert report["assistant_content"] == "[1,2]"
+
+
 def test_scripted_workflow_produces_valid_local_candidate(tmp_path):
     result = Workflow(TASK, ScriptedDemoClient(), tmp_path).run()
     assert result["state"]["missing_site_evidence"] == []
@@ -86,7 +151,7 @@ class WrongSiteClient(ScriptedDemoClient):
 
 def test_ready_cannot_switch_to_unqueried_edit_site(tmp_path):
     workflow = Workflow(TASK, WrongSiteClient(), tmp_path)
-    with pytest.raises(RuntimeError, match="lacks site-specific"):
+    with pytest.raises(RuntimeError, match="lacks environment"):
         workflow.collect_context()
 
 
@@ -128,6 +193,13 @@ class RetryQueryClient:
                     "tool": "check_growth_space",
                     "arguments": {"atom_index": 1, "distance": 1.5},
                 }
+            if self.calls == 3:
+                return {
+                    "action": "QUERY",
+                    "question": "candidate geometry",
+                    "tool": "validate_candidate_geometry",
+                    "arguments": {"atom_index": 1, "fragment_smiles": "[*:1]C"},
+                }
             return {
                 "action": "READY",
                 "understanding": "site evidence",
@@ -136,12 +208,19 @@ class RetryQueryClient:
                 "fragment_smiles": "[*:1]C",
             }
         if payload["mode"] == "edit_retry":
-            if self.calls == 4:
+            if self.calls == 5:
                 return {
                     "action": "QUERY",
                     "question": "smaller fragment",
                     "tool": "get_fragment_properties",
                     "arguments": {"smiles": "[*:1]F"},
+                }
+            if self.calls == 6:
+                return {
+                    "action": "QUERY",
+                    "question": "candidate geometry retry",
+                    "tool": "validate_candidate_geometry",
+                    "arguments": {"atom_index": 1, "fragment_smiles": "[*:1]F"},
                 }
             return {
                 "action": "READY",
@@ -156,13 +235,14 @@ class RetryQueryClient:
 def test_edit_retry_can_query_before_ready(tmp_path):
     result = Workflow(TASK, RetryQueryClient(), tmp_path).run()
     assert result["result"]["status"] == "no_candidate_accepted"
-    assert len(result["state"]["observations"]) == 3
-    assert len(result["state"]["decisions"]) == 7
+    assert len(result["state"]["observations"]) == 5
+    assert len(result["state"]["decisions"]) == 9
     assert result["result"]["attempts"][1]["decision"]["fragment_smiles"] == "[*:1]F"
-    assert result["state"]["decisions"][3]["action"] == "QUERY"
-    assert result["state"]["decisions"][3]["tool"] == "get_fragment_properties"
+    assert result["state"]["decisions"][2]["tool"] == "validate_candidate_geometry"
+    assert result["state"]["decisions"][4]["tool"] == "get_fragment_properties"
+    assert result["state"]["decisions"][5]["tool"] == "validate_candidate_geometry"
     assert (tmp_path / "decision-04.json").exists()
-    assert (tmp_path / "decision-07.json").exists()
+    assert (tmp_path / "decision-09.json").exists()
 
 
 class EnvironmentOnlyAblationClient:
@@ -245,7 +325,7 @@ def test_final_unbounded_ablation_requires_site_evidence(tmp_path):
         module.OpenAICompatibleChatClient = original
     assert result["status"] == "site_evidence_gate_failed"
     assert result["state"]["unbounded_tool_calls"] is True
-    assert result["result"]["ready_gate"]["missing"] == ["edit_site_geometry"]
+    assert result["result"]["ready_gate"]["missing"] == ["edit_site_geometry", "candidate_geometry"]
     assert not (tmp_path / "run" / "budget-06" / "candidate.sdf").exists()
 
 
