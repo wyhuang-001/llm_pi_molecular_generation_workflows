@@ -22,6 +22,20 @@ def test_input_pdb_sdf_identity():
     assert len(context.protein_atoms) > 8000
 
 
+def test_ligand_topology_comes_from_component_definition():
+    context = ComplexContext(TASK)
+    ligand = context.ligand
+    assert context.ligand_source.endswith("input/raw/2A6.cif")
+    assert Chem.MolToSmiles(ligand, isomericSmiles=True) == (
+        "c1ccc(Nc2nc(OCC3CCCCC3)c3[nH]cnc3n2)cc1"
+    )
+    assert sum(atom.GetIsAromatic() for atom in ligand.GetAtoms()) == 15
+    assert ligand.GetAtomWithIdx(1).GetTotalNumHs() == 1
+    assert ligand.GetAtomWithIdx(1).GetIsAromatic()
+    assert ligand.GetBondBetweenAtoms(1, 17).GetIsAromatic()
+    assert ligand.GetBondBetweenAtoms(1, 18).GetIsAromatic()
+
+
 def test_evidence_gate_requires_all_categories():
     state = AgentState(task="increase activity", max_context_rounds=8)
     assert not state.ready
@@ -42,7 +56,7 @@ def test_small_query_does_not_cover_required_evidence():
 def test_ligand_fragment_returns_connected_atom_and_bond_subgraph():
     tools = ToolRegistry(ComplexContext(TASK))
     result, evidence = tools.execute(
-        "get_ligand_fragment", {"atom_index": 0, "radius_bonds": 2}
+        "get_ligand_fragment", {"atom_index": 1, "radius_bonds": 2}
     )
     assert evidence == {"fragment_properties"}
     assert result["atom_indices"]
@@ -105,19 +119,19 @@ class RetryQueryClient:
                     "action": "QUERY",
                     "question": "site",
                     "tool": "get_atom_environment",
-                    "arguments": {"atom_index": 0, "radius": 4.0},
+                    "arguments": {"atom_index": 1, "radius": 4.0},
                 }
             if self.calls == 2:
                 return {
                     "action": "QUERY",
                     "question": "space",
                     "tool": "check_growth_space",
-                    "arguments": {"atom_index": 0, "distance": 1.5},
+                    "arguments": {"atom_index": 1, "distance": 1.5},
                 }
             return {
                 "action": "READY",
                 "understanding": "site evidence",
-                "edit_atom_index": 0,
+                "edit_atom_index": 1,
                 "edit_hypothesis": "small methyl edit",
                 "fragment_smiles": "[*:1]C",
             }
@@ -132,7 +146,7 @@ class RetryQueryClient:
             return {
                 "action": "READY",
                 "understanding": "retry with the same chemically valid small edit",
-                "edit_atom_index": 0,
+                "edit_atom_index": 1,
                 "edit_hypothesis": "retry small fluorine edit",
                 "fragment_smiles": "[*:1]F",
             }
@@ -141,11 +155,14 @@ class RetryQueryClient:
 
 def test_edit_retry_can_query_before_ready(tmp_path):
     result = Workflow(TASK, RetryQueryClient(), tmp_path).run()
-    assert result["result"]["status"] == "candidate_accepted"
+    assert result["result"]["status"] == "no_candidate_accepted"
     assert len(result["state"]["observations"]) == 3
-    assert len(result["state"]["decisions"]) == 5
+    assert len(result["state"]["decisions"]) == 7
+    assert result["result"]["attempts"][1]["decision"]["fragment_smiles"] == "[*:1]F"
+    assert result["state"]["decisions"][3]["action"] == "QUERY"
+    assert result["state"]["decisions"][3]["tool"] == "get_fragment_properties"
     assert (tmp_path / "decision-04.json").exists()
-    assert (tmp_path / "decision-05.json").exists()
+    assert (tmp_path / "decision-07.json").exists()
 
 
 class EnvironmentOnlyAblationClient:

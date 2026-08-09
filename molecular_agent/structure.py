@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import gemmi
 import numpy as np
 from rdkit import Chem
 
@@ -54,29 +55,132 @@ def _selector_key(atom: PDBAtom) -> tuple[str, str, int]:
     return atom.chain, atom.residue_name, atom.residue_number
 
 
-def _pdb_ligand_block(path: Path, selected: list[PDBAtom]) -> str:
-    selected_serials = {atom.serial for atom in selected}
-    source_lines = path.read_text(encoding="utf-8").splitlines()
-    atom_lines = [
-        line
-        for line in source_lines
-        if line[:6].strip() == "HETATM" and int(line[6:11]) in selected_serials
-    ]
-    conect_lines = []
-    for line in source_lines:
+def _pdb_ligand_bonds(path: Path, selected: list[PDBAtom]) -> set[frozenset[str]]:
+    names_by_serial = {atom.serial: atom.name for atom in selected}
+    bonds: set[frozenset[str]] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
         if line[:6].strip() != "CONECT":
             continue
-        values = [
+        serials = [
             int(line[index : index + 5])
             for index in range(6, len(line), 5)
             if line[index : index + 5].strip()
         ]
-        if not values or values[0] not in selected_serials:
+        if not serials or serials[0] not in names_by_serial:
             continue
-        kept = [values[0], *[value for value in values[1:] if value in selected_serials]]
-        if len(kept) > 1:
-            conect_lines.append("CONECT" + "".join(f"{value:5d}" for value in kept))
-    return "\n".join([*atom_lines, *conect_lines, "END", ""])
+        for neighbor in serials[1:]:
+            if neighbor in names_by_serial:
+                bonds.add(frozenset((names_by_serial[serials[0]], names_by_serial[neighbor])))
+    if not bonds:
+        raise ValueError("Selected ligand has no PDB CONECT records")
+    return bonds
+
+
+def _component_path(input_dir: Path, residue_name: str) -> Path:
+    return input_dir / "raw" / f"{residue_name}.cif"
+
+
+def _cif_charge(value: str) -> int:
+    if value in {".", "?", ""}:
+        return 0
+    charge = float(value)
+    if not charge.is_integer():
+        raise ValueError(f"Chemical component charge is not integral: {value}")
+    return int(charge)
+
+
+def _bond_type(value_order: str) -> Chem.BondType:
+    try:
+        return {
+            "SING": Chem.BondType.SINGLE,
+            "DOUB": Chem.BondType.DOUBLE,
+            "TRIP": Chem.BondType.TRIPLE,
+            "AROM": Chem.BondType.AROMATIC,
+        }[value_order]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported chemical component bond order: {value_order}") from exc
+
+
+def _build_ligand_from_component(
+    component_path: Path,
+    selected: list[PDBAtom],
+    expected_bonds: set[frozenset[str]],
+) -> Chem.Mol:
+    if not component_path.exists():
+        raise ValueError(
+            "Reliable ligand topology requires the local chemical component file: "
+            f"{component_path}"
+        )
+    block = gemmi.cif.read_file(str(component_path)).sole_block()
+    atom_table = block.find(
+        "_chem_comp_atom.",
+        ["atom_id", "type_symbol", "charge", "pdbx_aromatic_flag"],
+    )
+    component_atoms = [list(row) for row in atom_table if list(row)[1] != "H"]
+    component_by_name = {row[0]: row for row in component_atoms}
+    selected_names = [atom.name for atom in selected]
+    selected_by_name = {atom.name: atom for atom in selected}
+    component_names = list(component_by_name)
+    if len(selected_names) != len(set(selected_names)):
+        raise ValueError("Selected ligand has duplicate atom names")
+    if set(selected_names) != set(component_names):
+        raise ValueError(
+            "PDB ligand atoms do not match the chemical component atoms: "
+            f"pdb_only={sorted(set(selected_names) - set(component_names))}, "
+            f"component_only={sorted(set(component_names) - set(selected_names))}"
+        )
+
+    rw_mol = Chem.RWMol()
+    atom_indices: dict[str, int] = {}
+    for atom_name in selected_names:
+        _, element, charge, aromatic_flag = component_by_name[atom_name]
+        pdb_atom = selected_by_name[atom_name]
+        if element.upper() != pdb_atom.element.upper():
+            raise ValueError(
+                f"Element mismatch for ligand atom {atom_name}: "
+                f"PDB={pdb_atom.element}, component={element}"
+            )
+        rdkit_atom = Chem.Atom(element)
+        rdkit_atom.SetFormalCharge(_cif_charge(charge))
+        if aromatic_flag == "Y":
+            rdkit_atom.SetIsAromatic(True)
+        rdkit_atom.SetProp("atom_name", atom_name)
+        rdkit_atom.SetIntProp("pdb_serial", pdb_atom.serial)
+        atom_indices[atom_name] = rw_mol.AddAtom(rdkit_atom)
+
+    bond_table = block.find(
+        "_chem_comp_bond.",
+        ["atom_id_1", "atom_id_2", "value_order", "pdbx_aromatic_flag"],
+    )
+    seen_bonds: set[frozenset[str]] = set()
+    for atom_1, atom_2, value_order, aromatic_flag in (list(row) for row in bond_table):
+        if atom_1 not in atom_indices or atom_2 not in atom_indices:
+            continue
+        key = frozenset((atom_1, atom_2))
+        if key in seen_bonds:
+            raise ValueError(f"Duplicate chemical component bond: {atom_1}-{atom_2}")
+        seen_bonds.add(key)
+        rw_mol.AddBond(atom_indices[atom_1], atom_indices[atom_2], _bond_type(value_order))
+        bond = rw_mol.GetBondBetweenAtoms(atom_indices[atom_1], atom_indices[atom_2])
+        if aromatic_flag == "Y":
+            bond.SetIsAromatic(True)
+    if seen_bonds != expected_bonds:
+        display = lambda bonds: sorted("-".join(sorted(bond)) for bond in bonds)
+        raise ValueError(
+            "PDB CONECT does not match the chemical component topology: "
+            f"pdb_only={display(expected_bonds - seen_bonds)}, "
+            f"component_only={display(seen_bonds - expected_bonds)}"
+        )
+
+    molecule = rw_mol.GetMol()
+    conformer = Chem.Conformer(molecule.GetNumAtoms())
+    conformer.Set3D(True)
+    for atom in selected:
+        index = atom_indices[atom.name]
+        conformer.SetAtomPosition(index, tuple(float(value) for value in atom.xyz))
+    molecule.AddConformer(conformer)
+    Chem.SanitizeMol(molecule)
+    return molecule
 
 
 class ComplexContext:
@@ -93,18 +197,22 @@ class ComplexContext:
             "residue_name": self.ligand_pdb_atoms[0].residue_name,
             "residue_number": self.ligand_pdb_atoms[0].residue_number,
         }
-        block = _pdb_ligand_block(self.complex_path, self.ligand_pdb_atoms)
-        self.ligand = Chem.MolFromPDBBlock(block, removeHs=False, sanitize=True)
-        if self.ligand is None:
-            raise ValueError("Could not reconstruct ligand graph from PDB HETATM/CONECT records")
+        self.component_path = _component_path(
+            self.input_dir, self.ligand_selector["residue_name"]
+        )
+        self.ligand = _build_ligand_from_component(
+            self.component_path,
+            self.ligand_pdb_atoms,
+            _pdb_ligand_bonds(self.complex_path, self.ligand_pdb_atoms),
+        )
         if self.ligand.GetNumConformers() != 1 or not self.ligand.GetConformer().Is3D():
-            raise ValueError("PDB ligand must contain one 3D conformer")
+            raise ValueError("Chemical component ligand must contain one 3D PDB conformer")
         if self.ligand.GetNumHeavyAtoms() != len(self.ligand_pdb_atoms):
             raise ValueError(
-                "PDB ligand graph/coordinate mismatch: "
+                "Chemical component/PDB ligand atom mismatch: "
                 f"{self.ligand.GetNumHeavyAtoms()} vs {len(self.ligand_pdb_atoms)}"
             )
-        self.ligand_source = "PDB HETATM/CONECT; no separate ligand file required"
+        self.ligand_source = f"PDB coordinates + chemical component topology: {self.component_path}"
 
     def _select_ligand_atoms(self) -> list[PDBAtom]:
         selector = self.task.get("ligand_selector")

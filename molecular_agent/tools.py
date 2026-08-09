@@ -276,6 +276,15 @@ class ToolRegistry:
                 next_frontier.update(neighbor.GetIdx() for neighbor in self.context.ligand.GetAtomWithIdx(current).GetNeighbors())
             visited.update(next_frontier)
             frontier = next_frontier
+        ring_info = self.context.ligand.GetRingInfo()
+        changed = True
+        while changed:
+            changed = False
+            for ring in ring_info.AtomRings():
+                ring_atoms = set(ring)
+                if visited & ring_atoms and not ring_atoms <= visited:
+                    visited.update(ring_atoms)
+                    changed = True
         atom_indices = sorted(visited)
         atom_set = set(atom_indices)
         bond_indices = [
