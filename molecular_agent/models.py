@@ -24,6 +24,20 @@ class AgentState:
     decisions: list[dict[str, Any]] = field(default_factory=list)
     evidence: set[str] = field(default_factory=set)
     call_signatures: set[str] = field(default_factory=set)
+    docking_history: list[dict[str, Any]] = field(default_factory=list)
+    candidate_history: list[dict[str, Any]] = field(default_factory=list)
+    exploration_attempts: list[dict[str, Any]] = field(default_factory=list)
+    unmodifiable_targets: list[dict[str, Any]] = field(default_factory=list)
+    tool_rejections: list[dict[str, Any]] = field(default_factory=list)
+    convergence: dict[str, Any] = field(default_factory=lambda: {
+        "status": "not_started",
+        "converged": False,
+        "llm_controls_termination": True,
+        "stop_authority": "llm_or_hard_safety_limit",
+        "best_attempt": None,
+        "best_quality": None,
+        "non_improving_attempts": 0,
+    })
 
     @property
     def missing_evidence(self) -> list[str]:
@@ -50,4 +64,10 @@ class AgentState:
                 }
                 for item in self.observations
             ],
+            "docking_history": self.docking_history,
+            "candidate_history": self.candidate_history,
+            "exploration_attempts": self.exploration_attempts,
+            "unmodifiable_targets": self.unmodifiable_targets,
+            "tool_rejections": self.tool_rejections,
+            "convergence": self.convergence,
         }

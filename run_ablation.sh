@@ -18,12 +18,12 @@ fi
 
 TASK_PATH="${TASK_PATH:-input/task.json}"
 CONFIG_PATH="${CONFIG_PATH:-config.aicloud.json}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-aicloud-pocket-6A-mapped-01}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-runs/ablation-aicloud-pocket-6A-mapped-02}"
 COORDINATE_SCOPE="${COORDINATE_SCOPE:-pocket}"
 POCKET_RADIUS="${POCKET_RADIUS:-6.0}"
 BUDGETS="${BUDGETS:-0 1 2 3 4 5}"
 FINAL_BUDGET="${FINAL_BUDGET:-6}"
-ABLATION_MODEL="${ABLATION_MODEL:-GLM-5.2}"
+ABLATION_MODEL="${ABLATION_MODEL:-GLM-5.3}"
 ABLATION_BASE_URL="${ABLATION_BASE_URL:-https://llmapi.blsc.cn/v1}"
 AICLOUD_KEY_FILE="${AICLOUD_KEY_FILE:-$HOME/.aicloud_api_key}"
 

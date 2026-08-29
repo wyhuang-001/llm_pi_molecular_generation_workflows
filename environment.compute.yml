@@ -1,0 +1,60 @@
+name: molecular-agent
+channels:
+  - conda-forge
+
+# Shared Linux x86_64 environment for the molecular-agent workflow, docking,
+# and AsyncFEP/RBFE preparation and analysis. The installer may replace the
+# cuda-version line with COMPUTE_CUDA_VERSION before handing this file to conda.
+dependencies:
+  - python=3.11
+  # Compatibility-critical versions verified together on conda-forge/linux-64.
+  - numpy=1.26.4
+  - scipy=1.13.1
+
+  # Current structure/design workflow
+  - curl
+  - rdkit>=2025.03
+  - gemmi>=0.7
+  - pydantic>=2.9
+  - pytest>=8
+
+  # Docking, pose handling, and structure/QC utilities
+  - openbabel>=3.1
+  - vina=1.2.7
+  - prody=2.6.1
+  - mdanalysis>=2.7
+  - prolif>=2
+  - spyrmsd>=0.6
+  - freesasa
+  - freesasa-python
+
+  # AsyncFEP/Bloom runtime and MBAR analysis
+  - openmm=8.2.0
+  - pyyaml
+  - matplotlib-base
+  - pandas
+  - pyarrow
+  - parmed
+  - pymbar=4.2.0
+  # Keep pymbar's JAX backend on the solver-verified NumPy 1.26 stack.
+  - jax=0.6.2
+  - jaxlib=0.6.2
+  - duckdb
+  - click
+  - nvidia-ml-py
+  - psutil
+
+  # Topology preparation used by bloom-prepare and reference RBFE pipeline
+  - ambertools=24.8
+  - xtb=6.7.1
+  - openff-toolkit=0.18.0
+  - openmmforcefields=0.15.1
+  - pdbfixer=1.12
+
+  # OpenMM CUDA package selection. The installer can override this value.
+  - cuda-version=12.0
+
+  # The installer uses pip for local editable packages and pip-only extras.
+  - pip
+  - setuptools>=68
+  - wheel

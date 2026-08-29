@@ -402,17 +402,18 @@ def run_budget(
                     receptor_path = context.write_receptor_pdb(
                         run_dir / "receptor-protein-only.pdb"
                     )
-                    docking_adapter, rbfe_adapter = configured_adapters(config_path, run_dir)
+                    docking_adapter, _rbfe_adapter = configured_adapters(config_path, run_dir)
                     docking = docking_adapter.run(
                         candidate_path=candidate_path,
                         receptor_path=receptor_path,
-                    )
-                    rbfe = rbfe_adapter.run(
-                        candidate_path=candidate_path,
-                        receptor_path=receptor_path,
                         reference_path=reference_path,
-                        docking_result=docking,
+                        output_dir=run_dir / "docking",
                     )
+                    rbfe = {
+                        "stage": "rbfe",
+                        "status": "deferred",
+                        "message": "RBFE is intentionally deferred; this ablation stops after docking.",
+                    }
                 result = {
                     "decision": final_decision,
                     "validation": edit_result.report,
@@ -447,8 +448,8 @@ def run_budget(
             "evaluation_scope": {
                 "site_evidence": "required_and_failed",
                 "affinity": "not_evaluated",
-                "docking": "not_configured",
-                "fep": "not_configured",
+                "docking": "not_run_site_evidence_gate_failed",
+                "fep": "deferred",
             },
         }
     except Exception as exc:

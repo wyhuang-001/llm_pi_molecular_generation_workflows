@@ -6,3 +6,5 @@ runs/*
 __pycache__/
 .pytest_cache/
 *.pyc
+cache/chembl_*_chemreps.txt.gz
+molecular_agent/data/*.checkpoint.sqlite

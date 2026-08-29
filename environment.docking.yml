@@ -1,0 +1,40 @@
+name: molecular-agent-docking
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - numpy=1.26.4
+  - scipy=1.13.1
+  - curl
+  - rdkit>=2025.03
+  - gemmi>=0.7
+  - pydantic>=2.9
+  - pytest>=8
+
+  # GNINA v1.3.2 CUDA 12 runtime. The node supplies the NVIDIA driver/kernel.
+  - cuda-version=12.0
+  - cuda-cudart=12.0
+  - cuda-nvrtc=12.0
+  - cuda-nvtx=12.0
+  - libcublas=12.0
+  - libcudnn=9.10
+  - cudnn=9.10
+  - libcufft=11.0
+  - libcusparse=12.0
+  - libcusolver=11.4
+  - libnvjitlink=12.0
+
+  # Docking and receptor/ligand preparation
+  - openbabel>=3.1
+  - vina=1.2.7
+  - prody=2.6.1
+  - mdanalysis>=2.7
+  - prolif>=2
+  - spyrmsd>=0.6
+  - freesasa
+  - freesasa-python
+
+  - pip
+  - setuptools>=68
+  - wheel

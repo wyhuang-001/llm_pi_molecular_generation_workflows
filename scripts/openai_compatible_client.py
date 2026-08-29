@@ -16,6 +16,7 @@ class OpenAICompatibleChatClient:
         self.base_url = config["base_url"].rstrip("/")
         self.model = config["model"]
         self.timeout = int(config.get("timeout_seconds", 600))
+        self.max_output_tokens = int(config.get("max_output_tokens", 8192))
         self.system_prompt = system_prompt
         key_env = config.get("api_key_env", "AICLOUD_API_KEY")
         self.api_key = os.environ.get(key_env, "")
@@ -35,6 +36,7 @@ class OpenAICompatibleChatClient:
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0,
+            "max_tokens": self.max_output_tokens,
         }
         with tempfile.TemporaryDirectory(prefix="simple-agent-chat-") as tmp:
             request_path = Path(tmp) / "request.json"
@@ -80,7 +82,9 @@ class OpenAICompatibleChatClient:
                     f"Chat API endpoint returned invalid JSON: {raw_response[:1000]}"
                 ) from error
         try:
-            text = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            text = choice["message"]["content"]
+            finish_reason = choice.get("finish_reason")
         except (KeyError, IndexError, TypeError) as error:
             if diagnostic_path is not None:
                 self._write_diagnostic(
@@ -88,6 +92,16 @@ class OpenAICompatibleChatClient:
                     "missing_assistant_message",
                 )
             raise RuntimeError("Chat API response contained no assistant message") from error
+        if finish_reason == "length":
+            if diagnostic_path is not None:
+                self._write_diagnostic(
+                    diagnostic_path, payload, body, raw_response, data, text,
+                    "assistant_output_truncated",
+                )
+            raise RuntimeError(
+                "Chat API assistant output was truncated at the configured token limit; "
+                "increase max_output_tokens"
+            )
         if not text:
             if diagnostic_path is not None:
                 self._write_diagnostic(
@@ -95,8 +109,9 @@ class OpenAICompatibleChatClient:
                     "empty_assistant_content",
                 )
             raise RuntimeError("Chat API response contained empty assistant content")
+        normalized_text = self._normalize_json_content(text)
         try:
-            parsed = json.loads(text)
+            parsed = json.loads(normalized_text)
         except json.JSONDecodeError as error:
             if diagnostic_path is not None:
                 self._write_diagnostic(
@@ -115,6 +130,18 @@ class OpenAICompatibleChatClient:
                 f"got {type(parsed).__name__}: {text[:1000]}"
             )
         return parsed
+
+    @staticmethod
+    def _normalize_json_content(text: str) -> str:
+        """Accept JSON wrapped in a Markdown code fence, while rejecting truncation."""
+        normalized = text.strip()
+        if normalized.startswith("```"):
+            first_newline = normalized.find("\n")
+            if first_newline >= 0:
+                normalized = normalized[first_newline + 1 :].strip()
+            if normalized.endswith("```"):
+                normalized = normalized[:-3].rstrip()
+        return normalized
 
     @staticmethod
     def _write_diagnostic(

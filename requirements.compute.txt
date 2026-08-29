@@ -1,0 +1,3 @@
+# Pip-only additions. Conda owns the NumPy/OpenMM/scientific stack above.
+# The installer intentionally uses --no-deps so pip cannot replace those conda packages.
+meeko==0.7.1

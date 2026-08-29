@@ -198,7 +198,7 @@ class ComplexContext:
             "residue_number": self.ligand_pdb_atoms[0].residue_number,
         }
         self.component_path = _component_path(
-            self.input_dir, self.ligand_selector["residue_name"]
+            self.complex_path.parent, self.ligand_selector["residue_name"]
         )
         self.ligand = _build_ligand_from_component(
             self.component_path,

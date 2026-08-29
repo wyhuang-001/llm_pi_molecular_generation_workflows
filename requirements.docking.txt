@@ -1,0 +1,3 @@
+# Meeko is installed separately because its packaging is most reliable from PyPI.
+# Conda owns the scientific stack in environment.docking.yml.
+meeko==0.7.1

@@ -1,15 +1,24 @@
 {
   "base_url": "https://llmapi.blsc.cn/v1",
-  "model": "GLM-5.2",
+  "model": "GLM-5.3",
   "api_key_env": "AICLOUD_API_KEY",
+  "api_key_file": "~/.aicloud_api_key",
   "timeout_seconds": 600,
+  "max_output_tokens": 16384,
+  "reasoning_effort": "low",
+  "repair_max_output_tokens": 4096,
+  "repair_reasoning_effort": "low",
   "docking": {
     "enabled": false,
     "timeout_seconds": 3600,
+    "seeds": [17, 29, 43],
     "command": [
       "gnina",
       "-r", "{receptor}",
       "-l", "{candidate}",
+      "--autobox_ligand", "{reference}",
+      "--autobox_add", "4",
+      "--seed", "{seed}",
       "--num_modes", "20",
       "-o", "{output_dir}/docked.sdf",
       "--log", "{output_dir}/gnina.log"

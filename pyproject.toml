@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "Minimal LLM-guided protein-ligand editing workflow"
 requires-python = ">=3.11"
 dependencies = [
-  "numpy>=2.0",
+  # AsyncFEP/Bloom currently requires NumPy 1.26.x. Keep the shared compute
+  # environment on the NumPy 1 ABI until both workflows support NumPy 2.
+  "numpy>=1.26,<2",
   "rdkit>=2025.03",
   "gemmi>=0.7",
   "pydantic>=2.9",
@@ -12,6 +14,12 @@ dependencies = [
 
 [project.scripts]
 molecular-agent = "molecular_agent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["molecular_agent*"]
+
+[tool.setuptools.package-data]
+molecular_agent = ["data/*.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "source": {
+    "name": "Project seed fragments",
+    "license": "CC0-1.0",
+    "note": "Small offline seed set. Replace or extend with an audited library export."
+  },
+  "fragments": [
+    {"fragment_id": "fluoro", "name": "fluoro", "smiles": "[*:1]F", "operation": "substitute"},
+    {"fragment_id": "chloro", "name": "chloro", "smiles": "[*:1]Cl", "operation": "substitute"},
+    {"fragment_id": "methyl", "name": "methyl", "smiles": "[*:1]C", "operation": "substitute"},
+    {"fragment_id": "hydroxy", "name": "hydroxy", "smiles": "[*:1]O", "operation": "substitute"},
+    {"fragment_id": "amino", "name": "amino", "smiles": "[*:1]N", "operation": "substitute"},
+    {"fragment_id": "cyano", "name": "cyano", "smiles": "[*:1]C#N", "operation": "substitute"},
+    {"fragment_id": "methoxy", "name": "methoxy", "smiles": "[*:1]OC", "operation": "substitute"},
+    {"fragment_id": "acetamide", "name": "acetamide", "smiles": "[*:1]C(=O)N", "operation": "substitute"},
+    {"fragment_id": "phenyl", "name": "phenyl", "smiles": "[*:1]c1ccccc1", "operation": "substitute"},
+    {"fragment_id": "ethyl", "name": "ethyl", "smiles": "[*:1]CC", "operation": "substitute"}
+  ]
+}

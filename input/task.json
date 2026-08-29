@@ -6,6 +6,21 @@
     "residue_name": "2A6",
     "residue_number": 1298
   },
-  "max_context_rounds": 8,
-  "max_edit_attempts": 4
+  "max_context_rounds": 256,
+  "fragment_library_path": "../molecular_agent/data/chembl_fragments_working.json",
+  "docking_optimization": {
+    "primary_metric": "minimizedAffinity",
+    "minimum_improvement": 0.25,
+    "seed_stddev_penalty": 0.25,
+    "minimum_seed_win_fraction": 0.6666666667,
+    "hard_max_attempts": 80
+  },
+  "search_policy": {
+    "mode": "adaptive",
+    "minimum_distinct_transformations_per_target": 2
+  },
+  "fragment_replacement": {
+    "max_removed_heavy_atom_fraction": 0.4,
+    "protected_core_atom_indices": []
+  }
 }
