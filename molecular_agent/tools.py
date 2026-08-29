@@ -23,6 +23,53 @@ class ToolRegistry:
                 {"ligand_identity"},
                 {"type": "object", "properties": {}, "additionalProperties": False},
             ),
+            "get_edit_site_candidates": (
+                self.get_edit_site_candidates,
+                {"edit_site_candidates"},
+                {"type": "object", "properties": {}, "additionalProperties": False},
+            ),
+            "assess_edit_sites": (
+                self.assess_edit_sites,
+                {"site_strategy"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "sites": {
+                            "type": "array",
+                            "minItems": 1,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "target_type": {
+                                        "type": "string",
+                                        "enum": ["atom", "replacement_site"],
+                                    },
+                                    "target_id": {},
+                                    "priority": {"type": "integer", "minimum": 1},
+                                    "site_type": {
+                                        "type": "string",
+                                        "enum": [
+                                            "core_anchor",
+                                            "pocket_extension",
+                                            "solvent_exposed",
+                                            "linker_or_sidechain",
+                                            "uncertain",
+                                        ],
+                                    },
+                                    "rationale": {"type": "string", "minLength": 1},
+                                },
+                                "required": [
+                                    "target_type", "target_id", "priority", "site_type", "rationale"
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "global_rationale": {"type": "string"},
+                    },
+                    "required": ["sites"],
+                    "additionalProperties": False,
+                },
+            ),
             "get_pocket_residues": (
                 self.get_pocket_residues,
                 {"pocket_environment"},
@@ -104,6 +151,25 @@ class ToolRegistry:
                     "required": ["fragment_smiles"],
                 },
             ),
+            "generate_site_candidate_batch": (
+                self.generate_site_candidate_batch,
+                {"candidate_batch"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "target_type": {
+                            "type": "string",
+                            "enum": ["atom", "replacement_site"],
+                        },
+                        "target_id": {},
+                        "query": {"type": "string"},
+                        "max_heavy_atoms": {"type": "integer", "minimum": 1, "maximum": 30},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 32},
+                    },
+                    "required": ["target_type", "target_id"],
+                    "additionalProperties": False,
+                },
+            ),
             "search_fragment_library": (
                 self.search_fragment_library,
                 {"fragment_library"},
@@ -165,6 +231,14 @@ class ToolRegistry:
     def catalog(self, include_candidate_geometry: bool = True) -> dict[str, Any]:
         requirements = {
             "get_ligand_info": "Any successful call covers ligand identity.",
+            "get_edit_site_candidates": (
+                "Returns all host-supported atom and replacement-site targets with deterministic local "
+                "environment, interaction, and directional geometry summaries for strategy assessment."
+            ),
+            "assess_edit_sites": (
+                "Submit one priority and site_type assessment for each currently plausible host target. "
+                "The host validates target IDs; this is an LLM hypothesis record, not an affinity prediction."
+            ),
             "get_pocket_residues": "radius must be at least 5.0 A to cover pocket environment.",
             "detect_basic_interactions": "cutoff must be at least 4.0 A to cover key interactions.",
             "get_atom_environment": "radius must be at least 4.0 A for the final edit atom.",
@@ -172,6 +246,10 @@ class ToolRegistry:
             "list_fragment_replacement_sites": "Enumerates host-validated directed side-chain cuts. Use replacement_site_id; never guess cut_bond indices.",
             "get_replacement_site_spatial_profile": "Returns deterministic attachment-vector probes and nearest protein distances for one returned replacement_site_id. It reports geometry facts, not a suitability verdict.",
             "validate_candidate_geometry": "Runs the exact deterministic candidate construction and rigid-protein clash check. replace_fragment requires a replacement_site_id returned by list_fragment_replacement_sites.",
+            "generate_site_candidate_batch": (
+                "For one locked atom or replacement site, retrieve an operation-compatible fragment batch "
+                "and run deterministic candidate construction and rigid-protein clash prescreening."
+            ),
             "search_fragment_library": "Searches by one supported chemical term (for example heterocycle, pyridine, morpholine, indole, oxetane, nitrile), one valid SMILES/SMARTS pattern, or an empty query for browsing. Do not send natural-language descriptions. Results include source metadata.",
             "get_fragment_record": "Returns one auditable library record by fragment_id.",
             "get_fragment_properties": "Any valid fragment returns deterministic fragment properties.",
@@ -196,6 +274,8 @@ class ToolRegistry:
         result = handler(**arguments)
         covers = {
             "get_ligand_info": True,
+            "get_edit_site_candidates": True,
+            "assess_edit_sites": True,
             "get_pocket_residues": float(arguments.get("radius", 0)) >= 5.0,
             "detect_basic_interactions": float(arguments.get("cutoff", 0)) >= 4.0,
             "get_atom_environment": float(arguments.get("radius", 0)) >= 4.0,
@@ -203,6 +283,7 @@ class ToolRegistry:
             "list_fragment_replacement_sites": True,
             "get_replacement_site_spatial_profile": True,
             "validate_candidate_geometry": True,
+            "generate_site_candidate_batch": True,
             "get_fragment_properties": True,
             "get_fragment_spatial_profile": True,
             "get_ligand_fragment": True,
@@ -214,6 +295,169 @@ class ToolRegistry:
             and result.get("failure_class") == "unsupported_fragment_query"
         )
         return result, set(potential_evidence) if covers and not rejected_query else set()
+
+    def get_edit_site_candidates(self) -> dict[str, Any]:
+        interactions = self.detect_basic_interactions(4.0).get("contacts", [])
+        interactions_by_atom: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for contact in interactions:
+            atom_index = contact.get("ligand_atom_index")
+            if isinstance(atom_index, int):
+                interactions_by_atom[atom_index].append(contact)
+        atom_sites = []
+        for atom in self.context.ligand.GetAtoms():
+            if (
+                atom.GetAtomicNum() <= 1
+                or atom.GetTotalNumHs() < 1
+                or (atom.GetSymbol() == "N" and atom.GetIsAromatic())
+            ):
+                continue
+            atom_index = atom.GetIdx()
+            environment = self.get_atom_environment(atom_index, 4.0)
+            try:
+                growth = self.check_growth_space(atom_index, 3.0)
+            except Exception as error:
+                growth = {"status": "unavailable", "error": str(error)}
+            atom_sites.append({
+                "target_type": "atom",
+                "target_id": atom_index,
+                "element": atom.GetSymbol(),
+                "aromatic": atom.GetIsAromatic(),
+                "replaceable_hydrogens": atom.GetTotalNumHs(),
+                "nearby_protein_atoms": environment["protein_atoms"][:10],
+                "current_interactions": interactions_by_atom.get(atom_index, [])[:8],
+                "growth_probe": {
+                    key: growth.get(key)
+                    for key in (
+                        "status", "probe_distance", "probe_xyz", "minimum_clearance",
+                        "nearest_protein_atoms", "error",
+                    )
+                    if key in growth
+                },
+            })
+        replacement_sites = []
+        for site in self._replacement_sites:
+            try:
+                spatial = self.get_replacement_site_spatial_profile(
+                    site["replacement_site_id"], max_distance=4.0, probe_count=5
+                )
+                directional_clearance = [
+                    {
+                        "label": item["label"],
+                        "minimum_protein_atom_distance_along_probe": item[
+                            "minimum_protein_atom_distance_along_probe"
+                        ],
+                    }
+                    for item in spatial["direction_profiles"]
+                ]
+            except Exception as error:
+                directional_clearance = [{"status": "unavailable", "error": str(error)}]
+            replacement_sites.append({
+                "target_type": "replacement_site",
+                "target_id": site["replacement_site_id"],
+                "retained_atom_index": site["retained_atom_index"],
+                "removed_side_atom_index": site["removed_side_atom_index"],
+                "removed_heavy_atoms": site["removed_heavy_atoms"],
+                "removed_fraction": site["removed_fraction"],
+                "removed_fragment_smiles": site["removed_fragment_smiles"],
+                "attachment_vector": site["attachment_vector"],
+                "retained_atom_interactions": interactions_by_atom.get(
+                    site["retained_atom_index"], []
+                )[:8],
+                "directional_clearance": directional_clearance,
+            })
+        return {
+            "status": "complete",
+            "atom_site_count": len(atom_sites),
+            "replacement_site_count": len(replacement_sites),
+            "atom_sites": atom_sites,
+            "replacement_sites": replacement_sites,
+            "site_type_vocabulary": [
+                "core_anchor", "pocket_extension", "solvent_exposed",
+                "linker_or_sidechain", "uncertain",
+            ],
+            "limitation": (
+                "These are deterministic host-supported targets and rigid-structure summaries. Priority and "
+                "site type remain LLM assessments; receptor flexibility and binding free energy are not modeled."
+            ),
+        }
+
+    def assess_edit_sites(
+        self,
+        sites: list[dict[str, Any]],
+        global_rationale: str = "",
+    ) -> dict[str, Any]:
+        if not isinstance(sites, list) or not sites:
+            raise ValueError("assess_edit_sites requires a non-empty sites array")
+        editable_atoms = {
+            atom.GetIdx()
+            for atom in self.context.ligand.GetAtoms()
+            if atom.GetAtomicNum() > 1
+            and atom.GetTotalNumHs() > 0
+            and not (atom.GetSymbol() == "N" and atom.GetIsAromatic())
+        }
+        replacement_sites = {
+            site["replacement_site_id"] for site in self._replacement_sites
+        }
+        allowed_types = {
+            "core_anchor", "pocket_extension", "solvent_exposed",
+            "linker_or_sidechain", "uncertain",
+        }
+        normalized = []
+        seen_targets = set()
+        seen_priorities = set()
+        for item in sites:
+            if not isinstance(item, dict):
+                raise ValueError("Each site assessment must be an object")
+            target_type = item.get("target_type")
+            target_id = item.get("target_id")
+            priority = item.get("priority")
+            site_type = item.get("site_type")
+            rationale = item.get("rationale")
+            if target_type not in {"atom", "replacement_site"}:
+                raise ValueError("site assessment target_type must be atom or replacement_site")
+            valid_target = (
+                target_type == "atom" and isinstance(target_id, int) and target_id in editable_atoms
+            ) or (
+                target_type == "replacement_site"
+                and isinstance(target_id, str)
+                and target_id in replacement_sites
+            )
+            if not valid_target:
+                raise ValueError(f"Unknown or non-editable site target: {target_type}:{target_id}")
+            if not isinstance(priority, int) or priority < 1:
+                raise ValueError("site assessment priority must be a positive integer")
+            if priority in seen_priorities:
+                raise ValueError("site assessment priorities must be unique")
+            if site_type not in allowed_types:
+                raise ValueError(f"Unsupported site_type: {site_type!r}")
+            if not isinstance(rationale, str) or not rationale.strip():
+                raise ValueError("site assessment rationale must be non-empty")
+            target_key = (target_type, target_id)
+            if target_key in seen_targets:
+                raise ValueError(f"Duplicate site assessment: {target_type}:{target_id}")
+            seen_targets.add(target_key)
+            seen_priorities.add(priority)
+            normalized.append({
+                "target_type": target_type,
+                "target_id": target_id,
+                "priority": priority,
+                "site_type": site_type,
+                "rationale": rationale.strip(),
+            })
+        priorities = sorted(seen_priorities)
+        if priorities != list(range(1, len(priorities) + 1)):
+            raise ValueError("site assessment priorities must be consecutive starting at 1")
+        normalized.sort(key=lambda item: item["priority"])
+        return {
+            "status": "complete",
+            "sites": normalized,
+            "site_count": len(normalized),
+            "global_rationale": global_rationale.strip() if isinstance(global_rationale, str) else "",
+            "limitation": (
+                "Priority and site type are LLM-generated strategic assessments validated against host targets. "
+                "They are not structural annotations, docking scores, or affinity predictions."
+            ),
+        }
 
     def get_ligand_info(self) -> dict[str, Any]:
         molecule = self.context.ligand
@@ -799,6 +1043,103 @@ class ToolRegistry:
         except Exception as exc:
             return {"status": "rejected", "error": str(exc), "transformation": transformation}
         return {**result.report, "transformation": transformation}
+
+    def generate_site_candidate_batch(
+        self,
+        target_type: str,
+        target_id: Any,
+        query: str = "",
+        max_heavy_atoms: int = 12,
+        limit: int = 16,
+    ) -> dict[str, Any]:
+        if target_type == "atom":
+            atom = self._ligand_atom(target_id)
+            if atom.GetTotalNumHs() < 1 or (atom.GetSymbol() == "N" and atom.GetIsAromatic()):
+                raise ValueError(f"Atom {target_id!r} is not supported for replace_hydrogen")
+            operation = "substitute"
+        elif target_type == "replacement_site":
+            self.resolve_replacement_site(target_id)
+            operation = "replace_fragment"
+        else:
+            raise ValueError("target_type must be atom or replacement_site")
+        search = self.fragment_library.search(
+            query=query,
+            max_heavy_atoms=max_heavy_atoms,
+            operation=operation,
+            limit=limit,
+        )
+        if search.get("status") != "complete":
+            return {
+                **search,
+                "target_type": target_type,
+                "target_id": target_id,
+                "candidates": [],
+            }
+        candidates = []
+        rejected = []
+        seen_structures = set()
+        for record in search.get("fragments", []):
+            transformation = {
+                "operation": "replace_hydrogen" if target_type == "atom" else "replace_fragment",
+                "fragment_id": record["fragment_id"],
+                "fragment_smiles": record["smiles"],
+            }
+            if target_type == "atom":
+                transformation["edit_atom_index"] = target_id
+            else:
+                transformation["replacement_site_id"] = target_id
+                self._resolve_fragment_replacement(transformation)
+            try:
+                result = apply_transformation(
+                    self.context.ligand,
+                    transformation,
+                    self.context.protein_atoms,
+                    seed=17,
+                )
+            except Exception as error:
+                rejected.append({
+                    "fragment_id": record["fragment_id"],
+                    "fragment_smiles": record["smiles"],
+                    "failure_class": "candidate_construction_or_geometry",
+                    "error": str(error),
+                })
+                continue
+            canonical = result.report["candidate"]["canonical_smiles"]
+            if canonical in seen_structures:
+                continue
+            seen_structures.add(canonical)
+            summary = {
+                "fragment_id": record["fragment_id"],
+                "fragment_smiles": record["smiles"],
+                "transformation": transformation,
+                "canonical_smiles": canonical,
+                "status": result.report["status"],
+                "failure_class": result.report.get("failure_class"),
+                "severe_clash_count": result.report.get("severe_clash_count"),
+                "property_delta": result.report.get("property_delta"),
+                "fragment_properties": record.get("properties"),
+            }
+            if result.report["status"] == "accepted":
+                candidates.append(summary)
+            else:
+                rejected.append(summary)
+        return {
+            "status": "complete",
+            "target_type": target_type,
+            "target_id": target_id,
+            "query": query,
+            "operation": operation,
+            "requested_limit": limit,
+            "library_match_count": search.get("count", 0),
+            "accepted_count": len(candidates),
+            "rejected_count": len(rejected),
+            "candidates": candidates,
+            "rejected": rejected[:20],
+            "limitation": (
+                "Candidates passed only deterministic construction and rigid-protein clash prescreening. "
+                "They are not docked, ranked by affinity, or experimental activity predictions."
+            ),
+        }
 
     def search_fragment_library(
         self,

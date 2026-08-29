@@ -29,6 +29,9 @@ class AgentState:
     exploration_attempts: list[dict[str, Any]] = field(default_factory=list)
     unmodifiable_targets: list[dict[str, Any]] = field(default_factory=list)
     tool_rejections: list[dict[str, Any]] = field(default_factory=list)
+    site_strategy: dict[str, Any] | None = None
+    active_target: dict[str, Any] | None = None
+    site_search: dict[str, dict[str, Any]] = field(default_factory=dict)
     convergence: dict[str, Any] = field(default_factory=lambda: {
         "status": "not_started",
         "converged": False,
@@ -69,5 +72,8 @@ class AgentState:
             "exploration_attempts": self.exploration_attempts,
             "unmodifiable_targets": self.unmodifiable_targets,
             "tool_rejections": self.tool_rejections,
+            "site_strategy": self.site_strategy,
+            "active_target": self.active_target,
+            "site_search": self.site_search,
             "convergence": self.convergence,
         }

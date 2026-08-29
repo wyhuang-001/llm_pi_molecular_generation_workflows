@@ -17,7 +17,14 @@
   },
   "search_policy": {
     "mode": "adaptive",
-    "minimum_distinct_transformations_per_target": 2
+    "minimum_distinct_transformations_per_target": 2,
+    "site_lock_enabled": true,
+    "site_strategy_required": true,
+    "minimum_prioritized_sites": 1,
+    "minimum_local_attempts": 6,
+    "minimum_local_families": 2,
+    "local_patience": 3,
+    "maximum_local_attempts": 12
   },
   "fragment_replacement": {
     "max_removed_heavy_atom_fraction": 0.4,

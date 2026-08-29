@@ -108,6 +108,7 @@ class Workflow:
             max_context_rounds=int(self.context.task.get("max_context_rounds", 8)),
         )
         self.reference_docking_result: dict[str, Any] | None = None
+        self._design_phase = False
 
     def _emit(self, event: str, details: dict[str, Any] | None = None) -> None:
         if self.progress:
@@ -160,6 +161,7 @@ class Workflow:
                 "max_probe_distance", "probe_count", "fragment_id", "fragment_smiles",
                 "conformer_count", "max_attachment_distance", "maximum_forward_extent",
                 "maximum_radial_extent", "radius_of_gyration",
+                "site_count", "accepted_count", "rejected_count", "target_type", "target_id",
             )
             if key in result
         }
@@ -268,10 +270,13 @@ class Workflow:
             "tool_catalog": self.tools.catalog(),
             "host_ready": self.state.ready,
             "instruction": (
-                "Choose what knowledge is needed next. The host does not preselect the operation or "
-                "design region. Use the chemical tools to compare replace_hydrogen and replace_fragment, "
-                "query spatial facts when needed, then return READY only when the evidence supports the "
-                "selected operation and final edit site. Do not follow a fixed query sequence."
+                "Choose what knowledge is needed next. When site_strategy_required is enabled, first use "
+                "the chemical tools to inspect the ligand, pocket, interactions, and replacement sites. Call "
+                "get_edit_site_candidates to obtain one structured host-supported site dossier, then call "
+                "assess_edit_sites with an evidence-backed priority and site_type for each plausible "
+                "host target. The host will lock the highest-priority open target during design. Use the chemical "
+                "tools to compare replace_hydrogen and replace_fragment, query spatial facts when needed, then "
+                "return READY only when the evidence supports the selected operation and final edit site."
             ),
         }
         payload["optimization_context"] = self._optimization_context()
@@ -392,6 +397,31 @@ class Workflow:
             self.state.tool_rejections.append(rejection)
             self._emit("tool_call_reused", rejection)
             return
+        if tool == "assess_edit_sites" and not any(
+            item.tool == "get_edit_site_candidates" for item in self.state.observations
+        ):
+            raise RuntimeError(
+                "assess_edit_sites requires a prior get_edit_site_candidates observation so priorities and "
+                "site types are grounded in one host-supported site dossier"
+            )
+        if tool == "assess_edit_sites" and self._design_phase and self.state.exploration_attempts:
+            raise RuntimeError(
+                "assess_edit_sites is only allowed before design attempts; the active site strategy cannot "
+                "be reordered after local search has started"
+            )
+        if tool == "generate_site_candidate_batch" and self._design_phase:
+            active = self.state.active_target
+            proposed = {
+                "target_type": arguments.get("target_type"),
+                "target_id": arguments.get("target_id"),
+            }
+            if active is not None and proposed != {
+                "target_type": active.get("target_type"),
+                "target_id": active.get("target_id"),
+            }:
+                raise RuntimeError(
+                    "generate_site_candidate_batch may only target the current active prioritized site"
+                )
         self._emit("tool_started", {"tool": tool, "arguments": arguments})
         result, evidence = self.tools.execute(tool, arguments)
         self.state.call_signatures.add(signature)
@@ -399,6 +429,16 @@ class Workflow:
         self.state.observations.append(
             ToolObservation(tool=tool, arguments=arguments, result=result, evidence=evidence)
         )
+        if tool == "assess_edit_sites" and result.get("status") == "complete":
+            self.state.site_strategy = result
+            self.state.active_target = None
+            self.state.site_search = {}
+            self._refresh_site_search()
+            self._write_json("site-strategy.json", result)
+            self._emit("site_strategy_updated", {
+                "site_count": result.get("site_count"),
+                "active_target": self.state.active_target,
+            })
         if tool == "validate_candidate_geometry":
             transformation = result.get("transformation") or arguments
             status = "geometry_accepted" if result.get("status") == "accepted" else "geometry_rejected"
@@ -603,6 +643,19 @@ class Workflow:
         if not isinstance(reason, str) or not reason.strip():
             raise RuntimeError("MARK_UNMODIFIABLE requires a non-empty reason")
         policy = self._search_policy()
+        if policy["site_lock_enabled"] and self._design_phase:
+            self._refresh_site_search()
+            active = self.state.active_target
+            if active is None:
+                raise RuntimeError("MARK_UNMODIFIABLE requires an active prioritized target")
+            if (
+                target_type != active.get("target_type")
+                or target_id != active.get("target_id")
+            ):
+                raise RuntimeError(
+                    "MARK_UNMODIFIABLE may only close the current active prioritized target: "
+                    f"{active.get('target_type')}:{active.get('target_id')}"
+                )
         if policy["mode"] == "adaptive" and scope == "site":
             attempted = len(self._distinct_target_transformations(target_type, target_id))
             minimum = policy["minimum_distinct_transformations_per_target"]
@@ -643,6 +696,7 @@ class Workflow:
         )
         if scope == "family" and isinstance(family, str):
             attempt_record["family"] = family
+        self._refresh_site_search()
 
     @staticmethod
     def _docking_feedback_summary(docking: dict[str, Any]) -> dict[str, Any]:
@@ -683,10 +737,181 @@ class Workflow:
 
     def _search_policy(self) -> dict[str, Any]:
         configured = self.context.task.get("search_policy") or {}
+        mode = str(configured.get("mode", "family_coverage"))
         return {
-            "mode": str(configured.get("mode", "family_coverage")),
+            "mode": mode,
             "minimum_distinct_transformations_per_target": int(
                 configured.get("minimum_distinct_transformations_per_target", 2)
+            ),
+            "site_lock_enabled": bool(configured.get("site_lock_enabled", False)),
+            "site_strategy_required": bool(configured.get("site_strategy_required", False)),
+            "minimum_prioritized_sites": int(configured.get("minimum_prioritized_sites", 1)),
+            "minimum_local_attempts": int(configured.get("minimum_local_attempts", 6)),
+            "minimum_local_families": int(configured.get("minimum_local_families", 2)),
+            "local_patience": int(configured.get("local_patience", 3)),
+            "maximum_local_attempts": int(configured.get("maximum_local_attempts", 12)),
+        }
+
+    @staticmethod
+    def _target_key(target_type: str, target_id: Any) -> str:
+        return f"{target_type}:{target_id}"
+
+    @staticmethod
+    def _transformation_target(transformation: dict[str, Any]) -> dict[str, Any]:
+        if transformation.get("operation") == "replace_fragment":
+            return {
+                "target_type": "replacement_site",
+                "target_id": transformation.get("replacement_site_id"),
+            }
+        return {
+            "target_type": "atom",
+            "target_id": transformation.get("edit_atom_index"),
+        }
+
+    def _strategy_sites(self) -> list[dict[str, Any]]:
+        strategy = self.state.site_strategy or {}
+        sites = strategy.get("sites") or []
+        return sorted(
+            (dict(item) for item in sites if isinstance(item, dict)),
+            key=lambda item: int(item.get("priority", 10**9)),
+        )
+
+    def _refresh_site_search(self) -> None:
+        policy = self._search_policy()
+        if not policy["site_lock_enabled"] or not self.state.site_strategy:
+            self.state.active_target = None
+            return
+        settings = self._optimization_settings()
+        minimum_improvement = settings["minimum_improvement"]
+        refreshed: dict[str, dict[str, Any]] = {}
+        for site in self._strategy_sites():
+            target_type = site.get("target_type")
+            target_id = site.get("target_id")
+            key = self._target_key(target_type, target_id)
+            attempts = [
+                item for item in self.state.exploration_attempts
+                if item.get("source") == "design"
+                and item.get("target_type") == target_type
+                and item.get("target_id") == target_id
+            ]
+            docking = [
+                item for item in self.state.docking_history
+                if self._transformation_target(item.get("transformation") or {}) == {
+                    "target_type": target_type,
+                    "target_id": target_id,
+                }
+            ]
+            families = sorted({
+                str(item.get("family")) for item in attempts if item.get("family")
+            })
+            best_quality = None
+            best_attempt = None
+            non_improving = 0
+            for item in docking:
+                quality = item.get("quality")
+                if not isinstance(quality, (int, float)):
+                    non_improving += 1
+                    continue
+                if best_quality is None or float(quality) > best_quality + minimum_improvement:
+                    best_quality = float(quality)
+                    best_attempt = item.get("attempt")
+                    non_improving = 0
+                else:
+                    if float(quality) > best_quality:
+                        best_quality = float(quality)
+                        best_attempt = item.get("attempt")
+                    non_improving += 1
+            if not docking:
+                non_improving = len(attempts)
+            explicitly_closed = self._is_unmodifiable(target_type, target_id)
+            enough_attempts = len(attempts) >= policy["minimum_local_attempts"]
+            enough_families = len(families) >= policy["minimum_local_families"]
+            plateau = (
+                enough_attempts
+                and enough_families
+                and (
+                    non_improving >= policy["local_patience"]
+                    or len(attempts) >= policy["maximum_local_attempts"]
+                )
+            )
+            previous = self.state.site_search.get(key) or {}
+            status = "closed" if explicitly_closed else "plateau" if plateau else "pending"
+            refreshed[key] = {
+                **site,
+                "key": key,
+                "status": status,
+                "attempt_count": len(attempts),
+                "geometry_accepted": sum(item.get("status") in {"geometry_accepted", "docked"} for item in attempts),
+                "geometry_rejected": sum(item.get("status") == "geometry_rejected" for item in attempts),
+                "docking_count": len(docking),
+                "families": families,
+                "best_quality": best_quality,
+                "best_attempt": best_attempt,
+                "non_improving_attempts": non_improving,
+                "minimum_local_attempts": policy["minimum_local_attempts"],
+                "minimum_local_families": policy["minimum_local_families"],
+                "local_patience": policy["local_patience"],
+                "maximum_local_attempts": policy["maximum_local_attempts"],
+                "previous_status": previous.get("status"),
+            }
+        active = next(
+            (item for item in refreshed.values() if item["status"] == "pending"),
+            None,
+        )
+        if active is not None:
+            active["status"] = "active"
+            self.state.active_target = {
+                key: active[key]
+                for key in ("target_type", "target_id", "priority", "site_type", "rationale")
+            }
+        else:
+            self.state.active_target = None
+        self.state.site_search = refreshed
+
+    def _site_lock_rejection(self, transformation: dict[str, Any]) -> dict[str, Any] | None:
+        policy = self._search_policy()
+        if not policy["site_lock_enabled"] or not self._design_phase:
+            return None
+        self._refresh_site_search()
+        if policy["site_strategy_required"] and not self.state.site_strategy:
+            return {
+                "status": "rejected",
+                "failure_class": "site_strategy_missing",
+                "instruction": (
+                    "Before READY, inspect the ligand, pocket, interactions, and replacement sites, then call "
+                    "assess_edit_sites with prioritized host target IDs and LLM-assigned site types."
+                ),
+            }
+        strategy_count = len(self._strategy_sites())
+        if strategy_count < policy["minimum_prioritized_sites"]:
+            return {
+                "status": "rejected",
+                "failure_class": "site_strategy_too_small",
+                "instruction": (
+                    f"The site strategy contains {strategy_count} targets but at least "
+                    f"{policy['minimum_prioritized_sites']} are required. Call assess_edit_sites again with "
+                    "a broader evidence-backed prioritized target set."
+                ),
+            }
+        active = self.state.active_target
+        if active is None:
+            return None
+        proposed = self._transformation_target(transformation)
+        if proposed == {"target_type": active["target_type"], "target_id": active["target_id"]}:
+            return None
+        active_status = self.state.site_search.get(
+            self._target_key(active["target_type"], active["target_id"]), {}
+        )
+        return {
+            "status": "rejected",
+            "failure_class": "site_lock_violation",
+            "active_target": active,
+            "active_site_search": active_status,
+            "proposed_target": proposed,
+            "instruction": (
+                "Continue the active target with a chemically distinct candidate batch or transformation. "
+                "The host advances to the next prioritized site only after the local minimum-attempt, chemical-family, "
+                "and plateau/patience conditions are met, or after an accepted MARK_UNMODIFIABLE closure."
             ),
         }
 
@@ -729,9 +954,20 @@ class Workflow:
                 key=lambda item: float(item["quality"]),
                 default=None,
             )
+            strategy_item = next(
+                (
+                    item for item in self._strategy_sites()
+                    if item.get("target_type") == target_type
+                    and item.get("target_id") == target_id
+                ),
+                None,
+            )
             summaries.append({
                 "target_type": target_type,
                 "target_id": target_id,
+                "priority": strategy_item.get("priority") if strategy_item else None,
+                "site_type": strategy_item.get("site_type") if strategy_item else None,
+                "site_rationale": strategy_item.get("rationale") if strategy_item else None,
                 "clearance": clearance,
                 "closed": (
                     target_id in global_search["closed_atoms"]
@@ -786,6 +1022,9 @@ class Workflow:
             "exploration_attempts": self._llm_safe_value(self.state.exploration_attempts),
             "unmodifiable_targets": self._llm_safe_value(self.state.unmodifiable_targets),
             "search_policy": self._search_policy(),
+            "site_strategy": self._llm_safe_value(self.state.site_strategy),
+            "active_target": self._llm_safe_value(self.state.active_target),
+            "site_search": self._llm_safe_value(self.state.site_search),
             "adaptive_target_summaries": self._adaptive_target_summaries(global_search),
             "instruction": (
                 "Prior candidates, exploration attempts, and docking results are authoritative feedback. "
@@ -799,7 +1038,10 @@ class Workflow:
                 "replace_fragment, only use a fragment returned by search_fragment_library and obtain its "
                 "get_fragment_spatial_profile before validate_candidate_geometry. Continue a target while a "
                 "new chemically distinct, evidence-backed option could improve or meaningfully validate the "
-                "local trend. After the target has been explored sufficiently and no credible option remains, "
+                "local trend. When site_lock_enabled is true, active_target is authoritative: do not switch "
+                "targets until site_search marks the active target plateau or it is closed with MARK_UNMODIFIABLE. "
+                "Use generate_site_candidate_batch when several compatible fragments should be compared. After "
+                "the target has been explored sufficiently and no credible option remains, "
                 "explicitly use MARK_UNMODIFIABLE with scope site and an evidence-based reason. STOP is allowed "
                 "only after every target is adaptively explored and explicitly closed, or the hard safety limit "
                 "is reached."
@@ -1233,6 +1475,14 @@ class Workflow:
             transformation = self._transformation(decision)
         except Exception as error:
             raise ReadyDecisionError(decision, str(error)) from error
+        site_lock_rejection = self._site_lock_rejection(transformation)
+        if site_lock_rejection is not None:
+            raise ReadyDecisionError(
+                decision,
+                site_lock_rejection["instruction"],
+                failure_class=site_lock_rejection["failure_class"],
+                instruction=site_lock_rejection["instruction"],
+            )
         operation = transformation["operation"]
         if operation not in {"replace_hydrogen", "replace_fragment"}:
             raise ReadyDecisionError(decision, f"Unsupported READY operation: {operation!r}")
@@ -1799,6 +2049,57 @@ class Workflow:
                     for missing in missing_target_diversity
                 )
             ]
+        if search_policy["site_lock_enabled"] and self.state.site_strategy:
+            self._refresh_site_search()
+            strategy_sites = self._strategy_sites()
+            strategy_keys = [
+                self._target_key(item.get("target_type"), item.get("target_id"))
+                for item in strategy_sites
+            ]
+            strategy_status = [
+                self.state.site_search.get(key, {}) for key in strategy_keys
+            ]
+            strategy_ready = bool(strategy_sites) and len(strategy_sites) >= search_policy[
+                "minimum_prioritized_sites"
+            ]
+            complete = strategy_ready and all(
+                item.get("status") in {"plateau", "closed"} for item in strategy_status
+            )
+            pending_obligations = []
+            if not strategy_ready:
+                pending_obligations.append({
+                    "type": "site_strategy",
+                    "required_action": (
+                        "Call assess_edit_sites with at least "
+                        f"{search_policy['minimum_prioritized_sites']} evidence-backed targets."
+                    ),
+                })
+            elif self.state.active_target is not None:
+                active_key = self._target_key(
+                    self.state.active_target["target_type"],
+                    self.state.active_target["target_id"],
+                )
+                pending_obligations.append({
+                    "type": "active_target_local_search",
+                    "active_target": self.state.active_target,
+                    "site_search": self.state.site_search.get(active_key),
+                    "required_action": (
+                        "Continue the locked target with chemically distinct transformations or candidate batches "
+                        "until the local search gate reports plateau, or close it with MARK_UNMODIFIABLE after "
+                        "the minimum diversity evidence is satisfied."
+                    ),
+                })
+            open_targets = [
+                {
+                    "target_type": item.get("target_type"),
+                    "target_id": item.get("target_id"),
+                    "priority": item.get("priority"),
+                    "site_type": item.get("site_type"),
+                }
+                for item in strategy_status
+                if item.get("status") not in {"plateau", "closed"}
+            ]
+            missing_target_diversity = []
         return {
             "complete": complete,
             "editable_hydrogen_atoms": editable_atoms,
@@ -1949,6 +2250,7 @@ class Workflow:
             "interaction_consensus": docking.get("interaction_consensus"),
         }
         self.state.docking_history.append(entry)
+        self._refresh_site_search()
         scored_count = sum(
             item.get("raw_quality_from_mean") is not None for item in self.state.docking_history
         )
@@ -2059,9 +2361,30 @@ class Workflow:
         reference_path = self.run_dir / "reference-ligand.sdf"
         receptor_path = self.run_dir / "receptor-protein-only.pdb"
 
-        self._emit("optimization_started", {**settings, "hard_max_attempts": hard_max})
+        self._design_phase = True
+        self._refresh_site_search()
+        self._emit("optimization_started", {
+            **settings,
+            "hard_max_attempts": hard_max,
+            "site_strategy": self.state.site_strategy,
+            "active_target": self.state.active_target,
+        })
         for attempt in range(1, hard_max + 1):
-            self._validate_design(decision)
+            try:
+                self._validate_design(decision)
+            except ReadyDecisionError as error:
+                if (
+                    attempt == 1
+                    and error.rejection.get("failure_class") in {
+                        "site_lock_violation", "site_strategy_missing", "site_strategy_too_small",
+                    }
+                ):
+                    decision = self._retry_ready_decision(decision, error.rejection)
+                    if decision.get("action") == "STOP":
+                        return {"status": "no_candidate_accepted", "stopping_reason": "llm_stop", "attempts": history}
+                    self._validate_design(decision)
+                else:
+                    raise
             transformation = self._transformation(decision)
             exploration_record = self._record_exploration_attempt(
                 transformation,
@@ -2143,6 +2466,7 @@ class Workflow:
                     "docking_status": "not_run_geometry_rejected",
                 })
                 self._record_candidate_history(report, transformation)
+                self._refresh_site_search()
                 self._write_json(f"edit-attempt-{attempt:02d}.json", report)
                 if attempt == hard_max:
                     break
@@ -2176,6 +2500,7 @@ class Workflow:
                     details={"first_seen_attempt": previous_attempt},
                 )
                 self._record_candidate_history(report, transformation)
+                self._refresh_site_search()
                 self._write_json(f"edit-attempt-{attempt:02d}.json", report)
                 if attempt == hard_max:
                     break
@@ -2191,6 +2516,7 @@ class Workflow:
                 "geometry_accepted",
                 details={"canonical_smiles": candidate_smiles},
             )
+            self._refresh_site_search()
             self._emit("candidate_geometry_accepted", {
                 "canonical_smiles": candidate_smiles,
                 "property_delta": result.report.get("property_delta"),
@@ -2241,6 +2567,7 @@ class Workflow:
                 reason=docking.get("error") or docking.get("message"),
             )
             self._record_candidate_history(report, transformation)
+            self._refresh_site_search()
             self._write_json(f"edit-attempt-{attempt:02d}.json", report)
             self._emit("docking_completed", {
                 "attempt": attempt,
@@ -2375,6 +2702,30 @@ class ScriptedDemoClient:
         self.step = 0
 
     def complete_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+        observations = payload["state"]["observations"]
+        if not any(item["tool"] == "get_edit_site_candidates" for item in observations):
+            return {
+                "action": "QUERY",
+                "question": "List host-supported edit targets with local pocket and directional facts.",
+                "tool": "get_edit_site_candidates",
+                "arguments": {},
+            }
+        if not any(item["tool"] == "assess_edit_sites" for item in observations):
+            return {
+                "action": "QUERY",
+                "question": "Rank the supported edit sites and classify their local role.",
+                "tool": "assess_edit_sites",
+                "arguments": {
+                    "sites": [{
+                        "target_type": "atom",
+                        "target_id": 10,
+                        "priority": 1,
+                        "site_type": "pocket_extension",
+                        "rationale": "Use the scripted phenyl edit site as a small pocket-extension test.",
+                    }],
+                    "global_rationale": "The scripted client supplies one auditable prioritized target.",
+                },
+            }
         missing = payload["state"]["missing_site_evidence"]
         if "edit_site_environment" in missing:
             return {

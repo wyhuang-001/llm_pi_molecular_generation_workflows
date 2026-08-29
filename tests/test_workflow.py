@@ -58,6 +58,52 @@ def test_small_query_does_not_cover_required_evidence():
     assert evidence == {"pocket_environment"}
 
 
+def test_llm_assessed_edit_site_strategy_is_host_validated():
+    tools = ToolRegistry(ComplexContext(TASK))
+    result, evidence = tools.execute(
+        "assess_edit_sites",
+        {
+            "sites": [
+                {
+                    "target_type": "atom",
+                    "target_id": 10,
+                    "priority": 1,
+                    "site_type": "pocket_extension",
+                    "rationale": "The outward phenyl direction may reach unused pocket volume.",
+                },
+            ],
+            "global_rationale": "Prioritize a geometrically accessible extension vector.",
+        },
+    )
+    assert result["status"] == "complete"
+    assert result["sites"][0]["priority"] == 1
+    assert result["sites"][0]["site_type"] == "pocket_extension"
+    assert evidence == {"site_strategy"}
+
+    with pytest.raises(ValueError, match="Unknown or non-editable"):
+        tools.assess_edit_sites([{
+            "target_type": "atom",
+            "target_id": 999,
+            "priority": 1,
+            "site_type": "uncertain",
+            "rationale": "invalid host target",
+        }])
+
+
+def test_site_candidate_batch_is_operation_specific_and_geometry_screened():
+    tools = ToolRegistry(ComplexContext(TASK))
+    result, evidence = tools.execute(
+        "generate_site_candidate_batch",
+        {"target_type": "atom", "target_id": 10, "query": "fluoro", "limit": 3},
+    )
+    assert result["status"] == "complete"
+    assert result["target_type"] == "atom"
+    assert result["operation"] == "substitute"
+    assert result["accepted_count"] >= 1
+    assert all(item["transformation"]["edit_atom_index"] == 10 for item in result["candidates"])
+    assert evidence == {"candidate_batch"}
+
+
 def test_ligand_fragment_returns_connected_atom_and_bond_subgraph():
     tools = ToolRegistry(ComplexContext(TASK))
     result, evidence = tools.execute(
@@ -386,6 +432,55 @@ def test_transformation_identity_normalizes_cut_bond_order(tmp_path):
         "cut_bond": [14, 15],
         "fragment_smiles": "[*:1]F",
     })
+
+
+def test_site_lock_blocks_jump_until_active_target_local_search_completes(tmp_path):
+    workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
+    workflow._execute_query({
+        "action": "QUERY",
+        "tool": "get_edit_site_candidates",
+        "arguments": {},
+    })
+    workflow._execute_query({
+        "action": "QUERY",
+        "tool": "assess_edit_sites",
+        "arguments": {
+            "sites": [
+                {
+                    "target_type": "atom",
+                    "target_id": 10,
+                    "priority": 1,
+                    "site_type": "pocket_extension",
+                    "rationale": "Explore the first phenyl vector locally.",
+                },
+                {
+                    "target_type": "atom",
+                    "target_id": 9,
+                    "priority": 2,
+                    "site_type": "solvent_exposed",
+                    "rationale": "Reserve the adjacent site for the next local phase.",
+                },
+            ],
+        },
+    })
+    workflow._design_phase = True
+    workflow._refresh_site_search()
+
+    assert workflow.state.active_target["target_id"] == 10
+    rejection = workflow._site_lock_rejection({
+        "operation": "replace_hydrogen",
+        "edit_atom_index": 9,
+        "fragment_smiles": "[*:1]F",
+    })
+    assert rejection is not None
+    assert rejection["failure_class"] == "site_lock_violation"
+    assert rejection["active_target"]["target_id"] == 10
+    with pytest.raises(RuntimeError, match="current active prioritized site"):
+        workflow._execute_query({
+            "action": "QUERY",
+            "tool": "generate_site_candidate_batch",
+            "arguments": {"target_type": "atom", "target_id": 9, "query": "fluoro"},
+        })
 
 
 def test_docking_trend_preserves_best_attempt_without_auto_convergence(tmp_path):
