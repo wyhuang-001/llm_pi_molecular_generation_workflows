@@ -7,7 +7,7 @@
     "residue_number": 1298
   },
   "max_context_rounds": 256,
-  "fragment_library_path": "../molecular_agent/data/chembl_fragments_working.json",
+  "fragment_library_path": "../molecular_agent/data/fragments_unified.json",
   "docking_optimization": {
     "primary_metric": "minimizedAffinity",
     "minimum_improvement": 0.25,
@@ -23,8 +23,7 @@
     "minimum_prioritized_sites": 1,
     "minimum_local_attempts": 6,
     "minimum_local_families": 2,
-    "local_patience": 3,
-    "maximum_local_attempts": 12
+    "local_patience": 3
   },
   "fragment_replacement": {
     "max_removed_heavy_atom_fraction": 0.4,

@@ -8,7 +8,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, Crippen, Descriptors, Lipinski, rdMolDescriptors
 
 from .editing import apply_substituent, apply_transformation
-from .fragment_library import FragmentLibrary
+from .fragment_library import FragmentLibrary, chemical_tags, size_class_for
 from .structure import ComplexContext
 
 
@@ -164,6 +164,11 @@ class ToolRegistry:
                         "target_id": {},
                         "query": {"type": "string"},
                         "max_heavy_atoms": {"type": "integer", "minimum": 1, "maximum": 30},
+                        "size_class": {
+                            "type": "string",
+                            "enum": ["minimal", "small", "medium", "large"],
+                        },
+                        "chemical_tag": {"type": "string", "minLength": 1},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 32},
                     },
                     "required": ["target_type", "target_id"],
@@ -179,6 +184,11 @@ class ToolRegistry:
                         "query": {"type": "string"},
                         "max_heavy_atoms": {"type": "integer", "minimum": 1, "maximum": 30},
                         "operation": {"type": "string", "enum": ["substitute", "replace_fragment"]},
+                        "size_class": {
+                            "type": "string",
+                            "enum": ["minimal", "small", "medium", "large"],
+                        },
+                        "chemical_tag": {"type": "string", "minLength": 1},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     },
                 },
@@ -248,9 +258,16 @@ class ToolRegistry:
             "validate_candidate_geometry": "Runs the exact deterministic candidate construction and rigid-protein clash check. replace_fragment requires a replacement_site_id returned by list_fragment_replacement_sites.",
             "generate_site_candidate_batch": (
                 "For one locked atom or replacement site, retrieve an operation-compatible fragment batch "
-                "and run deterministic candidate construction and rigid-protein clash prescreening."
+                "and run deterministic candidate construction and rigid-protein clash prescreening. "
+                "Optional size_class and chemical_tag filters expose the unified library action space."
             ),
-            "search_fragment_library": "Searches by one supported chemical term (for example heterocycle, pyridine, morpholine, indole, oxetane, nitrile), one valid SMILES/SMARTS pattern, or an empty query for browsing. Do not send natural-language descriptions. Results include source metadata.",
+            "search_fragment_library": (
+                "Searches by one supported chemical term (for example heterocycle, pyridine, morpholine, "
+                "indole, oxetane, nitrile), one valid SMILES/SMARTS pattern, or an empty query for browsing. "
+                "Optional size_class filters minimal, small, medium, or large fragments; chemical_tag filters "
+                "labels such as halogen, alkyl, polar, heteroaryl, nitrile, or hbond_donor. Do not send "
+                "natural-language descriptions. Results include source metadata and deterministic properties."
+            ),
             "get_fragment_record": "Returns one auditable library record by fragment_id.",
             "get_fragment_properties": "Any valid fragment returns deterministic fragment properties.",
             "get_fragment_spatial_profile": "Returns deterministic 3D conformer extent and attachment-centered coordinates for a fragment. It reports shape facts, not a suitability verdict.",
@@ -857,7 +874,9 @@ class ToolRegistry:
         record = None
         if fragment_id:
             record = self.fragment_library.get(fragment_id)
-            if fragment_smiles and fragment_smiles != record["smiles"]:
+            if fragment_smiles and not self.fragment_library.smiles_equivalent(
+                fragment_smiles, record["smiles"]
+            ):
                 raise ValueError(
                     f"fragment_id {fragment_id} does not match fragment_smiles"
                 )
@@ -1022,12 +1041,16 @@ class ToolRegistry:
                 }
             if not transformation.get("fragment_smiles"):
                 transformation["fragment_smiles"] = record["smiles"]
-            elif transformation["fragment_smiles"] != record["smiles"]:
+            elif not self.fragment_library.smiles_equivalent(
+                transformation["fragment_smiles"], record["smiles"]
+            ):
                 return {
                     "status": "rejected",
                     "error": f"fragment_id {transformation['fragment_id']} does not match fragment_smiles",
                     "transformation": transformation,
                 }
+            else:
+                transformation["fragment_smiles"] = record["smiles"]
             transformation["library_record"] = record
             if transformation.get("operation") == "substitute":
                 transformation["operation"] = "replace_hydrogen"
@@ -1050,6 +1073,8 @@ class ToolRegistry:
         target_id: Any,
         query: str = "",
         max_heavy_atoms: int = 12,
+        size_class: str | None = None,
+        chemical_tag: str | None = None,
         limit: int = 16,
     ) -> dict[str, Any]:
         if target_type == "atom":
@@ -1067,6 +1092,8 @@ class ToolRegistry:
             max_heavy_atoms=max_heavy_atoms,
             operation=operation,
             limit=limit,
+            size_class=size_class,
+            chemical_tag=chemical_tag,
         )
         if search.get("status") != "complete":
             return {
@@ -1130,6 +1157,8 @@ class ToolRegistry:
             "query": query,
             "operation": operation,
             "requested_limit": limit,
+            "size_class": size_class,
+            "chemical_tag": chemical_tag,
             "library_match_count": search.get("count", 0),
             "accepted_count": len(candidates),
             "rejected_count": len(rejected),
@@ -1146,9 +1175,18 @@ class ToolRegistry:
         query: str = "",
         max_heavy_atoms: int = 12,
         operation: str = "substitute",
+        size_class: str | None = None,
+        chemical_tag: str | None = None,
         limit: int = 30,
     ) -> dict[str, Any]:
-        return self.fragment_library.search(query, max_heavy_atoms, operation, limit)
+        return self.fragment_library.search(
+            query,
+            max_heavy_atoms,
+            operation,
+            limit,
+            size_class=size_class,
+            chemical_tag=chemical_tag,
+        )
 
     def get_fragment_record(self, fragment_id: str) -> dict[str, Any]:
         return self.fragment_library.get(fragment_id)
@@ -1162,6 +1200,8 @@ class ToolRegistry:
             "canonical_smiles": Chem.MolToSmiles(molecule, isomericSmiles=True),
             "formal_charge": Chem.GetFormalCharge(molecule),
             "heavy_atoms": molecule.GetNumHeavyAtoms(),
+            "size_class": size_class_for(molecule.GetNumHeavyAtoms()),
+            "chemical_tags": chemical_tags(molecule),
             "molecular_weight": round(Descriptors.MolWt(molecule), 2),
             "logp": round(Crippen.MolLogP(molecule), 2),
             "hbd": Lipinski.NumHDonors(molecule),

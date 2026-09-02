@@ -133,21 +133,207 @@ class Workflow:
             return value[:4000] + "... [truncated for LLM context]"
         return value
 
-    def _llm_state_view(self) -> dict[str, Any]:
-        view = self.state.compact_view()
-        view["observations"] = [
+    @staticmethod
+    def _compact_transformation(transformation: dict[str, Any] | None) -> dict[str, Any]:
+        transformation = transformation or {}
+        fields = (
+            "operation", "edit_atom_index", "replacement_site_id", "fragment_id",
+            "fragment_smiles", "cut_bond",
+        )
+        return {
+            key: transformation[key]
+            for key in fields
+            if transformation.get(key) is not None
+        }
+
+    @classmethod
+    def _transformation_key(cls, transformation: dict[str, Any] | None) -> str:
+        normalized = cls._exploration_transformation(transformation or {})
+        # Fragment IDs preserve provenance but do not make the same chemical edit
+        # a distinct transformation. Match duplicate-protection semantics.
+        normalized.pop("fragment_id", None)
+        cut_bond = cls._normalize_cut_bond(normalized.get("cut_bond"))
+        if cut_bond is not None:
+            normalized["cut_bond"] = list(cut_bond)
+        return json.dumps(normalized, sort_keys=True)
+
+    def _compact_observation_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Keep actionable tool evidence while omitting bulky raw tool payloads."""
+        compact = self._tool_result_summary(result)
+        for key in (
+            "sites", "fragments", "candidates", "rejected", "residues", "contacts",
+            "direction_profiles", "representative_conformer_atoms", "properties",
+            "transformation", "candidate", "parent", "property_delta",
+            "replacement_site", "recommended_queries",
+        ):
+            if key not in result:
+                continue
+            value = result[key]
+            if key == "transformation" and isinstance(value, dict):
+                compact[key] = self._compact_transformation(value)
+            else:
+                compact[key] = self._llm_safe_value(value, key)
+        return compact
+
+    def _llm_observation_view(self) -> list[dict[str, Any]]:
+        # Context collection is already bounded by max_context_rounds. During the
+        # design loop retain baseline evidence, active-target evidence, and a
+        # recent window; complete observations remain in the audit files.
+        if not self._design_phase:
+            selected = list(self.state.observations)
+        else:
+            baseline_tools = {
+                "get_ligand_info", "get_pocket_residues", "detect_basic_interactions",
+                "get_edit_site_candidates", "list_fragment_replacement_sites",
+                "assess_edit_sites",
+            }
+            active = self.state.active_target or {}
+            active_type = active.get("target_type")
+            active_id = active.get("target_id")
+
+            def relevant(item: ToolObservation) -> bool:
+                if item.tool in baseline_tools:
+                    return True
+                arguments = item.arguments or {}
+                result = item.result or {}
+                if active_type == "atom":
+                    return active_id in {
+                        arguments.get("atom_index"), arguments.get("edit_atom_index"),
+                        arguments.get("target_id"), result.get("atom_index"), result.get("target_id"),
+                    }
+                if active_type == "replacement_site":
+                    return active_id in {
+                        arguments.get("replacement_site_id"), arguments.get("target_id"),
+                        result.get("replacement_site_id"), result.get("target_id"),
+                    }
+                return False
+
+            selected = [item for item in self.state.observations if relevant(item)]
+            selected.extend(self.state.observations[-12:])
+
+        latest: dict[str, tuple[int, ToolObservation]] = {}
+        positions = {id(item): index for index, item in enumerate(self.state.observations)}
+        for item in selected:
+            latest[self._signature(item.tool, item.arguments)] = (positions[id(item)], item)
+        ordered = [item for _index, item in sorted(latest.values(), key=lambda pair: pair[0])]
+        if len(ordered) > 32:
+            ordered = ordered[-32:]
+        return [
             {
                 "tool": item.tool,
                 "arguments": item.arguments,
-                "result": self._llm_safe_value(item.result),
+                "result": self._compact_observation_result(item.result),
                 "evidence": sorted(item.evidence),
             }
-            for item in self.state.observations
+            for item in ordered
         ]
-        view["candidate_history"] = self._llm_safe_value(self.state.candidate_history)
-        view["docking_history"] = self._llm_safe_value(self.state.docking_history)
-        view["tool_rejections"] = self._llm_safe_value(self.state.tool_rejections)
-        return view
+
+    def _compact_docking_history(self) -> list[dict[str, Any]]:
+        compact: list[dict[str, Any]] = []
+        for item in self.state.docking_history:
+            comparison = item.get("comparison") or {}
+            metrics = comparison.get("metrics") or {}
+            compact_metrics = {}
+            for name, metric in metrics.items():
+                if not isinstance(metric, dict):
+                    continue
+                delta = metric.get("delta_candidate_minus_reference") or {}
+                compact_metrics[name] = {
+                    "direction": metric.get("direction"),
+                    "delta_mean": delta.get("mean"),
+                    "delta_stddev": delta.get("stddev"),
+                    "candidate_better_seed_count": metric.get("candidate_better_seed_count"),
+                    "candidate_better_seed_fraction": metric.get("candidate_better_seed_fraction"),
+                }
+            pose = item.get("pose_consensus") or {}
+            interactions = item.get("interaction_consensus") or {}
+            compact.append({
+                "attempt": item.get("attempt"),
+                "design_region": item.get("design_region"),
+                "transformation": self._compact_transformation(item.get("transformation")),
+                "status": item.get("status"),
+                "primary_metric": item.get("primary_metric"),
+                "delta_candidate_minus_reference": item.get("delta_candidate_minus_reference"),
+                "seed_stddev": item.get("seed_stddev"),
+                "seed_win_fraction": item.get("seed_win_fraction"),
+                "quality": item.get("quality"),
+                "raw_quality_from_mean": item.get("raw_quality_from_mean"),
+                "is_new_best": item.get("is_new_best"),
+                "best_quality_so_far": item.get("best_quality_so_far"),
+                "comparison": {"status": comparison.get("status"), "metrics": compact_metrics},
+                "pose_consensus": {
+                    "stable": pose.get("stable"),
+                    "mean_pairwise_rmsd": pose.get("mean_pairwise_rmsd"),
+                    "max_pairwise_rmsd": pose.get("max_pairwise_rmsd"),
+                    "largest_consistent_cluster_fraction": pose.get("largest_consistent_cluster_fraction"),
+                },
+                "interaction_consensus": {
+                    "gained_consensus_residues": interactions.get("gained_consensus_residues", []),
+                    "lost_consensus_residues": interactions.get("lost_consensus_residues", []),
+                },
+            })
+        return compact
+
+    def _compact_candidate_history(self) -> list[dict[str, Any]]:
+        compact: list[dict[str, Any]] = []
+        for item in self.state.candidate_history:
+            validation = item.get("validation") or {}
+            docking = item.get("docking") or {}
+            compact.append({
+                "attempt": item.get("attempt"),
+                "record_type": item.get("record_type"),
+                "transformation": self._compact_transformation(item.get("transformation")),
+                "validation": {
+                    key: validation.get(key)
+                    for key in (
+                        "status", "failure_class", "canonical_smiles", "property_delta",
+                        "severe_clash_count", "formal_charge", "heavy_atoms", "molecular_weight",
+                    )
+                    if key in validation
+                },
+                "docking": {
+                    "status": docking.get("status"),
+                    "entered_docking": docking.get("entered_docking"),
+                    "completed": docking.get("completed"),
+                    "primary_metric": docking.get("primary_metric"),
+                    "primary_metric_summary": docking.get("primary_metric_summary"),
+                    "pose_consensus": {
+                        key: (docking.get("pose_consensus") or {}).get(key)
+                        for key in ("stable", "mean_pairwise_rmsd", "max_pairwise_rmsd")
+                        if key in (docking.get("pose_consensus") or {})
+                    },
+                    "interaction_consensus": {
+                        key: (docking.get("interaction_consensus") or {}).get(key, [])
+                        for key in ("gained_consensus_residues", "lost_consensus_residues")
+                    },
+                },
+            })
+        return compact
+
+    def _compact_convergence(self) -> dict[str, Any]:
+        return {
+            key: self.state.convergence.get(key)
+            for key in (
+                "status", "converged", "llm_controls_termination", "stop_authority",
+                "best_attempt", "best_quality", "non_improving_attempts", "termination_reason",
+            )
+            if key in self.state.convergence
+        }
+
+    def _llm_state_view(self) -> dict[str, Any]:
+        return {
+            "task": self.state.task,
+            "round": len(self.state.observations),
+            "max_rounds": self.state.max_context_rounds,
+            "covered_evidence": sorted(self.state.evidence),
+            "missing_site_evidence": self.state.missing_evidence,
+            "decisions": self._llm_safe_value(self.state.decisions[-12:]),
+            "observations": self._llm_observation_view(),
+            "tool_rejections": self._llm_safe_value(self.state.tool_rejections[-8:]),
+            "active_target": self._llm_safe_value(self.state.active_target),
+            "site_search": self._llm_safe_value(self.state.site_search),
+            "convergence": self._compact_convergence(),
+        }
 
     @staticmethod
     def _tool_result_summary(result: dict[str, Any]) -> dict[str, Any]:
@@ -159,14 +345,17 @@ class Workflow:
                 "failure_class", "error", "canonical_smiles", "heavy_atoms",
                 "molecular_weight", "formal_charge", "replacement_site_id",
                 "max_probe_distance", "probe_count", "fragment_id", "fragment_smiles",
+                "size_class", "chemical_tag", "chemical_tags", "allowed_operations",
                 "conformer_count", "max_attachment_distance", "maximum_forward_extent",
                 "maximum_radial_extent", "radius_of_gyration",
                 "site_count", "accepted_count", "rejected_count", "target_type", "target_id",
+                "filtered_compatible_records", "operation_compatible_records",
             )
             if key in result
         }
         for key in (
             "residues", "contacts", "protein_atoms", "fragments", "sites",
+            "size_class_counts", "chemical_tag_counts",
             "direction_profiles", "representative_conformer_atoms",
         ):
             value = result.get(key)
@@ -273,8 +462,10 @@ class Workflow:
                 "Choose what knowledge is needed next. When site_strategy_required is enabled, first use "
                 "the chemical tools to inspect the ligand, pocket, interactions, and replacement sites. Call "
                 "get_edit_site_candidates to obtain one structured host-supported site dossier, then call "
-                "assess_edit_sites with an evidence-backed priority and site_type for each plausible "
-                "host target. The host will lock the highest-priority open target during design. Use the chemical "
+                "assess_edit_sites only as a QUERY decision: action must be QUERY, tool must be "
+                "assess_edit_sites, and sites plus global_rationale must be nested inside arguments. Include an "
+                "evidence-backed priority and site_type for each plausible host target. The host will lock the "
+                "highest-priority open target during design. Use the chemical "
                 "tools to compare replace_hydrogen and replace_fragment, query spatial facts when needed, then "
                 "return READY only when the evidence supports the selected operation and final edit site."
             ),
@@ -448,6 +639,8 @@ class Workflow:
                 "validate_candidate_geometry",
                 reason=result.get("error") if result.get("status") != "accepted" else None,
             )
+        if tool == "generate_site_candidate_batch" and result.get("status") == "complete":
+            self._record_candidate_batch_exploration(result)
         self._write_json(
             f"observation-{len(self.state.observations):02d}.json",
             self.state.compact_view(),
@@ -457,6 +650,66 @@ class Workflow:
             "evidence": sorted(evidence),
             "result": self._tool_result_summary(result),
         })
+
+    def _record_candidate_batch_exploration(self, result: dict[str, Any]) -> None:
+        """Record batch-prescreened transformations without turning them into docking evidence."""
+        target_type = result.get("target_type")
+        target_id = result.get("target_id")
+        for item in (result.get("candidates") or []):
+            transformation = dict(item.get("transformation") or {})
+            if not transformation:
+                transformation = {
+                    "operation": "replace_hydrogen" if target_type == "atom" else "replace_fragment",
+                    "fragment_id": item.get("fragment_id"),
+                    "fragment_smiles": item.get("fragment_smiles"),
+                }
+                if target_type == "atom":
+                    transformation["edit_atom_index"] = target_id
+                else:
+                    transformation["replacement_site_id"] = target_id
+            self._record_exploration_attempt(
+                transformation,
+                "batch_geometry_accepted",
+                "candidate_batch",
+            )
+        for item in (result.get("rejected") or []):
+            transformation = dict(item.get("transformation") or {})
+            if not transformation:
+                transformation = {
+                    "operation": "replace_hydrogen" if target_type == "atom" else "replace_fragment",
+                    "fragment_id": item.get("fragment_id"),
+                    "fragment_smiles": item.get("fragment_smiles"),
+                }
+                if target_type == "atom":
+                    transformation["edit_atom_index"] = target_id
+                else:
+                    transformation["replacement_site_id"] = target_id
+            self._record_exploration_attempt(
+                transformation,
+                "geometry_rejected",
+                "candidate_batch",
+                reason=item.get("error") or item.get("failure_class"),
+            )
+
+    @staticmethod
+    def _unwrap_decision(decision: Any) -> Any:
+        """Accept a single common response envelope around the workflow decision."""
+        current = decision
+        for _ in range(2):
+            if not isinstance(current, dict) or "action" in current:
+                return current
+            wrapped = next(
+                (
+                    current[key]
+                    for key in ("answer", "decision", "response")
+                    if isinstance(current.get(key), dict)
+                ),
+                None,
+            )
+            if wrapped is None:
+                return current
+            current = wrapped
+        return current
 
     @staticmethod
     def _has_valid_action(decision: Any) -> bool:
@@ -510,10 +763,14 @@ class Workflow:
                 )
             if not transformation["fragment_smiles"]:
                 transformation["fragment_smiles"] = record["smiles"]
-            elif transformation["fragment_smiles"] != record["smiles"]:
+            elif not self.tools.fragment_library.smiles_equivalent(
+                transformation["fragment_smiles"], record["smiles"]
+            ):
                 raise RuntimeError(
                     f"fragment_id {fragment_id} does not match fragment_smiles"
                 )
+            else:
+                transformation["fragment_smiles"] = record["smiles"]
             transformation["library_record"] = record
         if operation == "replace_fragment":
             site_id = decision.get("replacement_site_id")
@@ -543,15 +800,7 @@ class Workflow:
 
     @classmethod
     def _same_transformation(cls, left: dict[str, Any], right: dict[str, Any]) -> bool:
-        return (
-            left.get("operation", "replace_hydrogen")
-            == right.get("operation", "replace_hydrogen")
-            and left.get("edit_atom_index") == right.get("edit_atom_index")
-            and left.get("replacement_site_id") == right.get("replacement_site_id")
-            and cls._normalize_cut_bond(left.get("cut_bond"))
-            == cls._normalize_cut_bond(right.get("cut_bond"))
-            and left.get("fragment_smiles") == right.get("fragment_smiles")
-        )
+        return cls._transformation_key(left) == cls._transformation_key(right)
 
     def _transformation_was_attempted(self, transformation: dict[str, Any]) -> bool:
         return any(
@@ -607,13 +856,10 @@ class Workflow:
                 and transformation.get("replacement_site_id") == target_id
             )
             if matches:
-                transformations.add(json.dumps(
-                    self._exploration_transformation(transformation),
-                    sort_keys=True,
-                ))
+                transformations.add(self._transformation_key(transformation))
         return transformations
 
-    def _record_unmodifiable(self, decision: dict[str, Any]) -> None:
+    def _record_unmodifiable(self, decision: dict[str, Any]) -> bool:
         target_type = decision.get("target_type")
         target_id = decision.get("target_id")
         scope = decision.get("scope")
@@ -642,6 +888,46 @@ class Workflow:
             raise RuntimeError("MARK_UNMODIFIABLE family must be halogen, non_halogen, or fragment_replacement")
         if not isinstance(reason, str) or not reason.strip():
             raise RuntimeError("MARK_UNMODIFIABLE requires a non-empty reason")
+        existing = next(
+            (
+                item for item in self.state.unmodifiable_targets
+                if item.get("target_type") == target_type
+                and item.get("target_id") == target_id
+                and (
+                    item.get("scope") == "site"
+                    or scope == "family"
+                    and item.get("scope") == "family"
+                    and item.get("family") == family
+                )
+            ),
+            None,
+        )
+        if existing is not None:
+            self._refresh_site_search()
+            active = self.state.active_target
+            active_label = (
+                f"{active.get('target_type')}:{active.get('target_id')}"
+                if active else "none"
+            )
+            rejection = {
+                "status": "reused",
+                "failure_class": "duplicate_unmodifiable_declaration",
+                "decision": decision,
+                "existing_declaration": existing,
+                "active_target": active,
+                "error": (
+                    f"{target_type}:{target_id} is already closed by an accepted "
+                    "MARK_UNMODIFIABLE declaration"
+                ),
+                "instruction": (
+                    "Do not repeat the closed target declaration. Its prior closure remains authoritative. "
+                    f"Continue with the current active target {active_label}, using a new QUERY, READY "
+                    "transformation, or a valid closure for that active target."
+                ),
+            }
+            self.state.tool_rejections.append(rejection)
+            self._emit("unmodifiable_declaration_reused", rejection)
+            return False
         policy = self._search_policy()
         if policy["site_lock_enabled"] and self._design_phase:
             self._refresh_site_search()
@@ -664,16 +950,28 @@ class Workflow:
                     f"Adaptive search requires at least {minimum} distinct transformations before "
                     f"closing {target_type} {target_id!r}; observed {attempted}"
                 )
-        if any(
-            item.get("target_type") == target_type
-            and item.get("target_id") == target_id
-            and (
-                item.get("scope") == "site"
-                or scope == "family" and item.get("scope") == "family" and item.get("family") == family
-            )
-            for item in self.state.unmodifiable_targets
-        ):
-            return
+            if policy["site_lock_enabled"] and self._design_phase:
+                local = self.state.site_search.get(
+                    self._target_key(target_type, target_id), {}
+                )
+                local_attempts = int(local.get("attempt_count", 0))
+                local_families = list(local.get("families") or [])
+                missing_conditions = []
+                if local_attempts < policy["minimum_local_attempts"]:
+                    missing_conditions.append(
+                        f"at least {policy['minimum_local_attempts']} local attempts "
+                        f"(observed {local_attempts})"
+                    )
+                if len(local_families) < policy["minimum_local_families"]:
+                    missing_conditions.append(
+                        f"at least {policy['minimum_local_families']} local chemical families "
+                        f"(observed {len(local_families)}: {local_families})"
+                    )
+                if missing_conditions:
+                    raise RuntimeError(
+                        "MARK_UNMODIFIABLE local search gate is incomplete; requires "
+                        + " and ".join(missing_conditions)
+                    )
         record = {
             "event": len(self.state.unmodifiable_targets) + 1,
             "target_type": target_type,
@@ -697,6 +995,7 @@ class Workflow:
         if scope == "family" and isinstance(family, str):
             attempt_record["family"] = family
         self._refresh_site_search()
+        return True
 
     @staticmethod
     def _docking_feedback_summary(docking: dict[str, Any]) -> dict[str, Any]:
@@ -749,7 +1048,6 @@ class Workflow:
             "minimum_local_attempts": int(configured.get("minimum_local_attempts", 6)),
             "minimum_local_families": int(configured.get("minimum_local_families", 2)),
             "local_patience": int(configured.get("local_patience", 3)),
-            "maximum_local_attempts": int(configured.get("maximum_local_attempts", 12)),
         }
 
     @staticmethod
@@ -776,6 +1074,25 @@ class Workflow:
             key=lambda item: int(item.get("priority", 10**9)),
         )
 
+    def _site_exploration_records(
+        self, target_type: str, target_id: Any
+    ) -> list[dict[str, Any]]:
+        """Return unique host exploration records for one target.
+
+        Geometry screening and candidate-batch results are local search evidence,
+        but they are not docking evidence. Keep the latest record for a
+        transformation so a batch prescreen followed by docking counts once.
+        """
+        records: dict[str, dict[str, Any]] = {}
+        for item in self.state.exploration_attempts:
+            if item.get("source") == "MARK_UNMODIFIABLE":
+                continue
+            if item.get("target_type") != target_type or item.get("target_id") != target_id:
+                continue
+            transformation = item.get("transformation") or {}
+            records[self._transformation_key(transformation)] = item
+        return list(records.values())
+
     def _refresh_site_search(self) -> None:
         policy = self._search_policy()
         if not policy["site_lock_enabled"] or not self.state.site_strategy:
@@ -788,12 +1105,7 @@ class Workflow:
             target_type = site.get("target_type")
             target_id = site.get("target_id")
             key = self._target_key(target_type, target_id)
-            attempts = [
-                item for item in self.state.exploration_attempts
-                if item.get("source") == "design"
-                and item.get("target_type") == target_type
-                and item.get("target_id") == target_id
-            ]
+            attempts = self._site_exploration_records(target_type, target_id)
             docking = [
                 item for item in self.state.docking_history
                 if self._transformation_target(item.get("transformation") or {}) == {
@@ -802,7 +1114,8 @@ class Workflow:
                 }
             ]
             families = sorted({
-                str(item.get("family")) for item in attempts if item.get("family")
+                self._local_modification_family(item.get("transformation") or {})
+                for item in attempts
             })
             best_quality = None
             best_attempt = None
@@ -826,22 +1139,23 @@ class Workflow:
             explicitly_closed = self._is_unmodifiable(target_type, target_id)
             enough_attempts = len(attempts) >= policy["minimum_local_attempts"]
             enough_families = len(families) >= policy["minimum_local_families"]
-            plateau = (
+            patience_reached = (
                 enough_attempts
                 and enough_families
-                and (
-                    non_improving >= policy["local_patience"]
-                    or len(attempts) >= policy["maximum_local_attempts"]
-                )
+                and non_improving >= policy["local_patience"]
             )
             previous = self.state.site_search.get(key) or {}
-            status = "closed" if explicitly_closed else "plateau" if plateau else "pending"
+            status = "closed" if explicitly_closed else "pending"
             refreshed[key] = {
                 **site,
                 "key": key,
                 "status": status,
                 "attempt_count": len(attempts),
-                "geometry_accepted": sum(item.get("status") in {"geometry_accepted", "docked"} for item in attempts),
+                "attempt_count_definition": (
+                    "unique host-recorded transformations, including geometry screening and batch evidence; "
+                    "this is not a docking count"
+                ),
+                "geometry_accepted": sum(item.get("status") in {"geometry_accepted", "batch_geometry_accepted", "docked"} for item in attempts),
                 "geometry_rejected": sum(item.get("status") == "geometry_rejected" for item in attempts),
                 "docking_count": len(docking),
                 "families": families,
@@ -851,7 +1165,7 @@ class Workflow:
                 "minimum_local_attempts": policy["minimum_local_attempts"],
                 "minimum_local_families": policy["minimum_local_families"],
                 "local_patience": policy["local_patience"],
-                "maximum_local_attempts": policy["maximum_local_attempts"],
+                "patience_reached": patience_reached,
                 "previous_status": previous.get("status"),
             }
         active = next(
@@ -911,7 +1225,7 @@ class Workflow:
             "instruction": (
                 "Continue the active target with a chemically distinct candidate batch or transformation. "
                 "The host advances to the next prioritized site only after the local minimum-attempt, chemical-family, "
-                "and plateau/patience conditions are met, or after an accepted MARK_UNMODIFIABLE closure."
+                "or after an accepted MARK_UNMODIFIABLE closure. Patience is advisory and does not force a site switch."
             ),
         }
 
@@ -979,8 +1293,9 @@ class Workflow:
                     for item in transformations
                 }),
                 "transformations": self._llm_safe_value(transformations[-8:]),
-                "geometry_accepted": sum(item.get("status") == "geometry_accepted" for item in records),
+                "geometry_accepted": sum(item.get("status") in {"geometry_accepted", "batch_geometry_accepted", "docked"} for item in records),
                 "geometry_rejected": sum(item.get("status") == "geometry_rejected" for item in records),
+                "geometry_feasible_not_docked": self._geometry_feasible_not_docked(target_type, target_id),
                 "docking_count": len(docking),
                 "docking_results": [
                     {
@@ -1006,26 +1321,105 @@ class Workflow:
             })
         return summaries
 
+    def _geometry_feasible_not_docked(self, target_type: str, target_id: Any) -> list[dict[str, Any]]:
+        """Return host-accepted transformations that have not reached GNINA."""
+        docked_keys = {
+            self._transformation_key(item.get("transformation"))
+            for item in self.state.docking_history
+        }
+        batch_details: dict[str, dict[str, Any]] = {}
+        for observation in self.state.observations:
+            if observation.tool != "generate_site_candidate_batch":
+                continue
+            result = observation.result or {}
+            if result.get("target_type") != target_type or result.get("target_id") != target_id:
+                continue
+            for item in result.get("candidates") or []:
+                transformation = item.get("transformation") or {}
+                batch_details[self._transformation_key(transformation)] = {
+                    "canonical_smiles": item.get("canonical_smiles"),
+                    "fragment_properties": self._llm_safe_value(item.get("fragment_properties")),
+                }
+        candidates: dict[str, dict[str, Any]] = {}
+        accepted_statuses = {"batch_geometry_accepted", "geometry_accepted"}
+        for item in self.state.exploration_attempts:
+            if item.get("target_type") != target_type or item.get("target_id") != target_id:
+                continue
+            if item.get("status") not in accepted_statuses:
+                continue
+            transformation = item.get("transformation") or {}
+            key = self._transformation_key(transformation)
+            if key in docked_keys:
+                continue
+            entry = self._compact_transformation(transformation)
+            entry.update(batch_details.get(key, {}))
+            candidates[key] = entry
+        return list(candidates.values())
+
+    def _compact_exploration_attempts(self) -> list[dict[str, Any]]:
+        compact = []
+        for item in self.state.exploration_attempts:
+            compact.append({
+                "event": item.get("event"),
+                "attempt": item.get("attempt"),
+                "source": item.get("source"),
+                "status": item.get("status"),
+                "target_type": item.get("target_type"),
+                "target_id": item.get("target_id"),
+                "family": item.get("family"),
+                "transformation": self._compact_transformation(item.get("transformation")),
+                "reason": item.get("reason"),
+            })
+        return compact[-80:]
+
+    @staticmethod
+    def _compact_global_search(global_search: dict[str, Any]) -> dict[str, Any]:
+        attempted_targets = []
+        for target_id, records in (global_search.get("attempted_atoms") or {}).items():
+            attempted_targets.append({
+                "target_type": "atom",
+                "target_id": int(target_id),
+                "attempt_count": len(records),
+                "families": sorted({item.get("family") for item in records if item.get("family")}),
+            })
+        for target_id, records in (global_search.get("attempted_replacement_sites") or {}).items():
+            attempted_targets.append({
+                "target_type": "replacement_site",
+                "target_id": target_id,
+                "attempt_count": len(records),
+                "families": sorted({item.get("family") for item in records if item.get("family")}),
+            })
+        return {
+            key: global_search.get(key)
+            for key in (
+                "complete", "closed_atoms", "closed_replacement_sites", "open_targets",
+                "missing_edit_atoms", "missing_atom_coverage", "missing_replacement_sites",
+                "missing_replacement_coverage", "missing_global_families",
+                "missing_target_diversity", "pending_obligations", "policy",
+            )
+        } | {"attempted_target_summaries": attempted_targets}
+
     def _optimization_context(self) -> dict[str, Any]:
         global_search = self._global_search_coverage()
         return {
-            "candidate_history": self._llm_safe_value(self.state.candidate_history),
-            "docking_history": self._llm_safe_value(self.state.docking_history),
             "reference_baseline": self._llm_safe_value(self.reference_docking_result),
-            "convergence": self.state.convergence,
-            "global_search": global_search,
-            "pending_obligations": global_search["pending_obligations"],
+            "convergence": self._compact_convergence(),
+            "global_search": self._compact_global_search(global_search),
+            "pending_obligations": self._llm_safe_value(global_search["pending_obligations"]),
             "attempted_transformations": [
-                item.get("transformation") for item in self.state.exploration_attempts
+                self._compact_transformation(item.get("transformation"))
+                for item in self.state.exploration_attempts
                 if item.get("source") == "design"
-            ],
-            "exploration_attempts": self._llm_safe_value(self.state.exploration_attempts),
-            "unmodifiable_targets": self._llm_safe_value(self.state.unmodifiable_targets),
+            ][-80:],
+            "exploration_attempts": self._compact_exploration_attempts(),
+            "unmodifiable_targets": self._llm_safe_value(self.state.unmodifiable_targets[-30:]),
             "search_policy": self._search_policy(),
             "site_strategy": self._llm_safe_value(self.state.site_strategy),
             "active_target": self._llm_safe_value(self.state.active_target),
             "site_search": self._llm_safe_value(self.state.site_search),
             "adaptive_target_summaries": self._adaptive_target_summaries(global_search),
+            "candidate_history": self._compact_candidate_history()[-40:],
+            "docking_history": self._compact_docking_history()[-40:],
             "instruction": (
                 "Prior candidates, exploration attempts, and docking results are authoritative feedback. "
                 "Do not return an attempted or rejected transformation again; a new READY decision must "
@@ -1039,7 +1433,7 @@ class Workflow:
                 "get_fragment_spatial_profile before validate_candidate_geometry. Continue a target while a "
                 "new chemically distinct, evidence-backed option could improve or meaningfully validate the "
                 "local trend. When site_lock_enabled is true, active_target is authoritative: do not switch "
-                "targets until site_search marks the active target plateau or it is closed with MARK_UNMODIFIABLE. "
+                "targets until it is explicitly closed with MARK_UNMODIFIABLE; patience is only a review signal. "
                 "Use generate_site_candidate_batch when several compatible fragments should be compared. After "
                 "the target has been explored sufficiently and no credible option remains, "
                 "explicitly use MARK_UNMODIFIABLE with scope site and an evidence-based reason. STOP is allowed "
@@ -1054,15 +1448,33 @@ class Workflow:
         """Ask for a complete decision without guessing missing tool fields.
 
         Transformation-shaped responses receive a targeted READY-schema repair.
-        If the model still omits or misspells the action, only the action is
-        normalized; all semantic READY fields remain model-owned and are checked
-        by the existing validation path.
+        Registered tool names used as actions receive a targeted QUERY-schema
+        repair. Persistent malformed tool decisions are rejected; only legacy
+        transformation-shaped READY responses may use the separate action
+        normalization path, with all semantic fields still model-owned.
         """
+        decision = self._unwrap_decision(decision)
         attempts = 0
         while not self._has_valid_action(decision) and attempts < 2:
             attempts += 1
+            registered_tool_action = (
+                decision.get("action")
+                if isinstance(decision, dict)
+                and decision.get("action") in self.tools.catalog()
+                else None
+            )
             contains_transformation = self._contains_transformation_fields(decision)
-            if contains_transformation:
+            if registered_tool_action:
+                mode = "tool_schema_repair"
+                instruction = (
+                    f"Your previous response incorrectly used the registered tool name "
+                    f"{registered_tool_action!r} as the action. Tool names are never legal action values. "
+                    "Return exactly one QUERY object: set action to QUERY, set tool to the registered tool "
+                    "name, and move every tool input field under arguments. Preserve the supplied tool "
+                    "arguments exactly. Do not return the tool name in action and do not omit the QUERY "
+                    "wrapper."
+                )
+            elif contains_transformation:
                 mode = "ready_schema_repair"
                 instruction = (
                     "Your previous response expressed a molecular transformation but was not a "
@@ -1076,10 +1488,11 @@ class Workflow:
                 mode = "decision_repair"
                 instruction = (
                     "Return exactly one complete JSON object with a top-level string action. "
-                    "Use QUERY with question, tool, and arguments; QUERY_BATCH with a queries array; "
-                    "READY with a complete transformation; MARK_UNMODIFIABLE with a precise target, scope, "
-                    "and reason; STOP with a reason; or PROPOSE_TOOL. "
-                    "Do not return bare tool arguments or explanatory prose."
+                    "The action must be one of QUERY, QUERY_BATCH, READY, MARK_UNMODIFIABLE, STOP, or "
+                    "PROPOSE_TOOL; it must never be a registered tool name. Use QUERY with question, tool, "
+                    "and arguments; QUERY_BATCH with a queries array; READY with a complete transformation; "
+                    "MARK_UNMODIFIABLE with a precise target, scope, and reason; STOP with a reason; or "
+                    "PROPOSE_TOOL. Do not return bare tool arguments or explanatory prose."
                 )
             self._write_json(
                 f"invalid-decision-{len(self.state.decisions) + attempts:02d}.json",
@@ -1096,7 +1509,23 @@ class Workflow:
                 "invalid_decision": decision,
                 "instruction": instruction,
             }
-            if contains_transformation:
+            if registered_tool_action:
+                repair_payload["query_template"] = {
+                    "action": "QUERY",
+                    "question": f"Execute {registered_tool_action} using the supplied evidence-backed arguments.",
+                    "tool": registered_tool_action,
+                    "arguments": {
+                        key: value
+                        for key, value in decision.items()
+                        if key != "action"
+                    },
+                    "expected_evidence": (
+                        "site_strategy"
+                        if registered_tool_action == "assess_edit_sites"
+                        else "host tool result"
+                    ),
+                }
+            elif contains_transformation:
                 repair_payload["ready_template"] = {
                     **decision,
                     "action": "READY",
@@ -1104,7 +1533,7 @@ class Workflow:
                     "edit_hypothesis": "<one sentence on the intended structural change>",
                     "knowledge_gaps": ["<optional>"],
                 }
-            decision = self.client.complete_json(repair_payload)
+            decision = self._unwrap_decision(self.client.complete_json(repair_payload))
         if not self._has_valid_action(decision):
             if self._contains_transformation_fields(decision):
                 decision = self._normalize_transformation_action(decision, phase)
@@ -1170,7 +1599,8 @@ class Workflow:
         if action == "QUERY":
             self._execute_query(decision)
         elif action == "MARK_UNMODIFIABLE":
-            self._record_unmodifiable(decision)
+            if not self._record_unmodifiable(decision):
+                return "MARK_UNMODIFIABLE_REUSED"
         elif action == "QUERY_BATCH":
             queries = decision.get("queries")
             if not isinstance(queries, list) or not queries:
@@ -1229,12 +1659,35 @@ class Workflow:
             except RuntimeError as error:
                 message = str(error)
                 last_message = message
-                if action not in {"QUERY", "QUERY_BATCH"}:
+                if action not in {"QUERY", "QUERY_BATCH", "MARK_UNMODIFIABLE"}:
                     raise
-                is_duplicate = isinstance(error, DuplicateToolCallError)
-                last_failure_class = "duplicate_tool_call" if is_duplicate else "invalid_tool_decision"
-                rejection = (
-                    error.rejection if is_duplicate else {
+                is_duplicate_tool = isinstance(error, DuplicateToolCallError)
+                if is_duplicate_tool:
+                    last_failure_class = "duplicate_tool_call"
+                    rejection = error.rejection
+                elif action == "MARK_UNMODIFIABLE":
+                    last_failure_class = "invalid_unmodifiable_decision"
+                    active = self.state.active_target
+                    active_label = (
+                        f"{active.get('target_type')}:{active.get('target_id')}"
+                        if active else "none"
+                    )
+                    rejection = {
+                        "status": "rejected",
+                        "failure_class": last_failure_class,
+                        "decision": decision,
+                        "active_target": active,
+                        "error": message,
+                        "instruction": (
+                            "Correct the MARK_UNMODIFIABLE declaration. In site-lock mode it may only "
+                            f"close the current active target {active_label}, and only after the local "
+                            "attempt and chemical-family gate is complete. Otherwise return a new QUERY "
+                            "or READY transformation for the active target."
+                        ),
+                    }
+                else:
+                    last_failure_class = "invalid_tool_decision"
+                    rejection = {
                         "status": "rejected",
                         "failure_class": last_failure_class,
                         "error": message,
@@ -1243,14 +1696,16 @@ class Workflow:
                             "or QUERY_BATCH with each item containing a string tool and object arguments."
                         ),
                     }
-                )
                 self.state.tool_rejections.append(rejection)
-                self._emit("tool_call_rejected", rejection)
+                self._emit("decision_rejected", rejection)
                 recovery_payload = {
                     **payload,
                     "state": self._llm_state_view(),
-                    "mode": "tool_call_recovery",
-                    "tool_call_rejection": rejection,
+                    "mode": (
+                        "decision_recovery"
+                        if action == "MARK_UNMODIFIABLE" else "tool_call_recovery"
+                    ),
+                    "decision_rejection": rejection,
                     "instruction": rejection["instruction"],
                 }
                 decision = self._repair_decision(
@@ -1260,7 +1715,7 @@ class Workflow:
                 )
         if last_failure_class == "duplicate_tool_call":
             raise RuntimeError(f"LLM did not recover from duplicate tool calls: {last_message}")
-        raise RuntimeError(f"LLM did not recover from malformed tool decisions: {last_message}")
+        raise RuntimeError(f"LLM did not recover from rejected decisions: {last_message}")
 
     def collect_context(self) -> dict[str, Any]:
         ready_evidence_retries = 0
@@ -1555,15 +2010,30 @@ class Workflow:
         if self._search_policy()["mode"] == "adaptive":
             fragment_id = transformation.get("fragment_id")
             fragment_smiles = transformation.get("fragment_smiles")
+
+            def smiles_match(value: Any) -> bool:
+                return bool(
+                    isinstance(value, str)
+                    and isinstance(fragment_smiles, str)
+                    and self.tools.fragment_library.smiles_equivalent(value, fragment_smiles)
+                )
+
             library_match = any(
-                item.tool == "search_fragment_library"
-                and any(
-                    isinstance(fragment, dict)
-                    and (
-                        fragment.get("fragment_id") == fragment_id
-                        or fragment.get("smiles") == fragment_smiles
+                (
+                    item.tool == "search_fragment_library"
+                    and any(
+                        isinstance(fragment, dict)
+                        and (
+                            fragment.get("fragment_id") == fragment_id
+                            or smiles_match(fragment.get("smiles"))
+                        )
+                        for fragment in (item.result.get("fragments") or [])
                     )
-                    for fragment in (item.result.get("fragments") or [])
+                )
+                or (
+                    item.tool == "get_fragment_record"
+                    and isinstance(item.result, dict)
+                    and item.result.get("fragment_id") == fragment_id
                 )
                 for item in self.state.observations
             )
@@ -1579,7 +2049,10 @@ class Workflow:
                 })
             properties_match = any(
                 item.tool == "get_fragment_properties"
-                and item.arguments.get("smiles") == fragment_smiles
+                and (
+                    smiles_match(item.arguments.get("smiles"))
+                    or smiles_match((item.result or {}).get("canonical_smiles"))
+                )
                 for item in self.state.observations
             ) or library_match
             if not properties_match:
@@ -1592,7 +2065,8 @@ class Workflow:
                 item.tool == "get_fragment_spatial_profile"
                 and (
                     item.arguments.get("fragment_id") == fragment_id
-                    or item.arguments.get("fragment_smiles") == fragment_smiles
+                    or smiles_match(item.arguments.get("fragment_smiles"))
+                    or smiles_match((item.result or {}).get("fragment_smiles"))
                 )
                 for item in self.state.observations
             )
@@ -1747,6 +2221,15 @@ class Workflow:
             return "alkyl"
         return "other"
 
+    @classmethod
+    def _local_modification_family(cls, transformation: dict[str, Any]) -> str:
+        chemical_transformation = dict(transformation)
+        chemical_transformation["operation"] = "replace_hydrogen"
+        family = cls._modification_family(chemical_transformation)
+        if transformation.get("operation") == "replace_fragment":
+            return f"fragment_replacement:{family}"
+        return family
+
     @staticmethod
     def _replace_hydrogen_site_supported(atom: Chem.Atom) -> bool:
         """Return whether the current single-bond editor supports replacing this H."""
@@ -1829,7 +2312,7 @@ class Workflow:
                 "source": record.get("source"),
                 "status": record.get("status"),
                 "family": record.get("family") or self._modification_family(transformation),
-                "transformation": transformation,
+                "transformation": self._compact_transformation(transformation),
                 "reason": record.get("reason"),
             }
 
@@ -2063,7 +2546,7 @@ class Workflow:
                 "minimum_prioritized_sites"
             ]
             complete = strategy_ready and all(
-                item.get("status") in {"plateau", "closed"} for item in strategy_status
+                item.get("status") == "closed" for item in strategy_status
             )
             pending_obligations = []
             if not strategy_ready:
@@ -2084,9 +2567,9 @@ class Workflow:
                     "active_target": self.state.active_target,
                     "site_search": self.state.site_search.get(active_key),
                     "required_action": (
-                        "Continue the locked target with chemically distinct transformations or candidate batches "
-                        "until the local search gate reports plateau, or close it with MARK_UNMODIFIABLE after "
-                        "the minimum diversity evidence is satisfied."
+                        "Continue the locked target while a chemically distinct evidence-backed option remains. "
+                        "Patience is a review signal, not an automatic stopping condition. Close it only with "
+                        "MARK_UNMODIFIABLE after the local evidence and candidate options are exhausted."
                     ),
                 })
             open_targets = [
@@ -2097,7 +2580,7 @@ class Workflow:
                     "site_type": item.get("site_type"),
                 }
                 for item in strategy_status
-                if item.get("status") not in {"plateau", "closed"}
+                if item.get("status") != "closed"
             ]
             missing_target_diversity = []
         return {

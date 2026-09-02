@@ -10,6 +10,7 @@ TASK_PATH="${TASK_PATH:-input/task.json}"
 RUN_ROOT="${RUN_ROOT:-runs/docking-loop-test}"
 CONTEXT_ROUNDS="${CONTEXT_ROUNDS:-256}"
 EDIT_ATTEMPTS="${EDIT_ATTEMPTS:-80}"
+SCRIPTED_EDIT_ATTEMPTS="${SCRIPTED_EDIT_ATTEMPTS:-1}"
 MODE="scripted"
 RUN_TESTS=1
 
@@ -32,7 +33,8 @@ Environment overrides:
   TASK_PATH         Task JSON (default: input/task.json)
   RUN_ROOT          Output root (default: runs/docking-loop-test)
   CONTEXT_ROUNDS    Runtime context-query budget (default: 256)
-  EDIT_ATTEMPTS     Runtime maximum candidate attempts (default: 80)
+  EDIT_ATTEMPTS     Runtime maximum candidate attempts for real mode (default: 80)
+  SCRIPTED_EDIT_ATTEMPTS  Maximum attempts for the single-candidate scripted smoke test (default: 1)
   AICLOUD_KEY_FILE  API key file for --real/--all (default: ~/.aicloud_api_key)
   AICLOUD_API_KEY   API key value; takes precedence over AICLOUD_KEY_FILE
 EOF
@@ -76,6 +78,7 @@ fi
 mkdir -p "$RUN_ROOT"
 RUNTIME_CONFIG="$RUN_ROOT/runtime-config.json"
 RUNTIME_TASK="$RUN_ROOT/runtime-task.json"
+SCRIPTED_RUNTIME_TASK="$RUN_ROOT/runtime-task-scripted.json"
 mamba run -n "$ENV_NAME" python - "$SOURCE_CONFIG" "$RUNTIME_CONFIG" <<'PY'
 import json
 import sys
@@ -106,6 +109,19 @@ data["max_context_rounds"] = rounds
 data.setdefault("docking_optimization", {})["hard_max_attempts"] = attempts
 target.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 print(f"Runtime task: {target} (max_context_rounds={rounds}, hard_max_attempts={attempts})")
+PY
+mamba run -n "$ENV_NAME" python - "$RUNTIME_TASK" "$SCRIPTED_RUNTIME_TASK" "$SCRIPTED_EDIT_ATTEMPTS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source, target, attempts = Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3])
+if attempts < 1:
+    raise SystemExit("SCRIPTED_EDIT_ATTEMPTS must be a positive integer")
+data = json.loads(source.read_text(encoding="utf-8"))
+data.setdefault("docking_optimization", {})["hard_max_attempts"] = attempts
+target.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(f"Scripted runtime task: {target} (hard_max_attempts={attempts})")
 PY
 
 printf 'Checking GPU and GNINA runtime\n'
@@ -167,12 +183,14 @@ PY
 run_workflow() {
   local kind="$1"
   local run_dir="$RUN_ROOT/$kind"
+  local task_path="$RUNTIME_TASK"
   rm -rf -- "$run_dir"
   mkdir -p "$run_dir"
   printf '\nRunning %s workflow through real GNINA docking\n' "$kind"
   if [[ "$kind" == "scripted" ]]; then
+    task_path="$SCRIPTED_RUNTIME_TASK"
     mamba run -n "$ENV_NAME" python -m molecular_agent.cli \
-      --task "$RUNTIME_TASK" \
+      --task "$task_path" \
       --config "$RUNTIME_CONFIG" \
       --scripted-demo \
       --run-dir "$run_dir"

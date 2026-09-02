@@ -76,13 +76,24 @@ mamba run -n molecular-agent python scripts/filter_fragment_library.py \
 
 在任务 JSON 中用 `fragment_library_path` 指向工作库。联网只发生在显式执行导入脚本时，设计工作流始终读取本地快照。ChEMBL 来源：`https://www.ebi.ac.uk/chembl/`；许可与署名：`https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/`。
 
+项目还提供统一片段库，由 10 条 CC0 curated seed 片段和 ChEMBL working 子集合并生成：
+
+```bash
+mamba run -n molecular-agent-docking python scripts/build_unified_fragment_library.py \
+  --seed molecular_agent/data/fragments.json \
+  --working molecular_agent/data/chembl_fragments_working.json \
+  --output molecular_agent/data/fragments_unified.json
+```
+
+统一库为每条记录保留 `fragment_id`、`name`、`smiles`、来源记录、`allowed_operations` 和 ChEMBL provenance，并写入确定性的 `size_class` 与 `chemical_tags`。尺寸层级为 `minimal`（1 个重原子）、`small`（2-4）、`medium`（5-8）和 `large`（9-12）；同时保存电荷、分子量、LogP、HBD、HBA、TPSA、环数和可旋转键等基础性质。`size_class` 是 LLM 可选择的动作空间，不是宿主强制的小到大执行顺序。`search_fragment_library` 和 `generate_site_candidate_batch` 支持用 `size_class`、`chemical_tag` 过滤，最终候选仍必须经过几何验证和 docking。
+
 ## Docking 趋势和收敛
 
 `docking_optimization` 配置主指标、显著改善阈值、seed 稳定性和硬安全上限。每轮同时记录原始 attempt score 与单调不下降的 best-so-far 轨迹；允许探索候选变差，不会伪造成每轮都改善。以 `minimizedAffinity` 为主指标时，candidate-reference delta 越负越好。候选必须达到 `minimum_seed_win_fraction` 才进入历史最佳竞争，quality 还会按 `seed_stddev_penalty * seed标准差` 扣分，避免由单一 seed 驱动选择。
 
-工作流支持 `search_policy.mode=adaptive` 的证据驱动搜索。启用 `site_lock_enabled` 后，LLM 先通过 `assess_edit_sites` 工具提交 host 校验过的位点优先级和位点类型（`core_anchor`、`pocket_extension`、`solvent_exposed`、`linker_or_sidechain` 或 `uncertain`）。宿主按该策略锁定当前最高优先级的开放位点，并将 `active_target`、`site_search` 和局部统计反馈给 LLM；在当前位点达到 `minimum_local_attempts`、`minimum_local_families` 且满足 `local_patience` 平台期，或显式 `MARK_UNMODIFIABLE` 关闭后，才切换到下一位点。这样可形成位点内的局部 SAR，而不是每轮在所有位点之间跳转。
+工作流支持 `search_policy.mode=adaptive` 的证据驱动搜索。启用 `site_lock_enabled` 后，LLM 先通过 `assess_edit_sites` 工具提交 host 校验过的位点优先级和位点类型（`core_anchor`、`pocket_extension`、`solvent_exposed`、`linker_or_sidechain` 或 `uncertain`）。宿主按该策略锁定当前最高优先级的开放位点，并将 `active_target`、`site_search` 和局部统计反馈给 LLM；`minimum_local_attempts` 和 `minimum_local_families` 是显式关闭前的证据下限，`local_patience` 只作为要求 LLM 重新评估的信号，不会自动把位点标为 plateau 或切换到下一位点。位点只有在 LLM 使用有证据理由的 `MARK_UNMODIFIABLE` 关闭后才切换。这样可形成不设局部尝试上限的位点内局部 SAR，而不是每轮在所有位点之间跳转。
 
-`generate_site_candidate_batch` 可由 LLM 调用，为一个锁定位点从 operation-compatible 片段库中批量取出候选，并执行确定性构建和刚性蛋白碰撞预筛选；它不执行 docking，也不替代 READY 的完整证据门。`minimum_distinct_transformations_per_target` 仍是 adaptive 模式的最低多样性门槛。LLM 必须读取每个位点的化学环境、空间方向、已有相互作用、片段性质、attachment-centered 3D profile、docking 分数、seed 稳定性、pose 共识和相互作用变化，再决定继续提出新的化学上不同的 transformation，或使用有证据理由的 `MARK_UNMODIFIABLE` 关闭该位点。几何拒绝也会作为后续搜索证据反馈给 LLM。所有尝试由独立的 `exploration_attempts` 审计账本记录，不会把几何拒绝误认为成功 docking。每次 docking 的主指标、相对参考的表现、历史最佳、seed 稳定性、pose 一致性、相互作用变化和失败原因都会反馈给 LLM。候选变差不会单独触发停止；`hard_max_attempts` 只作为防止无限计算的安全上限。当前 `input/task.json` 使用 site-lock adaptive 模式和 80 次硬上限。最终 `candidate_path` 指向历史最佳候选，而不是最后一次尝试。
+`generate_site_candidate_batch` 可由 LLM 调用，为一个锁定位点从 operation-compatible 片段库中批量取出候选，并执行确定性构建和刚性蛋白碰撞预筛选；它不执行 docking，也不替代 READY 的完整证据门。宿主会在发送给 LLM 的位点摘要中计算 `geometry_feasible_not_docked`：它是批次或确定性几何检查已接受、但尚未出现在 docking history 中的 transformation；这不是对整个片段库的穷举，未被查询的片段仍只是潜在候选。完整 observation、GNINA 原始输出、pose、候选结构和 provenance 只保存在运行目录，LLM 输入使用去重后的基线/当前位点/最近窗口和结构化指标摘要。`minimum_distinct_transformations_per_target` 仍是 adaptive 模式的最低多样性门槛。LLM 必须读取每个位点的化学环境、空间方向、已有相互作用、片段性质、attachment-centered 3D profile、docking 分数、seed 稳定性、pose 共识和相互作用变化，再决定继续提出新的化学上不同的 transformation，或使用有证据理由的 `MARK_UNMODIFIABLE` 关闭该位点。几何拒绝也会作为后续搜索证据反馈给 LLM。所有尝试由独立的 `exploration_attempts` 审计账本记录，不会把几何拒绝误认为成功 docking。每次 docking 的主指标、相对参考的表现、历史最佳、seed 稳定性、pose 一致性、相互作用变化和失败原因都会反馈给 LLM。候选变差不会单独触发停止；当前没有局部 `maximum_local_attempts`，`hard_max_attempts` 仍只作为防止进程失控的全局安全上限，而不是科学收敛条件。重复 transformation、重复工具调用和连续无进展决策会被拦截或要求 LLM 修正；最终 `candidate_path` 指向历史最佳候选，而不是最后一次尝试。
 
 这类收敛只表示固定 docking 协议下的搜索平台，不等价于实验活性或真实结合自由能收敛。
 
