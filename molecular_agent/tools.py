@@ -13,9 +13,15 @@ from .structure import ComplexContext
 
 
 class ToolRegistry:
-    def __init__(self, context: ComplexContext, fragment_library: FragmentLibrary | None = None):
+    def __init__(
+        self,
+        context: ComplexContext,
+        fragment_library: FragmentLibrary | None = None,
+        parent_resolver: Callable[[int | None], Chem.Mol] | None = None,
+    ):
         self.context = context
         self.fragment_library = fragment_library or FragmentLibrary()
+        self.parent_resolver = parent_resolver
         self._replacement_sites = self._build_replacement_sites()
         self._tools: dict[str, tuple[Callable[..., dict[str, Any]], set[str], dict[str, Any]]] = {
             "get_ligand_info": (
@@ -57,6 +63,10 @@ class ToolRegistry:
                                         ],
                                     },
                                     "rationale": {"type": "string", "minLength": 1},
+                                    "search_status": {
+                                        "type": "string",
+                                        "enum": ["hard-reject", "pilot", "active"],
+                                    },
                                 },
                                 "required": [
                                     "target_type", "target_id", "priority", "site_type", "rationale"
@@ -96,6 +106,7 @@ class ToolRegistry:
                     "properties": {
                         "atom_index": {"type": "integer", "minimum": 0},
                         "radius": {"type": "number", "minimum": 3, "maximum": 8},
+                        "parent_attempt": {"type": "integer", "minimum": 1},
                     },
                     "required": ["atom_index", "radius"],
                 },
@@ -108,6 +119,7 @@ class ToolRegistry:
                     "properties": {
                         "atom_index": {"type": "integer", "minimum": 0},
                         "distance": {"type": "number", "minimum": 1.0, "maximum": 4.0},
+                        "parent_attempt": {"type": "integer", "minimum": 1},
                     },
                     "required": ["atom_index", "distance"],
                 },
@@ -147,6 +159,8 @@ class ToolRegistry:
                         "replacement_site_id": {"type": "string", "minLength": 1},
                         "fragment_id": {"type": "string"},
                         "fragment_smiles": {"type": "string", "minLength": 1},
+                        "parent_attempt": {"type": "integer", "minimum": 1},
+                        "replace_existing_substituent": {"type": "boolean"},
                     },
                     "required": ["fragment_smiles"],
                 },
@@ -170,6 +184,7 @@ class ToolRegistry:
                         },
                         "chemical_tag": {"type": "string", "minLength": 1},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 32},
+                        "parent_attempt": {"type": "integer", "minimum": 1},
                     },
                     "required": ["target_type", "target_id"],
                     "additionalProperties": False,
@@ -430,6 +445,7 @@ class ToolRegistry:
             priority = item.get("priority")
             site_type = item.get("site_type")
             rationale = item.get("rationale")
+            search_status = item.get("search_status", "active")
             if target_type not in {"atom", "replacement_site"}:
                 raise ValueError("site assessment target_type must be atom or replacement_site")
             valid_target = (
@@ -449,6 +465,8 @@ class ToolRegistry:
                 raise ValueError(f"Unsupported site_type: {site_type!r}")
             if not isinstance(rationale, str) or not rationale.strip():
                 raise ValueError("site assessment rationale must be non-empty")
+            if search_status not in {"hard-reject", "pilot", "active"}:
+                raise ValueError("site assessment search_status must be hard-reject, pilot, or active")
             target_key = (target_type, target_id)
             if target_key in seen_targets:
                 raise ValueError(f"Duplicate site assessment: {target_type}:{target_id}")
@@ -460,6 +478,7 @@ class ToolRegistry:
                 "priority": priority,
                 "site_type": site_type,
                 "rationale": rationale.strip(),
+                "search_status": search_status,
             })
         priorities = sorted(seen_priorities)
         if priorities != list(range(1, len(priorities) + 1)):
@@ -614,13 +633,19 @@ class ToolRegistry:
             raise ValueError("Edit-site tools require a heavy atom")
         return atom
 
-    def get_atom_environment(self, atom_index: int, radius: float) -> dict[str, Any]:
-        atom = self._ligand_atom(atom_index)
-        position = self.context.ligand.GetConformer().GetAtomPosition(atom_index)
+    def get_atom_environment(
+        self, atom_index: int, radius: float, parent_attempt: int | None = None
+    ) -> dict[str, Any]:
+        ligand = self._parent_ligand(parent_attempt)
+        if atom_index < 0 or atom_index >= ligand.GetNumAtoms():
+            raise ValueError(f"Invalid ligand atom index: {atom_index}")
+        atom = ligand.GetAtomWithIdx(atom_index)
+        position = ligand.GetConformer().GetAtomPosition(atom_index)
         xyz = np.array([position.x, position.y, position.z])
         nearby = self.context.protein_near(xyz, radius)
         return {
             "atom_index": atom_index,
+            "parent_attempt": parent_attempt,
             "element": atom.GetSymbol(),
             "aromatic": atom.GetIsAromatic(),
             "replaceable_hydrogens": atom.GetTotalNumHs(),
@@ -634,12 +659,17 @@ class ToolRegistry:
             ],
         }
 
-    def check_growth_space(self, atom_index: int, distance: float) -> dict[str, Any]:
-        atom = self._ligand_atom(atom_index)
+    def check_growth_space(
+        self, atom_index: int, distance: float, parent_attempt: int | None = None
+    ) -> dict[str, Any]:
+        ligand = self._parent_ligand(parent_attempt)
+        if atom_index < 0 or atom_index >= ligand.GetNumAtoms():
+            raise ValueError(f"Invalid ligand atom index: {atom_index}")
+        atom = ligand.GetAtomWithIdx(atom_index)
         neighbors = [item for item in atom.GetNeighbors() if item.GetAtomicNum() > 1]
         if not neighbors:
             raise ValueError("Selected atom has no heavy-atom neighbor")
-        conformer = self.context.ligand.GetConformer()
+        conformer = ligand.GetConformer()
         origin_point = conformer.GetAtomPosition(atom_index)
         origin = np.array([origin_point.x, origin_point.y, origin_point.z])
         neighbor_positions = []
@@ -658,6 +688,7 @@ class ToolRegistry:
         )
         return {
             "atom_index": atom_index,
+            "parent_attempt": parent_attempt,
             "probe_distance": distance,
             "probe_xyz": [round(float(value), 3) for value in probe],
             "nearest_protein_atoms": [
@@ -1022,8 +1053,20 @@ class ToolRegistry:
         transformation["edit_atom_index"] = site["retained_atom_index"]
         transformation["replacement_site"] = site
 
-    def validate_candidate_geometry(self, **transformation: Any) -> dict[str, Any]:
+    def _parent_ligand(self, parent_attempt: int | None = None) -> Chem.Mol:
+        if parent_attempt is None:
+            return self.context.ligand
+        if self.parent_resolver is None:
+            raise ValueError("parent_attempt is not available in this tool context")
+        return self.parent_resolver(parent_attempt)
+
+    def validate_candidate_geometry(
+        self, parent_attempt: int | None = None, **transformation: Any
+    ) -> dict[str, Any]:
         # The host, rather than the model, resolves site IDs and fragment IDs.
+        parent = self._parent_ligand(parent_attempt)
+        if parent_attempt is not None:
+            transformation["parent_attempt"] = parent_attempt
         if transformation.get("operation") == "replace_fragment":
             try:
                 self._resolve_fragment_replacement(transformation)
@@ -1058,7 +1101,7 @@ class ToolRegistry:
             transformation["edit_atom_index"] = transformation["atom_index"]
         try:
             result = apply_transformation(
-                self.context.ligand,
+                parent,
                 transformation,
                 self.context.protein_atoms,
                 seed=17,
@@ -1076,9 +1119,15 @@ class ToolRegistry:
         size_class: str | None = None,
         chemical_tag: str | None = None,
         limit: int = 16,
+        parent_attempt: int | None = None,
     ) -> dict[str, Any]:
+        parent = self._parent_ligand(parent_attempt)
         if target_type == "atom":
-            atom = self._ligand_atom(target_id)
+            if not isinstance(target_id, int) or not 0 <= target_id < parent.GetNumAtoms():
+                raise ValueError(f"Invalid ligand atom index: {target_id}")
+            atom = parent.GetAtomWithIdx(target_id)
+            if atom.GetAtomicNum() == 1:
+                raise ValueError("Edit-site tools require a heavy atom")
             if atom.GetTotalNumHs() < 1 or (atom.GetSymbol() == "N" and atom.GetIsAromatic()):
                 raise ValueError(f"Atom {target_id!r} is not supported for replace_hydrogen")
             operation = "substitute"
@@ -1110,6 +1159,8 @@ class ToolRegistry:
                 "operation": "replace_hydrogen" if target_type == "atom" else "replace_fragment",
                 "fragment_id": record["fragment_id"],
                 "fragment_smiles": record["smiles"],
+                "parent_attempt": parent_attempt,
+                "replace_existing_substituent": parent_attempt is not None,
             }
             if target_type == "atom":
                 transformation["edit_atom_index"] = target_id
@@ -1118,7 +1169,7 @@ class ToolRegistry:
                 self._resolve_fragment_replacement(transformation)
             try:
                 result = apply_transformation(
-                    self.context.ligand,
+                    parent,
                     transformation,
                     self.context.protein_atoms,
                     seed=17,
@@ -1154,6 +1205,7 @@ class ToolRegistry:
             "status": "complete",
             "target_type": target_type,
             "target_id": target_id,
+            "parent_attempt": parent_attempt,
             "query": query,
             "operation": operation,
             "requested_limit": limit,

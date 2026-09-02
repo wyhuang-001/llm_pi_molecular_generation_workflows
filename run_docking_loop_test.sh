@@ -35,8 +35,8 @@ Environment overrides:
   CONTEXT_ROUNDS    Runtime context-query budget (default: 256)
   EDIT_ATTEMPTS     Runtime maximum candidate attempts for real mode (default: 80)
   SCRIPTED_EDIT_ATTEMPTS  Maximum attempts for the single-candidate scripted smoke test (default: 1)
-  AICLOUD_KEY_FILE  API key file for --real/--all (default: ~/.aicloud_api_key)
-  AICLOUD_API_KEY   API key value; takes precedence over AICLOUD_KEY_FILE
+  CODEX_CONFIG_DIR  Local Codex configuration directory (default: ~/.codex)
+  OPENAI_API_KEY    Optional API key override; otherwise read from Codex auth.json
 EOF
 }
 
@@ -60,19 +60,15 @@ command -v mamba >/dev/null 2>&1 || {
 [[ -f "$TASK_PATH" ]] || { printf 'ERROR: task not found: %s\n' "$TASK_PATH" >&2; exit 1; }
 
 if [[ "$MODE" == "real" || "$MODE" == "all" ]]; then
-  if [[ -z "${AICLOUD_API_KEY:-}" ]]; then
-    AICLOUD_KEY_FILE="${AICLOUD_KEY_FILE:-$HOME/.aicloud_api_key}"
-    [[ -f "$AICLOUD_KEY_FILE" ]] || {
-      printf 'ERROR: API key file not found: %s\n' "$AICLOUD_KEY_FILE" >&2
-      exit 1
-    }
-    AICLOUD_API_KEY="$(tr -d '\r\n' < "$AICLOUD_KEY_FILE")"
-    [[ -n "$AICLOUD_API_KEY" ]] || {
-      printf 'ERROR: API key file is empty: %s\n' "$AICLOUD_KEY_FILE" >&2
-      exit 1
-    }
-    export AICLOUD_API_KEY
-  fi
+  export CODEX_CONFIG_DIR="${CODEX_CONFIG_DIR:-$HOME/.codex}"
+  [[ -f "$CODEX_CONFIG_DIR/config.toml" ]] || {
+    printf 'ERROR: Codex config not found: %s/config.toml\n' "$CODEX_CONFIG_DIR" >&2
+    exit 1
+  }
+  [[ -f "$CODEX_CONFIG_DIR/auth.json" || -n "${OPENAI_API_KEY:-}" ]] || {
+    printf 'ERROR: Codex auth not found: %s/auth.json\n' "$CODEX_CONFIG_DIR" >&2
+    exit 1
+  }
 fi
 
 mkdir -p "$RUN_ROOT"

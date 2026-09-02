@@ -89,12 +89,19 @@ class Workflow:
         self.run_dir = run_dir.resolve()
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.progress = progress
+        self.parent_candidates: dict[int, Chem.Mol] = {
+            0: Chem.Mol(self.context.ligand)
+        }
+        self.parent_metadata: dict[int, dict[str, Any]] = {
+            0: {"attempt": 0, "generation": 0, "target_type": None, "target_id": None}
+        }
         library_path = self.context.task.get("fragment_library_path")
         if library_path:
             library_path = (self.context.input_dir / str(library_path)).resolve()
         self.tools = ToolRegistry(
             self.context,
             FragmentLibrary(library_path) if library_path else None,
+            parent_resolver=self._resolve_parent_candidate,
         )
         if config_path is not None:
             self.docking_adapter, self.rbfe_adapter = configured_adapters(
@@ -109,6 +116,20 @@ class Workflow:
         )
         self.reference_docking_result: dict[str, Any] | None = None
         self._design_phase = False
+
+    def _resolve_parent_candidate(self, parent_attempt: int | None) -> Chem.Mol:
+        attempt = 0 if parent_attempt is None else int(parent_attempt)
+        try:
+            return Chem.Mol(self.parent_candidates[attempt])
+        except KeyError as error:
+            raise ValueError(f"Unknown parent_attempt: {attempt}") from error
+
+    def _parent_metadata_for(self, parent_attempt: int | None) -> dict[str, Any]:
+        attempt = 0 if parent_attempt is None else int(parent_attempt)
+        try:
+            return dict(self.parent_metadata[attempt])
+        except KeyError as error:
+            raise ValueError(f"Unknown parent_attempt: {attempt}") from error
 
     def _emit(self, event: str, details: dict[str, Any] | None = None) -> None:
         if self.progress:
@@ -138,7 +159,8 @@ class Workflow:
         transformation = transformation or {}
         fields = (
             "operation", "edit_atom_index", "replacement_site_id", "fragment_id",
-            "fragment_smiles", "cut_bond",
+            "fragment_smiles", "cut_bond", "parent_attempt", "generation",
+            "replace_existing_substituent",
         )
         return {
             key: transformation[key]
@@ -152,6 +174,7 @@ class Workflow:
         # Fragment IDs preserve provenance but do not make the same chemical edit
         # a distinct transformation. Match duplicate-protection semantics.
         normalized.pop("fragment_id", None)
+        normalized.pop("generation", None)
         cut_bond = cls._normalize_cut_bond(normalized.get("cut_bond"))
         if cut_bond is not None:
             normalized["cut_bond"] = list(cut_bond)
@@ -281,6 +304,10 @@ class Workflow:
             docking = item.get("docking") or {}
             compact.append({
                 "attempt": item.get("attempt"),
+                "candidate_id": item.get("candidate_id"),
+                "parent_attempt": item.get("parent_attempt"),
+                "generation": item.get("generation", 1),
+                "candidate_path": item.get("candidate_path"),
                 "record_type": item.get("record_type"),
                 "transformation": self._compact_transformation(item.get("transformation")),
                 "validation": {
@@ -383,6 +410,12 @@ class Workflow:
             "operation": operation,
             "fragment_smiles": transformation.get("fragment_smiles"),
         }
+        parent_attempt = transformation.get("parent_attempt")
+        if isinstance(parent_attempt, int) and parent_attempt > 0:
+            normalized["parent_attempt"] = parent_attempt
+        generation = transformation.get("generation")
+        if isinstance(generation, int) and generation >= 0:
+            normalized["generation"] = generation
         fragment_id = transformation.get("fragment_id")
         if isinstance(fragment_id, str) and fragment_id:
             normalized["fragment_id"] = fragment_id
@@ -428,6 +461,10 @@ class Workflow:
         }
         if attempt is not None:
             record["attempt"] = attempt
+        parent_attempt = normalized.get("parent_attempt")
+        if isinstance(parent_attempt, int) and parent_attempt > 0:
+            record["parent_attempt"] = parent_attempt
+            record["generation"] = normalized.get("generation", 1)
         if reason:
             record["reason"] = reason
         self.state.exploration_attempts.append(record)
@@ -749,9 +786,22 @@ class Workflow:
     def _transformation(self, decision: dict[str, Any]) -> dict[str, Any]:
         operation = decision.get("operation", "replace_hydrogen")
         fragment_id = self._optional_identifier(decision.get("fragment_id"))
+        parent_attempt = decision.get("parent_attempt")
+        if parent_attempt is not None and (
+            not isinstance(parent_attempt, int) or parent_attempt < 1
+        ):
+            raise RuntimeError("parent_attempt must be a positive attempt number")
+        if parent_attempt is not None:
+            self._parent_metadata_for(parent_attempt)
         transformation = {
             "operation": operation,
             "fragment_smiles": decision.get("fragment_smiles"),
+            "parent_attempt": parent_attempt,
+            "generation": (
+                self._parent_metadata_for(parent_attempt).get("generation", 0) + 1
+                if parent_attempt is not None else 1
+            ),
+            "replace_existing_substituent": parent_attempt is not None,
         }
         if fragment_id:
             transformation["fragment_id"] = fragment_id
@@ -786,6 +836,9 @@ class Workflow:
             transformation["edit_atom_index"] = site["retained_atom_index"]
         else:
             transformation["edit_atom_index"] = decision.get("edit_atom_index")
+        if parent_attempt is None:
+            transformation.pop("parent_attempt", None)
+            transformation.pop("replace_existing_substituent", None)
         if not isinstance(transformation.get("fragment_smiles"), str):
             raise RuntimeError("READY requires fragment_smiles or a valid fragment_id")
         return transformation
@@ -942,36 +995,7 @@ class Workflow:
                     "MARK_UNMODIFIABLE may only close the current active prioritized target: "
                     f"{active.get('target_type')}:{active.get('target_id')}"
                 )
-        if policy["mode"] == "adaptive" and scope == "site":
-            attempted = len(self._distinct_target_transformations(target_type, target_id))
-            minimum = policy["minimum_distinct_transformations_per_target"]
-            if attempted < minimum:
-                raise RuntimeError(
-                    f"Adaptive search requires at least {minimum} distinct transformations before "
-                    f"closing {target_type} {target_id!r}; observed {attempted}"
-                )
-            if policy["site_lock_enabled"] and self._design_phase:
-                local = self.state.site_search.get(
-                    self._target_key(target_type, target_id), {}
-                )
-                local_attempts = int(local.get("attempt_count", 0))
-                local_families = list(local.get("families") or [])
-                missing_conditions = []
-                if local_attempts < policy["minimum_local_attempts"]:
-                    missing_conditions.append(
-                        f"at least {policy['minimum_local_attempts']} local attempts "
-                        f"(observed {local_attempts})"
-                    )
-                if len(local_families) < policy["minimum_local_families"]:
-                    missing_conditions.append(
-                        f"at least {policy['minimum_local_families']} local chemical families "
-                        f"(observed {len(local_families)}: {local_families})"
-                    )
-                if missing_conditions:
-                    raise RuntimeError(
-                        "MARK_UNMODIFIABLE local search gate is incomplete; requires "
-                        + " and ".join(missing_conditions)
-                    )
+        # The LLM closes a site only after reviewing tool and docking evidence.
         record = {
             "event": len(self.state.unmodifiable_targets) + 1,
             "target_type": target_type,
@@ -1039,14 +1063,9 @@ class Workflow:
         mode = str(configured.get("mode", "family_coverage"))
         return {
             "mode": mode,
-            "minimum_distinct_transformations_per_target": int(
-                configured.get("minimum_distinct_transformations_per_target", 2)
-            ),
             "site_lock_enabled": bool(configured.get("site_lock_enabled", False)),
             "site_strategy_required": bool(configured.get("site_strategy_required", False)),
             "minimum_prioritized_sites": int(configured.get("minimum_prioritized_sites", 1)),
-            "minimum_local_attempts": int(configured.get("minimum_local_attempts", 6)),
-            "minimum_local_families": int(configured.get("minimum_local_families", 2)),
             "local_patience": int(configured.get("local_patience", 3)),
         }
 
@@ -1137,15 +1156,14 @@ class Workflow:
             if not docking:
                 non_improving = len(attempts)
             explicitly_closed = self._is_unmodifiable(target_type, target_id)
-            enough_attempts = len(attempts) >= policy["minimum_local_attempts"]
-            enough_families = len(families) >= policy["minimum_local_families"]
-            patience_reached = (
-                enough_attempts
-                and enough_families
-                and non_improving >= policy["local_patience"]
-            )
+            initial_status = site.get("search_status", "active")
+            patience_reached = non_improving >= policy["local_patience"]
             previous = self.state.site_search.get(key) or {}
-            status = "closed" if explicitly_closed else "pending"
+            status = (
+                "closed"
+                if explicitly_closed or initial_status == "hard-reject"
+                else "pending"
+            )
             refreshed[key] = {
                 **site,
                 "key": key,
@@ -1162,8 +1180,7 @@ class Workflow:
                 "best_quality": best_quality,
                 "best_attempt": best_attempt,
                 "non_improving_attempts": non_improving,
-                "minimum_local_attempts": policy["minimum_local_attempts"],
-                "minimum_local_families": policy["minimum_local_families"],
+                "initial_search_status": initial_status,
                 "local_patience": policy["local_patience"],
                 "patience_reached": patience_reached,
                 "previous_status": previous.get("status"),
@@ -1176,7 +1193,11 @@ class Workflow:
             active["status"] = "active"
             self.state.active_target = {
                 key: active[key]
-                for key in ("target_type", "target_id", "priority", "site_type", "rationale")
+                for key in (
+                    "target_type", "target_id", "priority", "site_type", "rationale",
+                    "search_status",
+                )
+                if key in active
             }
         else:
             self.state.active_target = None
@@ -1211,7 +1232,28 @@ class Workflow:
         if active is None:
             return None
         proposed = self._transformation_target(transformation)
-        if proposed == {"target_type": active["target_type"], "target_id": active["target_id"]}:
+        active_target = {"target_type": active["target_type"], "target_id": active["target_id"]}
+        if proposed == active_target:
+            parent_attempt = transformation.get("parent_attempt")
+            if parent_attempt is not None:
+                parent = self._parent_metadata_for(parent_attempt)
+                parent_target = {
+                    "target_type": parent.get("target_type"),
+                    "target_id": parent.get("target_id"),
+                }
+                if parent_target not in ({"target_type": None, "target_id": None}, active_target):
+                    return {
+                        "status": "rejected",
+                        "failure_class": "parent_site_mismatch",
+                        "parent_attempt": parent_attempt,
+                        "parent_target": parent_target,
+                        "proposed_target": proposed,
+                        "instruction": (
+                            "Local optimization must keep the parent candidate and child transformation on the "
+                            "same active target. Choose a parent from the active target or omit parent_attempt "
+                            "for a generation-1 edit of the original ligand."
+                        ),
+                    }
             return None
         active_status = self.state.site_search.get(
             self._target_key(active["target_type"], active["target_id"]), {}
@@ -1223,9 +1265,9 @@ class Workflow:
             "active_site_search": active_status,
             "proposed_target": proposed,
             "instruction": (
-                "Continue the active target with a chemically distinct candidate batch or transformation. "
-                "The host advances to the next prioritized site only after the local minimum-attempt, chemical-family, "
-                "or after an accepted MARK_UNMODIFIABLE closure. Patience is advisory and does not force a site switch."
+                "Continue the active target with a chemically distinct, tool-supported candidate batch or transformation. "
+                "The host advances to the next prioritized site only after the LLM explicitly closes the active target "
+                "with an evidence-backed MARK_UNMODIFIABLE decision. Patience is advisory and does not force a site switch."
             ),
         }
 
@@ -1403,6 +1445,11 @@ class Workflow:
         global_search = self._global_search_coverage()
         return {
             "reference_baseline": self._llm_safe_value(self.reference_docking_result),
+            "available_parents": [
+                self._llm_safe_value(metadata)
+                for attempt, metadata in sorted(self.parent_metadata.items())
+                if attempt > 0
+            ],
             "convergence": self._compact_convergence(),
             "global_search": self._compact_global_search(global_search),
             "pending_obligations": self._llm_safe_value(global_search["pending_obligations"]),
@@ -1423,8 +1470,8 @@ class Workflow:
             "instruction": (
                 "Prior candidates, exploration attempts, and docking results are authoritative feedback. "
                 "Do not return an attempted or rejected transformation again; a new READY decision must "
-                "be chemically distinct. This is an adaptive search: the diversity floor is only a minimum, "
-                "not a stopping condition. For every target, read adaptive_target_summaries and inspect the "
+                "be chemically distinct. This is an evidence-driven search with no fixed per-site attempt floor. "
+                "For every target, read adaptive_target_summaries and inspect the "
                 "local chemical environment, existing interactions, attachment direction, clearance, fragment "
                 "properties, fragment 3D profile, docking scores, seed consistency, pose consensus, interaction "
                 "changes, and the trend of prior transformations. Search the fragment library for chemically "
@@ -1435,7 +1482,7 @@ class Workflow:
                 "local trend. When site_lock_enabled is true, active_target is authoritative: do not switch "
                 "targets until it is explicitly closed with MARK_UNMODIFIABLE; patience is only a review signal. "
                 "Use generate_site_candidate_batch when several compatible fragments should be compared. After "
-                "the target has been explored sufficiently and no credible option remains, "
+                "the active target has been explored sufficiently and no credible option remains, "
                 "explicitly use MARK_UNMODIFIABLE with scope site and an evidence-based reason. STOP is allowed "
                 "only after every target is adaptively explored and explicitly closed, or the hard safety limit "
                 "is reached."
@@ -1942,11 +1989,16 @@ class Workflow:
         if operation not in {"replace_hydrogen", "replace_fragment"}:
             raise ReadyDecisionError(decision, f"Unsupported READY operation: {operation!r}")
         index = transformation.get("edit_atom_index")
-        if not isinstance(index, int) or not 0 <= index < self.context.ligand.GetNumAtoms():
+        parent_attempt = transformation.get("parent_attempt")
+        validation_parent = self._resolve_parent_candidate(parent_attempt)
+        if not isinstance(index, int) or not 0 <= index < validation_parent.GetNumAtoms():
             raise ReadyDecisionError(decision, f"Invalid edit_atom_index: {index!r}")
         if operation == "replace_hydrogen":
-            atom = self.context.ligand.GetAtomWithIdx(index)
-            if atom.GetTotalNumHs() < 1:
+            atom = validation_parent.GetAtomWithIdx(index)
+            if (
+                atom.GetTotalNumHs() < 1
+                and not transformation.get("replace_existing_substituent")
+            ):
                 raise ReadyDecisionError(
                     decision,
                     f"Selected edit atom {index} has no replaceable hydrogen for replace_hydrogen",
@@ -1956,12 +2008,12 @@ class Workflow:
                     ),
                 )
         environment_sites = {
-            item.arguments.get("atom_index")
+            (item.arguments.get("atom_index"), item.arguments.get("parent_attempt"))
             for item in self.state.observations
             if item.tool == "get_atom_environment"
         }
         geometry_sites = {
-            item.arguments.get("atom_index")
+            (item.arguments.get("atom_index"), item.arguments.get("parent_attempt"))
             for item in self.state.observations
             if item.tool == "check_growth_space"
         }
@@ -1977,6 +2029,8 @@ class Workflow:
                 "cut_bond": args.get("cut_bond"),
                 "fragment_smiles": args.get("fragment_smiles"),
                 "fragment_id": args.get("fragment_id"),
+                "parent_attempt": args.get("parent_attempt"),
+                "replace_existing_substituent": args.get("replace_existing_substituent"),
             }
             candidate_geometry.append(observed)
         exact_geometry = any(
@@ -1989,17 +2043,23 @@ class Workflow:
         )
         missing_evidence = []
         recommended_queries = []
-        if index not in environment_sites:
+        if (index, parent_attempt) not in environment_sites:
             missing_evidence.append("edit-site environment")
+            environment_arguments = {"atom_index": index, "radius": 5.0}
+            if parent_attempt is not None:
+                environment_arguments["parent_attempt"] = parent_attempt
             recommended_queries.append({
                 "tool": "get_atom_environment",
-                "arguments": {"atom_index": index, "radius": 5.0},
+                "arguments": environment_arguments,
             })
-        if operation == "replace_hydrogen" and index not in geometry_sites:
+        if operation == "replace_hydrogen" and (index, parent_attempt) not in geometry_sites:
             missing_evidence.append("growth space")
+            growth_arguments = {"atom_index": index, "distance": 2.0}
+            if parent_attempt is not None:
+                growth_arguments["parent_attempt"] = parent_attempt
             recommended_queries.append({
                 "tool": "check_growth_space",
-                "arguments": {"atom_index": index, "distance": 2.0},
+                "arguments": growth_arguments,
             })
         if operation == "replace_fragment" and not replacement_sites_queried:
             missing_evidence.append("host-enumerated replacement site")
@@ -2086,6 +2146,9 @@ class Workflow:
                 "operation": operation,
                 "fragment_smiles": transformation["fragment_smiles"],
             }
+            if parent_attempt is not None:
+                geometry_arguments["parent_attempt"] = parent_attempt
+                geometry_arguments["replace_existing_substituent"] = True
             if transformation.get("fragment_id"):
                 geometry_arguments["fragment_id"] = transformation["fragment_id"]
             if operation == "replace_fragment":
@@ -2133,6 +2196,9 @@ class Workflow:
         primary_name = self._optimization_settings()["primary_metric"]
         self.state.candidate_history.append({
             "attempt": report.get("attempt"),
+            "candidate_id": f"attempt-{report.get('attempt'):02d}",
+            "parent_attempt": report.get("parent_attempt"),
+            "generation": report.get("generation", 1),
             "record_type": "design_attempt",
             "transformation": transformation,
             "candidate_path": report.get("candidate_path"),
@@ -2266,9 +2332,6 @@ class Workflow:
         ]
         search_policy = self._search_policy()
         adaptive_search = search_policy["mode"] == "adaptive"
-        minimum_target_diversity = search_policy[
-            "minimum_distinct_transformations_per_target"
-        ]
         atom_clearance: dict[int, float] = {}
         for index in editable_atoms:
             try:
@@ -2430,24 +2493,6 @@ class Workflow:
         ]
         missing_target_diversity = []
         if adaptive_search:
-            for index in editable_atoms:
-                distinct = self._distinct_target_transformations("atom", index)
-                if index not in closed_atoms and len(distinct) < minimum_target_diversity:
-                    missing_target_diversity.append({
-                        "target_type": "atom",
-                        "target_id": index,
-                        "distinct_transformations": len(distinct),
-                        "minimum_required": minimum_target_diversity,
-                    })
-            for site_id in replacement_sites:
-                distinct = self._distinct_target_transformations("replacement_site", site_id)
-                if site_id not in closed_sites and len(distinct) < minimum_target_diversity:
-                    missing_target_diversity.append({
-                        "target_type": "replacement_site",
-                        "target_id": site_id,
-                        "distinct_transformations": len(distinct),
-                        "minimum_required": minimum_target_diversity,
-                    })
             open_targets = [
                 {"target_type": "atom", "target_id": index}
                 for index in editable_atoms if index not in closed_atoms
@@ -2455,7 +2500,7 @@ class Workflow:
                 {"target_type": "replacement_site", "target_id": site_id}
                 for site_id in replacement_sites if site_id not in closed_sites
             ]
-            complete = not missing_target_diversity and not open_targets
+            complete = not open_targets
         else:
             open_targets = []
             complete = not (
@@ -2507,15 +2552,6 @@ class Workflow:
             pending_obligations.append({"type": "global_family", "family": family})
         if adaptive_search:
             pending_obligations = [
-                {
-                    "type": "target_diversity",
-                    **item,
-                    "additional_distinct_transformations_required": (
-                        item["minimum_required"] - item["distinct_transformations"]
-                    ),
-                }
-                for item in missing_target_diversity
-            ] + [
                 {
                     "type": "target_review",
                     **item,
@@ -2578,6 +2614,7 @@ class Workflow:
                     "target_id": item.get("target_id"),
                     "priority": item.get("priority"),
                     "site_type": item.get("site_type"),
+                    "search_status": item.get("initial_search_status"),
                 }
                 for item in strategy_status
                 if item.get("status") != "closed"
@@ -2707,6 +2744,9 @@ class Workflow:
 
         entry = {
             "attempt": attempt,
+            "candidate_id": f"attempt-{attempt:02d}",
+            "parent_attempt": transformation.get("parent_attempt"),
+            "generation": transformation.get("generation", 1),
             "design_region": self._design_region(transformation),
             "transformation": transformation,
             "candidate_path": str(candidate_path),
@@ -2789,6 +2829,7 @@ class Workflow:
             "is_new_best": is_new_best,
             "best_attempt": best_attempt,
             "best_quality": best_quality,
+            "active_parent_attempt": best_attempt,
             "non_improving_attempts": non_improving,
             "validated_design_regions": validated_regions,
             "docked_design_regions": docked_regions,
@@ -2869,6 +2910,14 @@ class Workflow:
                 else:
                     raise
             transformation = self._transformation(decision)
+            parent_attempt = transformation.get("parent_attempt")
+            parent_molecule = self._resolve_parent_candidate(parent_attempt)
+            self._emit("parent_selected", {
+                "attempt": attempt,
+                "parent_attempt": parent_attempt or 0,
+                "generation": transformation.get("generation", 1),
+                "parent_metadata": self._parent_metadata_for(parent_attempt),
+            })
             exploration_record = self._record_exploration_attempt(
                 transformation,
                 "submitted",
@@ -2885,7 +2934,7 @@ class Workflow:
             })
             try:
                 result = apply_transformation(
-                    self.context.ligand,
+                    parent_molecule,
                     transformation,
                     self.context.protein_atoms,
                     seed=17,
@@ -2894,6 +2943,8 @@ class Workflow:
                 write_sdf(result, attempt_path, name=f"edit-attempt-{attempt:02d}")
                 report = {
                     "attempt": attempt,
+                    "parent_attempt": parent_attempt,
+                    "generation": transformation.get("generation", 1),
                     "decision": decision,
                     "transformation": transformation,
                     "validation": result.report,
@@ -2903,6 +2954,8 @@ class Workflow:
                 result = None
                 report = {
                     "attempt": attempt,
+                    "parent_attempt": parent_attempt,
+                    "generation": transformation.get("generation", 1),
                     "decision": decision,
                     "transformation": transformation,
                     "validation": {
@@ -3067,6 +3120,18 @@ class Workflow:
             trend_entry = self._record_docking_result(
                 attempt, transformation, candidate_path, docking
             )
+            if trend_entry.get("stability_eligible"):
+                self.parent_candidates[attempt] = Chem.Mol(result.molecule)
+                self.parent_metadata[attempt] = {
+                    "attempt": attempt,
+                    "generation": transformation.get("generation", 1),
+                    "target_type": self._transformation_target(transformation)["target_type"],
+                    "target_id": self._transformation_target(transformation)["target_id"],
+                    "quality": trend_entry.get("quality"),
+                    "canonical_smiles": candidate_smiles,
+                    "candidate_path": str(candidate_path),
+                }
+                self._emit("parent_available", self.parent_metadata[attempt])
             self._write_json("docking-history.json", {
                 "history": self.state.docking_history,
                 "convergence": self.state.convergence,

@@ -1,6 +1,7 @@
 {
   "base_url": "https://api.p1-103n1x.com/v1",
   "model": "gpt-5.6-sol",
+  "codex_config_dir": "~/.codex",
   "api_key_env": "OPENAI_API_KEY",
   "timeout_seconds": 600,
   "max_output_tokens": 8192,

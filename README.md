@@ -172,7 +172,7 @@ OPENAI_API_KEY="$KEY" mamba run -n molecular-agent \
   --budgets 0
 ```
 
-也可以直接使用项目根目录的一键脚本运行 AI 智算云官方 API 对比测试。脚本默认使用 `GLM-5.3`、配体周围 6 Å 口袋坐标和宿主生成的 `ligand_atom_map`，默认从 `$HOME/.aicloud_api_key` 读取纯文本 key，不再要求每次执行前导出环境变量。这里不会把完整 PDB 发送给 LLM。该 key 文件位于项目目录之外，不会被 Git 跟踪：
+也可以直接使用项目根目录的一键脚本运行 OpenAI-compatible API 对比测试。脚本默认使用 `gpt-5.6-sol`、配体周围 6 Å 口袋坐标和宿主生成的 `ligand_atom_map`。主工作流直接从 `~/.codex/config.toml` 读取 provider、Responses API endpoint 和模型，并从 `~/.codex/auth.json` 的 `OPENAI_API_KEY` 读取认证信息；这里不会把完整 PDB 发送给 LLM。Codex 配置和认证文件位于项目目录之外，不会被 Git 跟踪：
 
 ```bash
 ./run_ablation.sh
@@ -198,7 +198,7 @@ pi --list-models 'aicloud/*'
 
 ```bash
 BUDGETS="0 1 2" OUTPUT_ROOT=runs/ablation-aicloud-smoke-01 ./run_ablation.sh
-ABLATION_MODEL=GLM-5.3 ./run_ablation.sh
+ABLATION_MODEL=gpt-5.6-sol ./run_ablation.sh
 COORDINATE_SCOPE=pocket POCKET_RADIUS=6.0 OUTPUT_ROOT=runs/ablation-aicloud-pocket-6A-mapped-rerun ./run_ablation.sh
 ```
 
@@ -213,11 +213,11 @@ https://llmapi.blsc.cn/v1/chat/completions
 ```bash
 AICLOUD_API_KEY='...' \
 ABLATION_BASE_URL="https://your-compatible-endpoint/v1" \
-ABLATION_MODEL=GLM-5.3 \
+ABLATION_MODEL=gpt-5.6-sol \
 ./run_ablation.sh
 ```
 
-主工作流仍读取 `config.json` 中的模型和端点，不受 `ABLATION_MODEL` 或 `ABLATION_BASE_URL` 影响。若在 `config.json` 或 `config.aicloud.json` 中启用 `docking.command`，候选通过几何检查后会写出 protein-only receptor、reference-ligand、候选 constrained pose。系统默认使用 `[17, 29, 43]` 三个固定 seed；对每个 seed，先在 `docking-reference-baseline/seed-*/` 中用同一 receptor、同一 reference autobox 和同一 GNINA 参数独立重对接参考分子，再在 `docking-attempt-XX/seed-*/` 中对接候选，并按相同 seed 配对比较。结果包含每个 seed 的 rank-1 分数、差值、均值、样本标准差、范围、候选胜出次数和胜率。每个 seed 还分别记录 GNINA rank-1 和按各评分指标选择的最优 pose；三个 seed 的 rank-1 pose 会在共享受体坐标系中计算重原子 RMSD 共识，并与参考配体比较跨 seed 残基接触共识。对于 `minimizedAffinity`，更负表示相对更好；对于 `CNNscore`、`CNNaffinity` 和 `CNN_VS`，更正表示相对更好。命令、stdout/stderr、返回码、docked SDF 和 pose 属性摘要会分别写入各 seed 目录。该差值和 pose 共识只是同一协议下的排序与稳定性指标，不是实验亲和力或活性结论。`rbfe` 配置仅保留供未来阶段使用，本轮不执行。AI 智算云 key 未填入前，pi 不会显示 `aicloud/GLM-5.3` 为可用模型；填入后重新打开 pi 或重新执行模型列表即可。
+主工作流读取配置中的模型和端点；`config.aicloud.json` 已配置为从 `~/.codex` 读取 `gpt-5.6-sol` 和 Responses API endpoint，不受独立 ablation 的 `ABLATION_MODEL` 或 `ABLATION_BASE_URL` 影响。若在 `config.json` 或 `config.aicloud.json` 中启用 `docking.command`，候选通过几何检查后会写出 protein-only receptor、reference-ligand、候选 constrained pose。系统默认使用 `[17, 29, 43]` 三个固定 seed；对每个 seed，先在 `docking-reference-baseline/seed-*/` 中用同一 receptor、同一 reference autobox 和同一 GNINA 参数独立重对接参考分子，再在 `docking-attempt-XX/seed-*/` 中对接候选，并按相同 seed 配对比较。结果包含每个 seed 的 rank-1 分数、差值、均值、样本标准差、范围、候选胜出次数和胜率。每个 seed 还分别记录 GNINA rank-1 和按各评分指标选择的最优 pose；三个 seed 的 rank-1 pose 会在共享受体坐标系中计算重原子 RMSD 共识，并与参考配体比较跨 seed 残基接触共识。对于 `minimizedAffinity`，更负表示相对更好；对于 `CNNscore`、`CNNaffinity` 和 `CNN_VS`，更正表示相对更好。命令、stdout/stderr、返回码、docked SDF 和 pose 属性摘要会分别写入各 seed 目录。该差值和 pose 共识只是同一协议下的排序与稳定性指标，不是实验亲和力或活性结论。`rbfe` 配置仅保留供未来阶段使用，本轮不执行。Codex 配置有效后，主工作流会使用 `gpt-5.6-sol`；不需要在项目中保存 API key。
 
 严格对比结果时读取各目录的 `result.json` 和根目录的 `summary.json`。其中只有 `budget-06` 的 `state.site_evidence_gate_required` 应为 `true`；`budget-00` 到 `budget-05` 应为 `false`。每组的 `input.json` 还保存了固定的 `ligand_atom_map`，可检查 `rdkit_index`、PDB serial 和配体原子名的映射。重点比较 `status`、`tool_call_count`、`decision_count`、`result.ready_gate`、`result.decision`、`result.validation.property_delta`、`result.validation.structure_change` 和 `error`。这项实验只能比较信息预算与工具使用对方案的影响，不能直接比较活性；后续接入 docking/RBFE 时，应在相同候选评估协议下追加结果。
 

@@ -274,6 +274,40 @@ def test_unified_fragment_library_exposes_size_and_chemical_tags():
     assert all("nitrile" in item["chemical_tags"] for item in small_nitriles["fragments"])
 
 
+def test_local_parent_child_replaces_the_existing_substituent(tmp_path):
+    workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
+    parent_result = apply_transformation(
+        workflow.context.ligand,
+        {
+            "operation": "replace_hydrogen",
+            "edit_atom_index": 10,
+            "fragment_smiles": "[*:1]F",
+        },
+        workflow.context.protein_atoms,
+    )
+    workflow.parent_candidates[1] = parent_result.molecule
+    workflow.parent_metadata[1] = {
+        "attempt": 1,
+        "generation": 1,
+        "target_type": "atom",
+        "target_id": 10,
+    }
+    result, evidence = workflow.tools.execute(
+        "validate_candidate_geometry",
+        {
+            "operation": "replace_hydrogen",
+            "edit_atom_index": 10,
+            "fragment_smiles": "[*:1]C",
+            "parent_attempt": 1,
+            "replace_existing_substituent": True,
+        },
+    )
+    assert result["status"] == "accepted"
+    assert result["replaced_existing_substituent"] is True
+    assert result["candidate"]["canonical_smiles"] != parent_result.report["candidate"]["canonical_smiles"]
+    assert evidence == {"candidate_geometry"}
+
+
 def test_fragment_smiles_matching_uses_structure_equivalence(tmp_path):
     from molecular_agent.fragment_library import FragmentLibrary
 
@@ -762,7 +796,7 @@ def test_local_fragment_replacement_families_keep_chemical_diversity():
     }) == "fragment_replacement:polar"
 
 
-def test_mark_unmodifiable_enforces_local_attempt_gate(tmp_path):
+def test_mark_unmodifiable_uses_llm_evidence_without_fixed_attempt_gate(tmp_path):
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     _prepare_locked_site_strategy(workflow, [{
         "target_type": "atom",
@@ -791,20 +825,6 @@ def test_mark_unmodifiable_enforces_local_attempt_gate(tmp_path):
         "scope": "site",
         "reason": "No remaining evidence-backed local hypothesis.",
     }
-    with pytest.raises(RuntimeError, match="at least 6 local attempts"):
-        workflow._record_unmodifiable(decision)
-
-    workflow._record_exploration_attempt(
-        {
-            "operation": "replace_hydrogen",
-            "edit_atom_index": 10,
-            "fragment_smiles": "[*:1]I",
-        },
-        "docked",
-        "design",
-        attempt=6,
-    )
-    workflow._refresh_site_search()
     assert workflow._record_unmodifiable(decision) is True
     assert workflow.state.site_search["atom:10"]["status"] == "closed"
 
@@ -1218,10 +1238,10 @@ def test_candidate_history_distinguishes_exploration_from_docking(tmp_path):
     assert entry["docking"]["completed"] is False
 
 
-def test_pending_obligations_include_adaptive_target_diversity(tmp_path):
+def test_pending_obligations_include_adaptive_target_review(tmp_path):
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     coverage = workflow._global_search_coverage()
-    assert any(item["type"] == "target_diversity" for item in coverage["pending_obligations"])
+    assert any(item["type"] == "target_review" for item in coverage["pending_obligations"])
     assert not coverage["complete"]
 
 
@@ -2047,7 +2067,7 @@ def test_transformation_field_detector_does_not_require_completeness():
 
 
 class PersistentBareTransformationClient:
-    """Mirrors GLM-5.3: always returns the bare transformation, ignoring repairs."""
+    """Models a client that always returns the bare transformation, ignoring repairs."""
 
     def __init__(self):
         self.calls = 0

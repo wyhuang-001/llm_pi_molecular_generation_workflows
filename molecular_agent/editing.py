@@ -330,6 +330,39 @@ def apply_transformation(
         atom_index = transformation.get("edit_atom_index")
         if not isinstance(atom_index, int):
             raise ValueError("replace_hydrogen requires integer edit_atom_index")
+        if transformation.get("replace_existing_substituent"):
+            anchor = parent.GetAtomWithIdx(atom_index)
+            removable = [
+                bond for bond in anchor.GetBonds()
+                if not bond.IsInRing()
+                and bond.GetBondType() == Chem.BondType.SINGLE
+                and bond.GetOtherAtom(anchor).GetAtomicNum() > 1
+            ]
+            if not removable:
+                raise ValueError("Parent has no removable substituent at the selected edit atom")
+            requested_neighbor = transformation.get("remove_neighbor_index")
+            if requested_neighbor is not None:
+                removable = [
+                    bond for bond in removable
+                    if bond.GetOtherAtom(anchor).GetIdx() == requested_neighbor
+                ]
+                if not removable:
+                    raise ValueError(
+                        "remove_neighbor_index is not a removable substituent at the selected edit atom"
+                    )
+            else:
+                removable.sort(key=lambda bond: bond.GetOtherAtom(anchor).GetIdx())
+            bond = removable[0]
+            result = apply_fragment_replacement(
+                parent,
+                (atom_index, bond.GetOtherAtom(anchor).GetIdx()),
+                fragment_smiles,
+                protein_atoms,
+                seed=seed,
+            )
+            result.report["operation"] = operation
+            result.report["replaced_existing_substituent"] = True
+            return result
         result = apply_substituent(parent, atom_index, fragment_smiles, protein_atoms, seed=seed)
         result.report["operation"] = operation
         return result

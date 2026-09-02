@@ -1,11 +1,11 @@
 {
-  "base_url": "https://llmapi.blsc.cn/v1",
-  "model": "GLM-5.3",
-  "api_key_env": "AICLOUD_API_KEY",
-  "api_key_file": "~/.aicloud_api_key",
+  "base_url": "https://api.p1-103n1x.com/v1",
+  "model": "gpt-5.6-sol",
+  "codex_config_dir": "~/.codex",
+  "api_key_env": "OPENAI_API_KEY",
   "timeout_seconds": 600,
   "max_output_tokens": 16384,
-  "reasoning_effort": "low",
+  "reasoning_effort": "max",
   "repair_max_output_tokens": 4096,
   "repair_reasoning_effort": "low",
   "docking": {
