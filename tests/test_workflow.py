@@ -7,7 +7,7 @@ import pytest
 from rdkit import Chem
 
 from molecular_agent.adapters import DockingAdapter, NotConfiguredAdapter
-from molecular_agent.editing import apply_transformation
+from molecular_agent.editing import apply_transformation, write_sdf
 from molecular_agent.llm import ResponsesClient
 from molecular_agent.models import AgentState, REQUIRED_EVIDENCE, ToolObservation
 from molecular_agent.structure import ComplexContext
@@ -308,6 +308,126 @@ def test_local_parent_child_replaces_the_existing_substituent(tmp_path):
     assert evidence == {"candidate_geometry"}
 
 
+def test_local_parent_candidate_batch_replaces_existing_substituent(tmp_path):
+    workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
+    parent_result = apply_transformation(
+        workflow.context.ligand,
+        {
+            "operation": "replace_hydrogen",
+            "edit_atom_index": 9,
+            "fragment_smiles": "[*:1]F",
+        },
+        workflow.context.protein_atoms,
+    )
+    workflow.parent_candidates[1] = parent_result.molecule
+    workflow.parent_metadata[1] = {
+        "attempt": 1,
+        "generation": 1,
+        "target_type": "atom",
+        "target_id": 9,
+    }
+    result, evidence = workflow.tools.execute(
+        "generate_site_candidate_batch",
+        {
+            "target_type": "atom",
+            "target_id": 9,
+            "query": "methyl",
+            "limit": 3,
+            "parent_attempt": 1,
+        },
+    )
+    assert result["status"] == "complete"
+    assert result["parent_attempt"] == 1
+    assert result["accepted_count"] >= 1
+    assert all(
+        item["transformation"]["parent_attempt"] == 1
+        and item["transformation"]["replace_existing_substituent"] is True
+        for item in result["candidates"]
+    )
+    assert evidence == {"candidate_batch"}
+
+
+def test_resume_restores_same_run_history_and_stable_parents(tmp_path, monkeypatch):
+    run_dir = tmp_path / "interrupted" / "real"
+    run_dir.mkdir(parents=True)
+    workflow = Workflow(TASK, ScriptedDemoClient(), run_dir)
+    parent_result = apply_transformation(
+        workflow.context.ligand,
+        {
+            "operation": "replace_hydrogen",
+            "edit_atom_index": 9,
+            "fragment_smiles": "[*:1]F",
+        },
+        workflow.context.protein_atoms,
+    )
+    candidate_path = run_dir / "candidate-01.sdf"
+    write_sdf(parent_result, candidate_path, name="candidate-01")
+    transformation = {
+        "operation": "replace_hydrogen",
+        "edit_atom_index": 9,
+        "fragment_smiles": "[*:1]F",
+        "generation": 1,
+    }
+    workflow.state.docking_history.append({
+        "attempt": 1,
+        "stability_eligible": True,
+        "quality": 0.5,
+        "transformation": transformation,
+    })
+    workflow.state.candidate_history.append({
+        "attempt": 1,
+        "candidate_path": str(candidate_path),
+        "validation": {"candidate": {"canonical_smiles": parent_result.report["candidate"]["canonical_smiles"]}},
+        "transformation": transformation,
+    })
+    workflow.state.active_target = {
+        "target_type": "atom",
+        "target_id": 9,
+        "search_status": "active",
+    }
+    workflow._write_json("context-final.json", workflow.state.compact_view())
+    workflow._write_json("docking-history.json", {
+        "history": workflow.state.docking_history,
+        "convergence": workflow.state.convergence,
+    })
+    workflow._write_json("edit-attempt-01.json", {
+        "attempt": 1,
+        "generation": 1,
+        "transformation": transformation,
+        "validation": parent_result.report,
+        "candidate_path": str(candidate_path),
+        "docking": {"status": "complete"},
+    })
+
+    resumed = Workflow(run_dir=run_dir, task_path=TASK, client=ScriptedDemoClient())
+    reports, progress = resumed._restore_run_state()
+    assert len(reports) == 1
+    assert progress["last_attempt"] == 1
+    assert len(resumed.state.docking_history) == 1
+    assert 1 in resumed.parent_candidates
+    assert resumed.parent_metadata[1]["target_id"] == 9
+    assert resumed.state.active_target["target_id"] == 9
+
+    continued = Workflow(run_dir=run_dir, task_path=TASK, client=ScriptedDemoClient())
+    monkeypatch.setattr(
+        continued,
+        "_retry_ready_decision",
+        lambda previous_design, rejection: {"action": "READY", "resume_test": True},
+    )
+    captured = {}
+
+    def capture_design(decision, **kwargs):
+        captured["decision"] = decision
+        captured.update(kwargs)
+        return {"status": "resume_test_complete"}
+
+    monkeypatch.setattr(continued, "design", capture_design)
+    assert continued._resume_design() == {"status": "resume_test_complete"}
+    assert captured["start_attempt"] == 2
+    assert len(captured["initial_history"]) == 1
+    assert captured["initial_seen_candidate_smiles"]
+
+
 def test_fragment_smiles_matching_uses_structure_equivalence(tmp_path):
     from molecular_agent.fragment_library import FragmentLibrary
 
@@ -598,6 +718,48 @@ def test_llm_state_view_uses_bounded_design_observation_window(tmp_path):
     assert all("stdout" not in item["result"] for item in view["observations"])
     assert "candidate_history" not in view
     assert "docking_history" not in view
+
+
+def test_working_memory_groups_tool_facts_by_site_and_fragment(tmp_path):
+    workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
+    workflow._execute_query({
+        "action": "QUERY",
+        "tool": "get_atom_environment",
+        "arguments": {"atom_index": 9, "radius": 4.0},
+    })
+    workflow._execute_query({
+        "action": "QUERY",
+        "tool": "get_fragment_properties",
+        "arguments": {"smiles": "[*:1]F"},
+    })
+    assert "atom:9" in workflow.state.site_memory
+    assert "get_atom_environment" in workflow.state.site_memory["atom:9"]["tool_facts"]
+    assert "[*:1]F" in workflow.state.fragment_memory
+    view = workflow._optimization_context()
+    assert "working_memory" in view
+    assert "site" not in view["working_memory"] or "sites" in view["working_memory"]
+
+
+def test_working_memory_keeps_full_history_outside_compact_archive(tmp_path):
+    workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
+    for attempt in range(1, 25):
+        workflow._update_working_memory(
+            transformation={
+                "operation": "replace_hydrogen",
+                "edit_atom_index": 9,
+                "fragment_smiles": f"[*:1]C{attempt}",
+            },
+            docking_entry={
+                "attempt": attempt,
+                "quality": float(attempt),
+                "seed_win_fraction": 1.0,
+                "seed_stddev": 0.1,
+                "pose_consensus": {"stable": True},
+                "interaction_consensus": {},
+            },
+        )
+    assert len(workflow.state.site_memory["atom:9"]["parent_contexts"]["0"]["events"]) <= 6
+    assert len(workflow.state.elite_archive) == 10
 
 
 def test_geometry_feasible_not_docked_excludes_docked_transformations(tmp_path):
@@ -1050,6 +1212,18 @@ def test_design_regions_are_descriptive_only(tmp_path):
     assert convergence["converged"] is False
 
 
+def test_optimization_mode_does_not_require_exhaustive_site_coverage(tmp_path):
+    task = json.loads(TASK.read_text(encoding="utf-8"))
+    task["search_policy"] = {"mode": "optimization"}
+    task["complex_path"] = str((ROOT / "input" / "complex.pdb").resolve())
+    task["fragment_library_path"] = str((ROOT / "molecular_agent" / "data" / "fragments_unified.json").resolve())
+    task_path = tmp_path / "optimization-task.json"
+    task_path.write_text(json.dumps(task), encoding="utf-8")
+    workflow = Workflow(task_path, ScriptedDemoClient(), tmp_path / "run")
+    assert workflow._global_search_coverage()["complete"] is False
+    assert workflow._stop_gate_rejection() is None
+
+
 def test_global_stop_gate_requires_non_halogen_followup_after_halogen_hit(tmp_path):
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     workflow._record_docking_result(
@@ -1494,6 +1668,147 @@ def test_docking_multi_seed_aggregates_paired_comparisons(tmp_path):
     assert result["pose_consensus"]["largest_consistent_cluster_fraction"] == 1.0
     assert result["interaction_consensus"]["status"] == "complete"
     assert "candidate_consensus_residues" in result["interaction_consensus"]
+
+
+def test_docking_multi_seed_runs_seed_pipelines_serially(tmp_path, monkeypatch):
+    source = (ROOT / "input" / "ligand.sdf").read_text(encoding="utf-8")
+    candidate = tmp_path / "candidate.sdf"
+    reference = tmp_path / "reference.sdf"
+    candidate.write_text(source, encoding="utf-8")
+    reference.write_text(source, encoding="utf-8")
+    receptor = tmp_path / "receptor.pdb"
+    receptor.write_text(
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C  \n",
+        encoding="utf-8",
+    )
+    seeds = [17, 29, 43]
+    calls = []
+    adapter = DockingAdapter(
+        {"enabled": True, "seeds": seeds, "max_retries": 0}, tmp_path
+    )
+
+    def fake_run(*, candidate_path, output_dir, seed, **_):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        kind = "reference" if Path(candidate_path) == reference else "candidate"
+        calls.append((kind, seed))
+        molecule = Chem.SDMolSupplier(str(candidate_path), removeHs=False)[0]
+        score = -8.0 if kind == "reference" else -8.5
+        molecule.SetProp("minimizedAffinity", str(score))
+        pose_path = output_dir / "docked.sdf"
+        writer = Chem.SDWriter(str(pose_path))
+        writer.write(molecule)
+        writer.close()
+        poses = [{"rank": 1, "properties": {"minimizedAffinity": str(score)}}]
+        return {
+            "stage": "docking",
+            "status": "complete",
+            "pose_path": str(pose_path),
+            "pose_count": 1,
+            "poses": poses,
+            "pose_selection": DockingAdapter._pose_selection_summary(poses),
+        }
+
+    monkeypatch.setattr(adapter, "run", fake_run)
+    result = adapter.run_with_reference_baseline(
+        candidate_path=candidate,
+        receptor_path=receptor,
+        reference_path=reference,
+        output_dir=tmp_path / "candidate-docking",
+        reference_output_dir=tmp_path / "reference-docking",
+    )
+
+    assert result["status"] == "complete"
+    assert calls == [
+        ("reference", 17),
+        ("candidate", 17),
+        ("reference", 29),
+        ("candidate", 29),
+        ("reference", 43),
+        ("candidate", 43),
+    ]
+    assert result["comparison"]["metrics"]["minimizedAffinity"][
+        "delta_candidate_minus_reference"
+    ]["mean"] == pytest.approx(-0.5)
+
+
+def test_docking_retries_failed_seed_before_aggregate(tmp_path, monkeypatch):
+    source = (ROOT / "input" / "ligand.sdf").read_text(encoding="utf-8")
+    candidate = tmp_path / "candidate.sdf"
+    reference = tmp_path / "reference.sdf"
+    candidate.write_text(source, encoding="utf-8")
+    reference.write_text(source, encoding="utf-8")
+    receptor = tmp_path / "receptor.pdb"
+    receptor.write_text(
+        "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 20.00           C  \n",
+        encoding="utf-8",
+    )
+    adapter = DockingAdapter(
+        {
+            "enabled": True,
+            "seeds": [43],
+            "max_retries": 2,
+            "retry_delay_seconds": 0,
+        },
+        tmp_path,
+    )
+    candidate_calls = 0
+
+    def fake_run(*, candidate_path, output_dir, seed, **_):
+        nonlocal candidate_calls
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        is_reference = Path(candidate_path) == reference
+        if not is_reference:
+            candidate_calls += 1
+            if candidate_calls == 1:
+                return {
+                    "stage": "docking",
+                    "status": "failed",
+                    "returncode": -11,
+                }
+        molecule = Chem.SDMolSupplier(str(candidate_path), removeHs=False)[0]
+        score = -8.0 if is_reference else -8.5
+        molecule.SetProp("minimizedAffinity", str(score))
+        pose_path = output_dir / "docked.sdf"
+        writer = Chem.SDWriter(str(pose_path))
+        writer.write(molecule)
+        writer.close()
+        poses = [{"rank": 1, "properties": {"minimizedAffinity": str(score)}}]
+        return {
+            "stage": "docking",
+            "status": "complete",
+            "returncode": 0,
+            "pose_path": str(pose_path),
+            "pose_count": 1,
+            "poses": poses,
+            "pose_selection": DockingAdapter._pose_selection_summary(poses),
+        }
+
+    monkeypatch.setattr(adapter, "run", fake_run)
+    result = adapter.run_with_reference_baseline(
+        candidate_path=candidate,
+        receptor_path=receptor,
+        reference_path=reference,
+        output_dir=tmp_path / "candidate-docking",
+        reference_output_dir=tmp_path / "reference-docking",
+    )
+
+    assert result["status"] == "complete"
+    assert candidate_calls == 2
+    seed_result = result["candidate_per_seed"]["43"]
+    assert seed_result["execution_attempt_count"] == 2
+    assert seed_result["retry_count"] == 1
+    assert [item["status"] for item in seed_result["retry_history"]] == [
+        "failed",
+        "complete",
+    ]
+    assert (
+        tmp_path
+        / "candidate-docking"
+        / "seed-00043"
+        / "docking-result-execution-01.json"
+    ).exists()
 
 
 def test_docking_preflight_blocks_invalid_receptor_before_command(tmp_path):

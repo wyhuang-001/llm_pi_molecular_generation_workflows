@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from statistics import mean, stdev
 from typing import Any, Callable
@@ -137,6 +138,67 @@ class DockingAdapter(CommandAdapter):
         if len(set(seeds)) != len(seeds):
             raise ValueError("docking.seeds must not contain duplicates")
         return seeds
+
+    def _retry_settings(self) -> tuple[int, float]:
+        max_retries = int(self.config.get("max_retries", 2))
+        retry_delay = float(self.config.get("retry_delay_seconds", 2.0))
+        if max_retries < 0:
+            raise ValueError("docking.max_retries must be zero or greater")
+        if retry_delay < 0:
+            raise ValueError("docking.retry_delay_seconds must be zero or greater")
+        return max_retries, retry_delay
+
+    @staticmethod
+    def _retryable_failure(result: dict[str, Any]) -> bool:
+        return (
+            result.get("status") == "failed"
+            and result.get("failure_class") != "docking_input_preflight"
+        )
+
+    def _run_with_retries(self, **values: Any) -> dict[str, Any]:
+        """Run one docking job, retrying transient command/runtime failures."""
+        max_retries, retry_delay = self._retry_settings()
+        output_dir = Path(values.get("output_dir", self.run_dir)).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        retry_history: list[dict[str, Any]] = []
+        result: dict[str, Any] = {}
+
+        for execution_attempt in range(1, max_retries + 2):
+            result = self.run(**values)
+            (output_dir / f"docking-result-execution-{execution_attempt:02d}.json").write_text(
+                json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            retry_history.append({
+                "execution_attempt": execution_attempt,
+                "status": result.get("status"),
+                "returncode": result.get("returncode"),
+                "failure_class": result.get("failure_class"),
+                "error": result.get("error") or result.get("postprocess_error"),
+                "pose_count": result.get("pose_count"),
+            })
+            if not self._retryable_failure(result) or execution_attempt > max_retries:
+                break
+            if self.progress:
+                self.progress("docking_retry_scheduled", {
+                    "execution_attempt": execution_attempt,
+                    "next_execution_attempt": execution_attempt + 1,
+                    "max_retries": max_retries,
+                    "retry_delay_seconds": retry_delay,
+                    "returncode": result.get("returncode"),
+                    "failure_class": result.get("failure_class"),
+                    "output_dir": str(output_dir),
+                })
+            if retry_delay:
+                time.sleep(retry_delay)
+
+        final = dict(result)
+        final["execution_attempt_count"] = len(retry_history)
+        final["retry_count"] = max(0, len(retry_history) - 1)
+        final["max_retries"] = max_retries
+        final["retry_history"] = retry_history
+        if final.get("status") != "not_configured":
+            self._write_audit(output_dir, final)
+        return final
 
     @staticmethod
     def _readable_3d_sdf(path: Path, label: str) -> tuple[bool, str]:
@@ -295,6 +357,9 @@ class DockingAdapter(CommandAdapter):
                 self._write_audit(output_dir, preflight)
                 return preflight
         run_seed = int(seed if seed is not None else self.config.get("seed", 17))
+        output_path = output_dir / str(self.config.get("output_filename", "docked.sdf"))
+        if output_path.exists():
+            output_path.unlink()
         result = super().run(
             candidate=str(candidate_path.resolve()),
             receptor=str(receptor_path.resolve()),
@@ -302,7 +367,6 @@ class DockingAdapter(CommandAdapter):
             output_dir=str(output_dir),
             seed=run_seed,
         )
-        output_path = output_dir / str(self.config.get("output_filename", "docked.sdf"))
         if result.get("status") == "complete" and output_path.is_file():
             try:
                 from rdkit import Chem
@@ -607,41 +671,53 @@ class DockingAdapter(CommandAdapter):
         reference_results: dict[int, dict[str, Any]] = {}
         candidate_results: dict[int, dict[str, Any]] = {}
         comparisons = []
-        for seed in seeds:
+        cached_reference_results = {
+            seed: self._reference_results.get(seed) for seed in seeds
+        }
+
+        def run_seed_pipeline(
+            seed: int,
+        ) -> tuple[int, dict[str, Any], dict[str, Any] | None, dict[str, Any]]:
             reference_dir = reference_output_dir / f"seed-{seed:05d}"
             candidate_dir = output_dir / f"seed-{seed:05d}"
-            baseline = self._reference_results.get(seed)
+            baseline = cached_reference_results[seed]
             if baseline is None:
-                baseline = self.run(
+                baseline = self._run_with_retries(
                     candidate_path=reference_path,
                     receptor_path=receptor_path,
                     reference_path=reference_path,
                     output_dir=reference_dir,
                     seed=seed,
                 )
-                if baseline.get("status") == "complete":
-                    self._reference_results[seed] = baseline
-            reference_results[seed] = baseline
             if baseline.get("status") != "complete":
-                comparisons.append(
-                    {
-                        "seed": seed,
-                        "status": "failed",
-                        "failure_class": "reference_docking_baseline",
-                        "error": "Reference docking baseline failed.",
-                    }
-                )
-                continue
-            candidate = self.run(
+                comparison = {
+                    "seed": seed,
+                    "status": "failed",
+                    "failure_class": "reference_docking_baseline",
+                    "error": "Reference docking baseline failed.",
+                }
+                return seed, baseline, None, comparison
+            candidate = self._run_with_retries(
                 candidate_path=candidate_path,
                 receptor_path=receptor_path,
                 reference_path=reference_path,
                 output_dir=candidate_dir,
                 seed=seed,
             )
-            candidate_results[seed] = candidate
             comparison = self.compare_results(candidate, baseline, pose_rank=1)
             comparison["seed"] = seed
+            return seed, baseline, candidate, comparison
+
+        # GNINA seed jobs are deliberately serialized. Running several GNINA
+        # processes against one GPU can trigger intermittent native crashes.
+        seed_results = [run_seed_pipeline(seed) for seed in seeds]
+
+        for seed, baseline, candidate, comparison in seed_results:
+            reference_results[seed] = baseline
+            if baseline.get("status") == "complete":
+                self._reference_results[seed] = baseline
+            if candidate is not None:
+                candidate_results[seed] = candidate
             comparisons.append(comparison)
 
         aggregate = self.aggregate_comparisons(comparisons, seeds, pose_rank=1)
@@ -674,6 +750,9 @@ class DockingAdapter(CommandAdapter):
                     "pose_count": reference_results[seed].get("pose_count"),
                     "top_pose": (reference_results[seed].get("poses") or [None])[0],
                     "pose_selection": reference_results[seed].get("pose_selection"),
+                    "execution_attempt_count": reference_results[seed].get("execution_attempt_count", 1),
+                    "retry_count": reference_results[seed].get("retry_count", 0),
+                    "retry_history": reference_results[seed].get("retry_history", []),
                     "audit_path": str((reference_output_dir / f"seed-{seed:05d}" / "docking-result.json").resolve()),
                 }
                 for seed in seeds
@@ -686,6 +765,9 @@ class DockingAdapter(CommandAdapter):
                 "pose_count": candidate_results[seed].get("pose_count"),
                 "top_pose": (candidate_results[seed].get("poses") or [None])[0],
                 "pose_selection": candidate_results[seed].get("pose_selection"),
+                "execution_attempt_count": candidate_results[seed].get("execution_attempt_count", 1),
+                "retry_count": candidate_results[seed].get("retry_count", 0),
+                "retry_history": candidate_results[seed].get("retry_history", []),
                 "audit_path": str((output_dir / f"seed-{seed:05d}" / "docking-result.json").resolve()),
             }
             for seed in candidate_results

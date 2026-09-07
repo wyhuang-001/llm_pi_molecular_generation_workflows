@@ -1128,8 +1128,20 @@ class ToolRegistry:
             atom = parent.GetAtomWithIdx(target_id)
             if atom.GetAtomicNum() == 1:
                 raise ValueError("Edit-site tools require a heavy atom")
-            if atom.GetTotalNumHs() < 1 or (atom.GetSymbol() == "N" and atom.GetIsAromatic()):
-                raise ValueError(f"Atom {target_id!r} is not supported for replace_hydrogen")
+            if parent_attempt is None:
+                if atom.GetTotalNumHs() < 1 or (atom.GetSymbol() == "N" and atom.GetIsAromatic()):
+                    raise ValueError(f"Atom {target_id!r} is not supported for replace_hydrogen")
+            else:
+                removable = [
+                    bond for bond in atom.GetBonds()
+                    if not bond.IsInRing()
+                    and bond.GetBondType() == Chem.BondType.SINGLE
+                    and bond.GetOtherAtom(atom).GetAtomicNum() > 1
+                ]
+                if not removable:
+                    raise ValueError(
+                        f"Atom {target_id!r} has no removable substituent for local replacement"
+                    )
             operation = "substitute"
         elif target_type == "replacement_site":
             self.resolve_replacement_site(target_id)

@@ -8,6 +8,8 @@
   "docking": {
     "enabled": false,
     "timeout_seconds": 3600,
+    "max_retries": 2,
+    "retry_delay_seconds": 2,
     "seeds": [17, 29, 43],
     "command": [
       "gnina",

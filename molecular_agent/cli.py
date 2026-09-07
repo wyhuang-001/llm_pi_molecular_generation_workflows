@@ -16,7 +16,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Minimal LLM-guided molecular design workflow")
     parser.add_argument("--task", type=Path, default=Path("input/task.json"))
     parser.add_argument("--config", type=Path, default=Path("config.json"))
+    parser.add_argument(
+        "--llm", choices=("current", "gpt-5.4-mini", "gpt-5.6-luna", "doubao", "deepseek"), default=None,
+        help="Select an LLM profile; omitted uses config llm_profile or current",
+    )
     parser.add_argument("--run-dir", type=Path, default=Path("runs/latest"))
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an incomplete workflow from the persisted state in --run-dir",
+    )
     parser.add_argument("--check-input", action="store_true")
     parser.add_argument("--scripted-demo", action="store_true")
     parser.add_argument("--quiet", action="store_true", help="Suppress live workflow events")
@@ -32,6 +41,15 @@ def _progress_printer(event: str, details: dict[str, Any]) -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.resume:
+        if args.scripted_demo:
+            raise SystemExit("--resume cannot be combined with --scripted-demo")
+        runtime_task = args.run_dir / ".." / "runtime-task.json"
+        runtime_config = args.run_dir / ".." / "runtime-config.json"
+        if args.task == Path("input/task.json") and runtime_task.exists():
+            args.task = runtime_task
+        if args.config == Path("config.json") and runtime_config.exists():
+            args.config = runtime_config
     progress = None if args.quiet else _progress_printer
     if args.check_input:
         context = ComplexContext(args.task)
@@ -57,15 +75,30 @@ def main() -> None:
                 args.config,
                 diagnostic_dir=args.run_dir / "llm",
                 progress=progress,
+                llm_profile=args.llm,
             )
         )
+        if not args.scripted_demo:
+            args.run_dir.mkdir(parents=True, exist_ok=True)
+            selection = {
+                "timestamp": datetime.now().astimezone().isoformat(),
+                "profile": client.llm_profile,
+                "model": client.model,
+                "base_url": client.base_url,
+                "wire_api": client.wire_api,
+                "resume": args.resume,
+            }
+            with (args.run_dir / "llm-selection.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(selection, ensure_ascii=False) + "\n")
+            if progress:
+                progress("llm_selected", selection)
         result = Workflow(
             args.task,
             client,
             args.run_dir,
             config_path=args.config,
             progress=progress,
-        ).run()
+        ).run(resume=args.resume)
     except Exception as error:
         args.run_dir.mkdir(parents=True, exist_ok=True)
         failure = {

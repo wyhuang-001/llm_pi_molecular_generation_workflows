@@ -1,0 +1,143 @@
+flowchart TD
+    I[输入任务] --> I1[配体与蛋白结构]
+    I --> I2[优化目标]
+    I --> I3[统一片段库路径]
+    I --> I4[搜索策略与安全限制]
+    I --> C[LLM 上下文收集]
+    I1 --> C
+    I2 --> C
+    I3 --> C
+    I4 --> C
+
+    C --> Q0[LLM 选择需要的基础信息]
+    Q0 --> H0[Host 获取基础证据]
+    H0 --> H01[配体身份与拓扑]
+    H0 --> H02[口袋残基与局部环境]
+    H0 --> H03[现有相互作用]
+    H0 --> H04[可编辑原子与替换位点]
+    H01 --> S
+    H02 --> S
+    H03 --> S
+    H04 --> S
+
+    S[LLM 判断编辑位点与优先顺序]
+    S --> S1[考虑空间净空与生长方向]
+    S --> S2[考虑附近蛋白残基：疏水、极性、带电、芳香]
+    S --> S3[考虑现有关键氢键与锚定相互作用]
+    S --> S4[考虑原子可编辑性与替换位点合法性]
+    S --> S5[考虑改造潜力、结构风险与位点类型]
+    S --> S6[根据前序几何和 docking 反馈调整优先级]
+    S1 --> SP[LLM 提交位点策略]
+    S2 --> SP
+    S3 --> SP
+    S4 --> SP
+    S5 --> SP
+    S6 --> SP
+    SP --> HV[Host 验证位点策略]
+    HV -->|合法| A[锁定最高优先级的未关闭位点]
+    HV -->|非法或缺少依据| Q0
+
+    A --> D[LLM 选择当前局部搜索方案]
+    D --> D1[选择编辑操作]
+    D1 --> D11[replace_hydrogen：在可替换氢上接入取代基]
+    D1 --> D12[replace_fragment：按 Host 定义的切割键替换一侧片段]
+    D --> D2[选择片段]
+    D2 --> D21[考虑尺寸：minimal、small、medium、large]
+    D2 --> D22[考虑化学家族与标签]
+    D2 --> D23[考虑片段性质：MW、LogP、TPSA、HBD、HBA、柔性]
+    D2 --> D24[考虑空间轮廓、连接方向与局部净空]
+    D2 --> D25[考虑操作权限、来源与 provenance]
+    D2 --> D26[避免重复并补充新的化学假设]
+    D --> D3[LLM 选择下一步查询]
+    D3 --> D31[环境、增长空间或替换位点]
+    D3 --> D32[片段库记录与片段属性]
+    D3 --> D33[片段空间轮廓]
+    D3 --> D34[候选几何验证]
+
+    D31 --> HT[Host 执行查询]
+    D32 --> HT
+    D33 --> HT
+    D34 --> HT
+    HT --> HT1[检查证据是否完整]
+    HT --> HT2[搜索统一片段库]
+    HT --> HT3[检查 fragment_id 与结构等价 SMILES]
+    HT --> HT4[检查 allowed_operations]
+    HT --> HT5[返回尺寸、标签、性质与 provenance]
+    HT --> HT6[计算片段空间轮廓]
+    HT1 --> D
+    HT2 --> D
+    HT3 --> D
+    HT4 --> D
+    HT5 --> D
+    HT6 --> D
+
+    D --> R[LLM 提交 READY]
+    R --> G0[Host READY 证据门控]
+    G0 -->|证据不足| G1[返回缺失证据与推荐查询]
+    G1 --> D
+    G0 -->|证据完整| N[检查 transformation 是否已尝试]
+    N -->|重复| N1[记录重复拒绝]
+    N1 --> D
+    N -->|新 transformation| B[Host 构造候选分子]
+
+    B --> B1[从原始参考配体执行独立单步编辑]
+    B1 --> B2[检查 attachment point、键连接与切割结果]
+    B2 --> B3[分子 sanitization 与化合价检查]
+    B3 --> B4[检查芳香性、formal charge 与结构有效性]
+    B4 --> X[Host 确定性几何与碰撞检查]
+    X -->|几何拒绝| XR[记录 geometry_rejected 与失败原因]
+    XR --> XF[作为局部搜索负面证据反馈给 LLM]
+    XF --> D
+    X -->|几何接受| XA[记录 geometry_accepted]
+    XA --> Y[LLM 判断是否值得正式 docking]
+    Y -->|暂不选择| Y1[保留为 geometry_feasible_not_docked]
+    Y1 --> D
+    Y -->|正式选择| Z[Host 最终候选准入]
+    Z --> Z1[保存候选 SDF、结构报告与完整审计记录]
+    Z1 --> GN[GNINA 多 seed docking]
+
+    GN --> GN1[候选分子 docking]
+    GN --> GN2[参考分子使用相同 seed 配对 docking]
+    GN1 --> CMP
+    GN2 --> CMP
+    CMP[Host 计算候选与参考分子差值]
+    CMP --> M1[minimizedAffinity]
+    CMP --> M2[CNNscore]
+    CMP --> M3[CNNaffinity]
+    CMP --> M4[CNN_VS]
+    CMP --> M5[seed 胜出比例与标准差]
+    CMP --> M6[rank-1 pose RMSD 与稳定性]
+    CMP --> M7[相互作用获得与丢失]
+    M1 --> FB[形成 docking 反馈]
+    M2 --> FB
+    M3 --> FB
+    M4 --> FB
+    M5 --> FB
+    M6 --> FB
+    M7 --> FB
+    FB --> FB1[更新全局最佳与局部趋势]
+    FB1 --> D
+
+    D --> K[LLM 判断局部搜索是否充分]
+    K -->|存在新且有意义的候选| D
+    K -->|无可信新候选| CL[LLM 提交 MARK_UNMODIFIABLE]
+    CL --> CG[Host 检查关闭条件]
+    CG --> CG1[必须关闭当前 active target]
+    CG --> CG2[必须达到最小局部尝试数]
+    CG --> CG3[必须覆盖最小化学家族数]
+    CG --> CG4[不得重复关闭声明]
+    CG -->|关闭条件不满足| CR[返回拒绝原因与继续搜索要求]
+    CR --> D
+    CG -->|关闭条件满足| CLOSED[关闭当前位点]
+    CLOSED --> NEXT[激活下一优先级未关闭位点]
+    NEXT --> D
+
+    CLOSED --> ALL{所有优先级位点都已明确关闭？}
+    ALL -->|否| NEXT
+    ALL -->|是| DONE[生成最终结果与完整审计报告]
+    ALL -->|否且达到全局安全上限| EM[紧急停止并保存当前审计状态]
+
+    H0 -.完整数据保留在磁盘.-> AUDIT[完整审计：决策、观察、候选、几何、GNINA、姿态、provenance]
+    HT -.完整工具输出保留在磁盘.-> AUDIT
+    GN -.完整 docking 输出保留在磁盘.-> AUDIT
+    FB -.LLM 仅接收有界摘要.-> D

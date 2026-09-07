@@ -32,6 +32,14 @@ class AgentState:
     site_strategy: dict[str, Any] | None = None
     active_target: dict[str, Any] | None = None
     site_search: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Derived working memory is a rebuildable cache; complete observations and
+    # events remain the authoritative audit trail.
+    global_memory: dict[str, Any] = field(default_factory=dict)
+    site_memory: dict[str, Any] = field(default_factory=dict)
+    fragment_memory: dict[str, Any] = field(default_factory=dict)
+    candidate_memory: dict[str, Any] = field(default_factory=dict)
+    elite_archive: list[dict[str, Any]] = field(default_factory=list)
+    memory_schema_version: int = 1
     convergence: dict[str, Any] = field(default_factory=lambda: {
         "status": "not_started",
         "converged": False,
@@ -72,6 +80,12 @@ class AgentState:
             "exploration_attempts": self.exploration_attempts,
             "unmodifiable_targets": self.unmodifiable_targets,
             "tool_rejections": self.tool_rejections,
+            "global_memory": self.global_memory,
+            "site_memory": self.site_memory,
+            "fragment_memory": self.fragment_memory,
+            "candidate_memory": self.candidate_memory,
+            "elite_archive": self.elite_archive,
+            "memory_schema_version": self.memory_schema_version,
             "site_strategy": self.site_strategy,
             "active_target": self.active_target,
             "site_search": self.site_search,

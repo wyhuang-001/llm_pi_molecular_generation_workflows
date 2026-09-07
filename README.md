@@ -20,7 +20,7 @@
 
 主工作流没有固定 6 Å 口袋输入。`ComplexContext` 解析完整 PDB，后续如何选择、压缩或向 LLM 暴露结构上下文属于主工作流后续设计。
 
-docking 和 AsyncFEP/RBFE 保留为配置驱动 adapter，但当前实际设计循环只运行到 docking。docking 为 `complete` 时，top-N pose 属性和外部程序审计会反馈给 LLM；LLM 可查询新证据并更换位点或片段。若 LLM 不修改候选，循环以 `no_candidate_revision_after_docking` 停止，避免重复 docking。RBFE 配置暂时保留但不会被主工作流或 ablation 调用，结果明确记录为 `deferred`，不会伪造分数。
+docking 和 AsyncFEP/RBFE 保留为配置驱动 adapter，但当前实际设计循环只运行到 docking。多 seed docking 按配置顺序串行执行，避免同一 GPU 上并发 GNINA 进程导致原生崩溃；单个 reference 或 candidate seed 失败时默认最多重试 2 次、间隔 2 秒，可通过 `docking.max_retries` 和 `docking.retry_delay_seconds` 调整。每次执行都保存独立审计，最终 seed 结果记录 `execution_attempt_count`、`retry_count` 和 `retry_history`。docking 为 `complete` 时，top-N pose 属性和外部程序审计会反馈给 LLM；LLM 可查询新证据并更换位点或片段。若 LLM 不修改候选，循环以 `no_candidate_revision_after_docking` 停止，避免重复 docking。RBFE 配置暂时保留但不会被主工作流或 ablation 调用，结果明确记录为 `deferred`，不会伪造分数。
 
 ## LLM 何时停止调用工具
 
@@ -125,6 +125,82 @@ mamba run -n molecular-agent python -m molecular_agent.cli \
 ```
 
 默认示例端点为 `https://api.p1-103n1x.com/v1`，客户端调用 Responses API 的 `/responses`。配置可用 `api_key_file` 指定纯文本 key 文件；环境变量优先于该文件。CLI 默认实时打印 LLM 决策、工具调用、候选几何检查、docking 命令、相对分数趋势和停止原因，并将完整审计 JSON 写入 `--run-dir`；使用 `--quiet` 可关闭实时事件，使用 `--full-json` 可在结束时额外打印完整结果。
+
+### 选择多个 LLM（不替换原配置）
+
+CLI 和 `run_docking_loop_test.sh` 均支持 `--llm current|gpt-5.4-mini|gpt-5.6-luna|doubao|deepseek`：
+
+- `current`：沿用原 `--config` 中的模型/端点/Codex 配置，默认仍是原模型。
+- `gpt-5.4-mini`：沿用 `current` 的端点、Codex 配置和认证信息，仅把模型覆盖为 `gpt-5.4-mini`，继续使用 Responses API。
+- `gpt-5.6-luna`：沿用 `current` 的端点、Codex 配置和认证信息，仅把模型覆盖为 `gpt-5.6-luna`，继续使用 Responses API。
+- `doubao`：使用火山方舟 `https://ark.cn-beijing.volces.com/api/v3/responses` 和模型 `doubao-seed-evolving`，从 `ARK_API_KEY` 或项目外的 `~/.config/simple-molecular-agent/doubao-api-key` 读取认证信息。
+- `deepseek`：加载 `molecular_agent/data/llm_profiles.json` 中的独立配置，使用 Chat Completions 协议，不读取原模型的认证信息。
+- 未指定时读取配置的 `llm_profile`，缺省为 `current`。脚本把显式选择写入该运行的 `runtime-config.json`；恢复时省略参数则沿用运行配置。直接 CLI 的 `--llm` 是本次调用覆盖，恢复时请再次指定。
+
+DeepSeek 暂按官方端点 `https://api.deepseek.com/v1`、模型 ID `deepseek-v4-pro` 配置，尚未真实验证服务端是否支持。优先读取 `DEEPSEEK_API_KEY`，否则读取项目外的 `~/.config/simple-molecular-agent/deepseek-api-key`（权限应为 `600`）。不要把明文 Key 写入配置或 Git。
+
+新建真实测试（会调用付费 LLM 和 GNINA；使用唯一运行目录）：
+
+```bash
+RUN_ROOT=runs/current-$(date +%Y%m%d-%H%M%S) CONTEXT_ROUNDS=1024 EDIT_ATTEMPTS=160 ./run_docking_loop_test.sh --real --llm current
+```
+
+```bash
+RUN_ROOT=runs/gpt-5.4-mini-$(date +%Y%m%d-%H%M%S) CONTEXT_ROUNDS=1024 EDIT_ATTEMPTS=160 ./run_docking_loop_test.sh --real --llm gpt-5.4-mini
+```
+
+```bash
+RUN_ROOT=runs/gpt-5.6-luna-$(date +%Y%m%d-%H%M%S) CONTEXT_ROUNDS=1024 EDIT_ATTEMPTS=160 ./run_docking_loop_test.sh --real --llm gpt-5.6-luna
+```
+
+```bash
+RUN_ROOT=runs/doubao-$(date +%Y%m%d-%H%M%S) CONTEXT_ROUNDS=1024 EDIT_ATTEMPTS=160 ./run_docking_loop_test.sh --real --llm doubao
+```
+
+```bash
+RUN_ROOT=runs/deepseek-$(date +%Y%m%d-%H%M%S) CONTEXT_ROUNDS=1024 EDIT_ATTEMPTS=160 ./run_docking_loop_test.sh --real --llm deepseek
+```
+
+在未完成的旧运行中显式换用 DeepSeek：
+
+```bash
+RUN_ROOT=runs/docking-loop-real-160 ./run_docking_loop_test.sh --real --resume --llm deepseek --skip-tests
+```
+
+模型选择不会修改 docking/RBFE 参数，也不做自动故障切换。每次 CLI 启动会追加非敏感的 `llm-selection.jsonl`，记录所选 profile、模型和端点；同一次运行切换模型后属于混合模型运行，不能作为单模型对照实验。
+
+若供应商的模型 ID 或端点不同，可在主配置增加覆盖（不改原模型字段）：
+
+```json
+{"llm_profiles": {"deepseek": {"base_url": "https://api.deepseek.com/v1", "model": "deepseek-v4-pro"}}}
+```
+
+### LLM 工作记忆与完整审计
+
+每次工具调用和候选改造仍完整保存为 observation/Event，用于审计、去重和恢复；LLM 输入则使用按全局信息、位点、片段、候选和 elite archive 归并的结构化工作记忆，并仅保留少量最近/代表性历史。不同 parent 的位点事实分开保存，避免将原始配体和子代的局部几何混淆。LLM 请求进度事件同时记录 payload 大小和 token 用量字段（若 API 返回）。
+
+### 从中断运行继续
+
+工作流中断后，可以使用同一运行目录恢复。恢复只读取该目录中的 `observation-*.json`、`context-final.json`、`edit-attempt-*.json`、candidate SDF 和 docking history；不会从其他运行导入候选、评分或 incumbent。已有 `result.json` 的运行视为已完成，不能用 `--resume` 覆盖。
+
+直接使用 CLI：
+
+```bash
+mamba run -n molecular-agent-docking python -m molecular_agent.cli \
+  --task runs/docking-loop-codex-gpt56-20260902-171109/runtime-task.json \
+  --config runs/docking-loop-codex-gpt56-20260902-171109/runtime-config.json \
+  --run-dir runs/docking-loop-codex-gpt56-20260902-171109/real \
+  --resume
+```
+
+也可以使用测试脚本。`RUN_ROOT` 必须是原运行的根目录，脚本会保留原 `real` 子目录和 runtime 配置，不会先删除它：
+
+```bash
+RUN_ROOT=runs/docking-loop-codex-gpt56-20260902-171109 \
+  ./run_docking_loop_test.sh --real --resume --skip-tests
+```
+
+恢复时 attempt 编号从旧 history 的最大编号之后继续；如果上次停在 parent local batch，恢复会重新请求尚未成功记录的工具调用，然后继续 local child docking。恢复前应确认代码、task、fragment library、docking config 与原运行一致。
 
 ## 独立工具预算对比实验
 

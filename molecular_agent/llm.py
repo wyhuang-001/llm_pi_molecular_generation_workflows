@@ -31,7 +31,7 @@ replace_hydrogen grows from an atom with a replaceable H. Query get_atom_environ
 Generation 0 is the original co-crystal ligand. During the initial coarse exploration, propose one transformation of the original ligand. After a target is promoted, local optimization may apply exactly one transformation to a previously evaluated parent candidate at that same edit target. For a local child, include `parent_attempt` equal to the parent candidate's attempt number and keep the same target site; omit it for generation-1 candidates from the original ligand. Do not perform multi-site combination edits.
 Before READY, query get_atom_environment for the retained edit atom and validate_candidate_geometry for the exact complete transformation. For a local child, include the parent_attempt in the exact geometry query and use the parent candidate path supplied in the optimization context; the geometry check must use that parent structure. For replace_fragment, the retained edit atom is the retained_atom_index returned by the selected replacement site. replace_hydrogen also requires check_growth_space. replace_fragment instead requires a prior list_fragment_replacement_sites result; its attachment vector and exact candidate geometry replace the hydrogen-growth probe. If READY is rejected with failure_class ready_evidence_missing, the host may execute recommended_queries and then resubmit the same transformation with its original understanding and edit_hypothesis before selecting anything new. For a local child, every parent-specific environment, growth-space, and exact geometry query must include the same parent_attempt. If READY is rejected with failure_class invalid_ready, correct the concrete operation, atom/site ID, and fragment fields before retrying. A chemistry or geometry rejection is already an exploration attempt; choose a different transformation or explicitly MARK_UNMODIFIABLE when the target or family is not chemically supported. Do not repeat a rejected spatial query or geometry validation call; use the returned result to select a different unexecuted query or transformation.
 After each docking evaluation, inspect candidate_history and docking_history, including the transformation, canonical SMILES, chemistry/clash status, primary metric delta, seed standard deviation and win fraction, pose_consensus, interaction_consensus, incumbent best attempt, trend, failed transformations, and remaining chemically plausible options. Prefer hypotheses supported across seeds and consistent poses rather than one favorable seed. Keep proposing transformations at active_target while its site_search status is active; do not jump to another target merely because one candidate was worse. Never repeat a transformation in attempted_transformations. Query only unexecuted calls; prior observations are authoritative.
-The host does not impose a fixed number of design regions or a minimum number of attempts per site. Inspect the tool evidence and accumulated results for each target. Continue a target when its chemical environment, fragment properties or 3D profile, docking trend, pose consensus, or interaction evidence supports another chemically distinct hypothesis. Close a target with MARK_UNMODIFIABLE only after reviewing that evidence and explaining why no credible local option remains. A hard-reject requires deterministic host-tool evidence; an uncertain site may receive a pilot or be paused without artificial coverage requirements. STOP is allowed only after every target has either been deterministically rejected or explicitly closed by an evidence-backed MARK_UNMODIFIABLE decision. The host-level hard attempt limit is an emergency process safeguard, not a scientific stopping rule or a per-site search requirement. Host-ineligible hydrogen atoms are reported for audit but are not pending edit sites. Exploration means an explicit transformation was attempted, including chemistry/geometry/valence/clash rejection, or the LLM returned a precise MARK_UNMODIFIABLE declaration accepted by the host. Such records count for coverage but never count as successful docking evidence. Do not repeat an attempted transformation. You may switch between edit atoms and replacement sites whenever the accumulated evidence supports a new hypothesis. A candidate that is worse than the reference is informative and does not by itself require stopping; distinguish exploration feedback from the best-so-far candidate. Continue when the overall primary-metric trend is improving, when a reference-better candidate can plausibly be refined, or when unstable secondary evidence justifies a confirming design. Return STOP only after the global-search gate is complete and your review finds no credible, chemically distinct, evidence-backed transformation likely to improve or meaningfully validate the current result. The hard attempt limit is a safety limit, not scientific convergence.
+The host does not impose a fixed number of design regions or a minimum number of attempts per site. Inspect the tool evidence and accumulated results for each target. Continue a target when its chemical environment, fragment properties or 3D profile, docking trend, pose consensus, or interaction evidence supports another chemically distinct hypothesis. Close a target with MARK_UNMODIFIABLE only after reviewing that evidence and explaining why no credible local option remains. A hard-reject requires deterministic host-tool evidence; an uncertain site may receive a pilot or be paused without artificial coverage requirements. STOP is allowed only after every target has either been deterministically rejected or explicitly closed by an evidence-backed MARK_UNMODIFIABLE decision. The host-level hard attempt limit is an emergency process safeguard, not a scientific stopping rule or a per-site search requirement. Host-ineligible hydrogen atoms are reported for audit but are not pending edit sites. Exploration means an explicit transformation was attempted, including chemistry/geometry/valence/clash rejection, or the LLM returned a precise MARK_UNMODIFIABLE declaration accepted by the host. Such records count for coverage but never count as successful docking evidence. Do not repeat an attempted transformation. You may switch between edit atoms and replacement sites whenever the accumulated evidence supports a new hypothesis. A candidate that is worse than the reference is informative and does not by itself require stopping; distinguish exploration feedback from the best-so-far candidate. Continue when the overall primary-metric trend is improving, when a reference-better candidate can plausibly be refined, or when unstable secondary evidence justifies a confirming design. In coverage mode, return STOP only after the global-search gate is complete. In optimization mode, STOP is allowed when the portfolio/quality/budget evidence supports stopping; do not wait for exhaustive site closure. In either mode, distinguish docking ranking from confirmed activity. The hard attempt limit is a safety limit, not scientific convergence.
 Do not claim that every candidate improves. Distinguish each attempt from the monotonic best-so-far trace. Do not call a polar proximity a hydrogen bond unless host evidence shows a donor-acceptor role pairing; acceptor-acceptor and donor-donor pairs are not hydrogen bonds. Treat distance-only contacts as hypotheses, not established interactions.
 fragment_smiles must be one connected fragment containing exactly one mapped dummy atom [*:1]. Preserve the intended scaffold, formal charge, and stereochemistry unless an explicit audited transformation allows otherwise.
 """
@@ -44,12 +44,33 @@ class ResponsesClient:
         system_prompt: str = SYSTEM_PROMPT,
         diagnostic_dir: Path | None = None,
         progress: Callable[[str, dict[str, Any]], None] | None = None,
+        llm_profile: str | None = None,
     ):
         config = json.loads(config_path.read_text(encoding="utf-8"))
+        self.llm_profile = llm_profile or config.get("llm_profile", "current")
+        inherited_model_override: str | None = None
+        if self.llm_profile != "current":
+            profiles = json.loads(
+                (Path(__file__).parent / "data" / "llm_profiles.json").read_text(encoding="utf-8")
+            )
+            if self.llm_profile not in profiles:
+                raise ValueError(f"Unknown LLM profile: {self.llm_profile}")
+            profile = {**profiles[self.llm_profile], **(config.get("llm_profiles", {}).get(self.llm_profile) or {})}
+            inherit_current_provider = bool(profile.pop("inherit_current_provider", False))
+            if inherit_current_provider:
+                inherited_model_override = str(profile["model"])
+            else:
+                # Independent providers must not inherit the current provider's credentials or Codex override.
+                for field in ("codex_config_dir", "api_key_env", "api_key_file"):
+                    config.pop(field, None)
+            config.update(profile)
+        self.wire_api = config.get("wire_api", "responses")
+        if self.wire_api not in {"responses", "chat_completions"}:
+            raise ValueError(f"Unsupported wire_api: {self.wire_api}")
         codex_config_dir = config.get("codex_config_dir")
         codex_settings = self._load_codex_settings(codex_config_dir) if codex_config_dir else {}
         self.base_url = str(codex_settings.get("base_url", config["base_url"])).rstrip("/")
-        self.model = str(codex_settings.get("model", config["model"]))
+        self.model = inherited_model_override or str(codex_settings.get("model", config["model"]))
         self.timeout = int(config.get("timeout_seconds", 600))
         self.max_output_tokens = int(config.get("max_output_tokens", 8192))
         self.reasoning_effort = str(
@@ -117,11 +138,22 @@ class ResponsesClient:
         self, payload: dict[str, Any], allow_repair: bool
     ) -> dict[str, Any]:
         self.request_count += 1
+        payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        payload_bytes = len(payload_json.encode("utf-8"))
+        estimated_input_tokens = max(1, (len(self.system_prompt.encode("utf-8")) + payload_bytes) // 4)
         if self.progress:
             self.progress("llm_request_started", {
                 "request": self.request_count,
                 "model": self.model,
+                "llm_profile": self.llm_profile,
+                "wire_api": self.wire_api,
                 "mode": payload.get("mode"),
+                "payload_bytes": payload_bytes,
+                "estimated_input_tokens": estimated_input_tokens,
+                "context_sections": sorted(
+                    key for key in ("state", "optimization_context", "tool_catalog", "working_memory")
+                    if key in payload or key in (payload.get("optimization_context") or {})
+                ),
             })
         is_repair = payload.get("mode") == "json_output_repair"
         body = {
@@ -141,6 +173,19 @@ class ResponsesClient:
             ),
             "text": {"format": {"type": "json_object"}},
         }
+        endpoint = "responses"
+        if self.wire_api == "chat_completions":
+            endpoint = "chat/completions"
+            body = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": payload_json},
+                ],
+                "max_tokens": self.repair_max_output_tokens if is_repair else self.max_output_tokens,
+                "response_format": {"type": "json_object"},
+                "stream": False,
+            }
         with tempfile.TemporaryDirectory(prefix="simple-agent-http-") as tmp:
             request_path = Path(tmp) / "request.json"
             response_path = Path(tmp) / "response.json"
@@ -170,7 +215,7 @@ class ResponsesClient:
                 "User-Agent: simple-molecular-agent/0.1",
                 "--data-binary",
                 f"@{request_path}",
-                f"{self.base_url}/responses",
+                f"{self.base_url}/{endpoint}",
                 "-o",
                 str(response_path),
             ]
@@ -185,8 +230,16 @@ class ResponsesClient:
             except json.JSONDecodeError as error:
                 self._write_diagnostic(payload, body, raw_http_body, None, None, "endpoint_invalid_json")
                 raise RuntimeError("LLM endpoint returned invalid JSON") from error
-        text = self._response_message_text(data)
-        if data.get("status") == "incomplete":
+        if self.wire_api == "chat_completions":
+            choices = data.get("choices") or []
+            choice = choices[0] if choices else {}
+            text = (choice.get("message") or {}).get("content")
+            text = text if isinstance(text, str) else ""
+            incomplete = choice.get("finish_reason") == "length"
+        else:
+            text = self._response_message_text(data)
+            incomplete = data.get("status") == "incomplete"
+        if incomplete:
             self._write_diagnostic(
                 payload, body, raw_http_body, data, text, "assistant_output_truncated"
             )
@@ -207,9 +260,15 @@ class ResponsesClient:
                 return self._repair_incomplete_response(payload)
             raise RuntimeError(f"LLM did not return a complete JSON object: {text[:1500]}") from error
         if self.progress:
+            usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
             self.progress("llm_request_completed", {
                 "request": self.request_count,
                 "action": result.get("action"),
+                "estimated_input_tokens": estimated_input_tokens,
+                "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens")),
+                "cached_input_tokens": usage.get("prompt_cache_hit_tokens", usage.get("cached_input_tokens", usage.get("cache_read_input_tokens", (usage.get("input_tokens_details") or {}).get("cached_tokens")))),
+                "output_tokens": usage.get("output_tokens", usage.get("completion_tokens")),
+                "reasoning_tokens": (usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
             })
         return result
 

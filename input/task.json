@@ -6,7 +6,7 @@
     "residue_name": "2A6",
     "residue_number": 1298
   },
-  "max_context_rounds": 256,
+  "max_context_rounds": 1024,
   "fragment_library_path": "../molecular_agent/data/fragments_unified.json",
   "docking_optimization": {
     "primary_metric": "minimizedAffinity",

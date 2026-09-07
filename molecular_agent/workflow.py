@@ -117,6 +117,188 @@ class Workflow:
         self.reference_docking_result: dict[str, Any] | None = None
         self._design_phase = False
 
+    def _restore_run_state(self) -> tuple[list[dict[str, Any]], dict[str, int]]:
+        """Restore only persisted state and candidate files from this run directory."""
+        if (self.run_dir / "result.json").exists():
+            raise RuntimeError(
+                f"Run already has a final result: {self.run_dir / 'result.json'}; use a new run directory"
+            )
+        state_paths = sorted(
+            self.run_dir.glob("observation-*.json"),
+            key=lambda path: int(path.stem.rsplit("-", 1)[1]),
+        )
+        if not state_paths:
+            context_path = self.run_dir / "context-final.json"
+            if context_path.exists():
+                state_paths = [context_path]
+        if not state_paths:
+            raise FileNotFoundError(
+                f"No persisted workflow state found in {self.run_dir}; cannot resume"
+            )
+        saved = json.loads(state_paths[-1].read_text(encoding="utf-8"))
+        if not isinstance(saved, dict) or not isinstance(saved.get("task"), str):
+            raise ValueError(f"Invalid persisted workflow state: {state_paths[-1]}")
+        if saved["task"] != self.state.task:
+            raise ValueError(
+                "Resume task does not match the persisted run task; use the original runtime task"
+            )
+
+        self.state.observations = [
+            ToolObservation(
+                tool=item["tool"],
+                arguments=item.get("arguments", {}),
+                result=item.get("result", {}),
+                evidence=set(item.get("evidence", [])),
+            )
+            for item in saved.get("observations", [])
+        ]
+        self.state.decisions = list(saved.get("decisions", []))
+        self.state.evidence = set(saved.get("covered_evidence", []))
+        self.state.call_signatures = {
+            self._signature(item.tool, item.arguments)
+            for item in self.state.observations
+        }
+        self.state.docking_history = list(saved.get("docking_history", []))
+        self.state.candidate_history = list(saved.get("candidate_history", []))
+        self.state.exploration_attempts = list(saved.get("exploration_attempts", []))
+        self.state.unmodifiable_targets = list(saved.get("unmodifiable_targets", []))
+        self.state.tool_rejections = list(saved.get("tool_rejections", []))
+        self.state.site_strategy = saved.get("site_strategy")
+        self.state.active_target = saved.get("active_target")
+        self.state.site_search = dict(saved.get("site_search", {}))
+        self.state.convergence = dict(saved.get("convergence", self.state.convergence))
+        # Rebuild derived memory from authoritative persisted observations/events.
+        self.state.global_memory = {}
+        self.state.site_memory = {}
+        self.state.fragment_memory = {}
+        self.state.candidate_memory = {}
+        self.state.elite_archive = []
+        for observation in self.state.observations:
+            self._update_working_memory(
+                tool=observation.tool,
+                result=observation.result,
+            )
+        for item in self.state.docking_history:
+            self._update_working_memory(
+                transformation=item.get("transformation"),
+                docking_entry=item,
+            )
+
+        reports: list[dict[str, Any]] = []
+        for path in sorted(
+            self.run_dir.glob("edit-attempt-*.json"),
+            key=lambda item: int(item.stem.rsplit("-", 1)[1]),
+        ):
+            report = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(report, dict) and isinstance(report.get("attempt"), int):
+                reports.append(report)
+        if not reports and self.state.docking_history:
+            raise FileNotFoundError(
+                "Persisted docking history exists but edit-attempt reports are missing; cannot rebuild resume state"
+            )
+        reports.sort(key=lambda item: item["attempt"])
+        report_by_attempt = {item["attempt"]: item for item in reports}
+        history_attempts = {
+            item.get("attempt") for item in self.state.docking_history
+            if isinstance(item.get("attempt"), int)
+        }
+        if not history_attempts.issubset(report_by_attempt):
+            missing = sorted(history_attempts - report_by_attempt.keys())
+            raise FileNotFoundError(
+                f"Missing persisted edit-attempt reports required for resume: {missing}"
+            )
+
+        self.parent_candidates = {0: Chem.Mol(self.context.ligand)}
+        self.parent_metadata = {
+            0: {"attempt": 0, "generation": 0, "target_type": None, "target_id": None}
+        }
+        eligible_attempts = {
+            item.get("attempt")
+            for item in self.state.docking_history
+            if item.get("stability_eligible") and isinstance(item.get("attempt"), int)
+        }
+        for attempt in sorted(eligible_attempts):
+            report = report_by_attempt.get(attempt)
+            candidate_path_value = report.get("candidate_path") if report else None
+            if not isinstance(candidate_path_value, str) or not candidate_path_value:
+                raise FileNotFoundError(
+                    f"Missing persisted candidate path for eligible attempt {attempt}"
+                )
+            candidate_path = Path(candidate_path_value).resolve()
+            try:
+                candidate_path.relative_to(self.run_dir)
+            except ValueError as error:
+                raise ValueError(
+                    f"Persisted candidate for attempt {attempt} is outside the run directory: {candidate_path}"
+                ) from error
+            if not candidate_path.exists():
+                raise FileNotFoundError(f"Missing persisted candidate for attempt {attempt}: {candidate_path}")
+            molecules = Chem.SDMolSupplier(str(candidate_path), removeHs=False)
+            molecule = next((item for item in molecules if item is not None), None)
+            if molecule is None:
+                raise ValueError(f"Could not read persisted candidate for attempt {attempt}: {candidate_path}")
+            docking_entry = next(
+                item for item in self.state.docking_history if item.get("attempt") == attempt
+            )
+            transformation = report.get("transformation") or docking_entry.get("transformation") or {}
+            target = self._transformation_target(transformation)
+            self.parent_candidates[attempt] = molecule
+            self.parent_metadata[attempt] = {
+                "attempt": attempt,
+                "generation": report.get("generation", transformation.get("generation", 1)),
+                "target_type": target["target_type"],
+                "target_id": target["target_id"],
+                "quality": docking_entry.get("quality"),
+                "canonical_smiles": (report.get("validation") or {}).get("candidate", {}).get("canonical_smiles"),
+                "candidate_path": str(candidate_path),
+            }
+
+        for report in reports:
+            docking = report.get("docking") or {}
+            reference = docking.get("reference_baseline")
+            if isinstance(reference, dict) and reference.get("status") == "complete":
+                self.reference_docking_result = reference
+        return reports, {
+            "last_attempt": max((item["attempt"] for item in reports), default=0),
+            "docked_attempts": len(history_attempts),
+        }
+
+    def _resume_design(self) -> dict[str, Any]:
+        reports, progress = self._restore_run_state()
+        if not reports:
+            raise RuntimeError("No completed design attempts are available to resume")
+        last_report = reports[-1]
+        rejection = {
+            "status": "rejected",
+            "failure_class": "workflow_resume",
+            "error": (
+                "The previous workflow stopped before completing its next decision. "
+                "Resume from the persisted same-run state and continue from the next unattempted transformation."
+            ),
+            "instruction": (
+                "Continue from the persisted candidate_history and docking_history. Do not repeat any completed "
+                "transformation. The previous runtime failure may have been fixed; retry the failed tool call only "
+                "if it is still unexecuted, then select a new evidence-backed transformation or STOP when allowed."
+            ),
+        }
+        self._design_phase = True
+        decision = self._retry_ready_decision(
+            last_report.get("decision") or {}, rejection
+        )
+        if decision.get("action") == "STOP":
+            return self._accepted_output(reports, self.run_dir / "reference-ligand.sdf", "llm_stop")
+        seen_candidate_smiles = {}
+        for report in reports:
+            canonical = ((report.get("validation") or {}).get("candidate") or {}).get("canonical_smiles")
+            if isinstance(canonical, str):
+                seen_candidate_smiles.setdefault(canonical, report["attempt"])
+        return self.design(
+            decision,
+            initial_history=reports,
+            initial_seen_candidate_smiles=seen_candidate_smiles,
+            start_attempt=progress["last_attempt"] + 1,
+        )
+
     def _resolve_parent_candidate(self, parent_attempt: int | None) -> Chem.Mol:
         attempt = 0 if parent_attempt is None else int(parent_attempt)
         try:
@@ -134,6 +316,136 @@ class Workflow:
     def _emit(self, event: str, details: dict[str, Any] | None = None) -> None:
         if self.progress:
             self.progress(event, details or {})
+
+    @staticmethod
+    def _memory_target_key(transformation: dict[str, Any] | None) -> str | None:
+        transformation = transformation or {}
+        if transformation.get("operation") == "replace_fragment":
+            site_id = transformation.get("replacement_site_id")
+            return f"replacement_site:{site_id}" if site_id is not None else None
+        atom_index = transformation.get("edit_atom_index")
+        return f"atom:{atom_index}" if atom_index is not None else None
+
+    def _update_working_memory(
+        self,
+        *,
+        tool: str | None = None,
+        result: dict[str, Any] | None = None,
+        transformation: dict[str, Any] | None = None,
+        docking_entry: dict[str, Any] | None = None,
+    ) -> None:
+        """Update compact, rebuildable memory without replacing the audit trail."""
+        result = result or {}
+        memory = self.state.global_memory
+        if tool in {"get_ligand_info", "get_pocket_residues", "detect_basic_interactions"}:
+            memory[tool] = {
+                "source": "host_fact",
+                "summary": self._compact_observation_result(result),
+            }
+        target_key = self._memory_target_key(transformation)
+        if target_key is None:
+            target_key = self._memory_target_key(result.get("transformation"))
+        if target_key is None:
+            result_target = {
+                "operation": result.get("operation"),
+                "edit_atom_index": result.get("edit_atom_index", result.get("atom_index")),
+                "replacement_site_id": result.get("replacement_site_id"),
+            }
+            if result.get("target_type") == "replacement_site":
+                result_target["operation"] = "replace_fragment"
+                result_target["replacement_site_id"] = result.get("target_id", result.get("replacement_site_id"))
+            target_key = self._memory_target_key(result_target)
+        if target_key:
+            site = self.state.site_memory.setdefault(target_key, {
+                "source": "derived_summary",
+                "target": target_key,
+                "parent_contexts": {},
+                "tool_facts": {},
+                "event_count": 0,
+                "docking_count": 0,
+                "families_tested": [],
+            })
+            if tool:
+                site["tool_facts"][tool] = {
+                    "source": "host_fact",
+                    "summary": self._compact_observation_result(result),
+                }
+            if transformation:
+                parent = str(transformation.get("parent_attempt", 0))
+                context = site["parent_contexts"].setdefault(parent, {
+                    "source": "derived_summary",
+                    "events": [],
+                })
+                family = self._local_modification_family(transformation)
+                if family not in site["families_tested"]:
+                    site["families_tested"].append(family)
+                if docking_entry:
+                    site["event_count"] += 1
+                    site["docking_count"] += 1
+                    context["events"].append({
+                        "source": "docking_observation",
+                        "attempt": docking_entry.get("attempt"),
+                        "family": family,
+                        "quality": docking_entry.get("quality"),
+                        "delta": docking_entry.get("delta_candidate_minus_reference"),
+                        "seed_win_fraction": docking_entry.get("seed_win_fraction"),
+                        "seed_stddev": docking_entry.get("seed_stddev"),
+                        "pose_stable": (docking_entry.get("pose_consensus") or {}).get("stable"),
+                        "interaction_loss": (docking_entry.get("interaction_consensus") or {}).get("lost_consensus_residues", []),
+                    })
+                    context["events"] = context["events"][-6:]
+        fragment_id = result.get("fragment_id", result.get("id"))
+        fragment_smiles = result.get("fragment_smiles", result.get("smiles"))
+        if fragment_id or fragment_smiles:
+            key = str(fragment_id or fragment_smiles)
+            self.state.fragment_memory[key] = {
+                "source": "host_fact",
+                "fragment_id": fragment_id,
+                "fragment_smiles": fragment_smiles,
+                "summary": self._compact_observation_result(result),
+            }
+        if docking_entry:
+            attempt = docking_entry.get("attempt")
+            if attempt is not None:
+                self.state.candidate_memory[str(attempt)] = {
+                    "source": "docking_observation",
+                    "attempt": attempt,
+                    "target": target_key,
+                    "transformation": self._compact_transformation(transformation),
+                    "quality": docking_entry.get("quality"),
+                    "seed_win_fraction": docking_entry.get("seed_win_fraction"),
+                    "seed_stddev": docking_entry.get("seed_stddev"),
+                    "pose_consensus": docking_entry.get("pose_consensus"),
+                    "interaction_consensus": docking_entry.get("interaction_consensus"),
+                }
+                self.state.candidate_memory = dict(
+                    list(sorted(self.state.candidate_memory.items(), key=lambda item: int(item[0])))[-32:]
+                )
+            if docking_entry.get("quality") is not None:
+                pose_stable = (docking_entry.get("pose_consensus") or {}).get("stable")
+                interaction_loss = (docking_entry.get("interaction_consensus") or {}).get("lost_consensus_residues", [])
+                seed_win_fraction = docking_entry.get("seed_win_fraction")
+                if pose_stable and not interaction_loss and isinstance(seed_win_fraction, (int, float)) and seed_win_fraction >= 2 / 3:
+                    archive_class = "stable_candidate"
+                elif docking_entry.get("quality") is not None:
+                    archive_class = "strong_hit_needs_confirmation"
+                else:
+                    archive_class = "unranked"
+                archive_entry = {
+                    "attempt": docking_entry.get("attempt"),
+                    "target": target_key,
+                    "quality": docking_entry.get("quality"),
+                    "seed_win_fraction": seed_win_fraction,
+                    "seed_stddev": docking_entry.get("seed_stddev"),
+                    "pose_stable": pose_stable,
+                    "interaction_loss": interaction_loss,
+                    "archive_class": archive_class,
+                    "transformation": self._compact_transformation(transformation),
+                }
+                merged = [item for item in self.state.elite_archive if item.get("attempt") != archive_entry["attempt"]]
+                merged.append(archive_entry)
+                merged.sort(key=lambda item: float(item.get("quality", float("-inf"))), reverse=True)
+                self.state.elite_archive = merged[:10]
 
     @staticmethod
     def _llm_safe_value(value: Any, key: str | None = None) -> Any:
@@ -657,6 +969,7 @@ class Workflow:
         self.state.observations.append(
             ToolObservation(tool=tool, arguments=arguments, result=result, evidence=evidence)
         )
+        self._update_working_memory(tool=tool, result=result)
         if tool == "assess_edit_sites" and result.get("status") == "complete":
             self.state.site_strategy = result
             self.state.active_target = None
@@ -1457,16 +1770,34 @@ class Workflow:
                 self._compact_transformation(item.get("transformation"))
                 for item in self.state.exploration_attempts
                 if item.get("source") == "design"
-            ][-80:],
-            "exploration_attempts": self._compact_exploration_attempts(),
+            ][-20:],
+            "exploration_attempts": self._compact_exploration_attempts()[-20:],
             "unmodifiable_targets": self._llm_safe_value(self.state.unmodifiable_targets[-30:]),
             "search_policy": self._search_policy(),
             "site_strategy": self._llm_safe_value(self.state.site_strategy),
             "active_target": self._llm_safe_value(self.state.active_target),
             "site_search": self._llm_safe_value(self.state.site_search),
+            "working_memory": {
+                "global": self._llm_safe_value(self.state.global_memory),
+                "sites": self._llm_safe_value(self.state.site_memory),
+                "fragments": self._llm_safe_value(self.state.fragment_memory),
+                "candidates": self._llm_safe_value(self.state.candidate_memory),
+                "elite_archive": self._llm_safe_value(self.state.elite_archive),
+            },
             "adaptive_target_summaries": self._adaptive_target_summaries(global_search),
-            "candidate_history": self._compact_candidate_history()[-40:],
-            "docking_history": self._compact_docking_history()[-40:],
+            # Keep a small compatibility window; working_memory is authoritative
+            # for current decisions and the full history remains on disk.
+            "candidate_history": self._compact_candidate_history()[-8:],
+            "docking_history": self._compact_docking_history()[-8:],
+            "search_control": {
+                "mode": self._search_policy()["mode"],
+                "active_target": self._llm_safe_value(self.state.active_target),
+                "elite_count": len(self.state.elite_archive),
+                "stable_candidate_count": sum(
+                    item.get("archive_class") == "stable_candidate"
+                    for item in self.state.elite_archive
+                ),
+            },
             "instruction": (
                 "Prior candidates, exploration attempts, and docking results are authoritative feedback. "
                 "Do not return an attempted or rejected transformation again; a new READY decision must "
@@ -2662,6 +2993,10 @@ class Workflow:
 
     def _stop_gate_rejection(self) -> dict[str, Any] | None:
         coverage = self._global_search_coverage()
+        # Optimization mode seeks a diverse high-quality portfolio under a
+        # finite budget; exhaustive site closure belongs to coverage mode.
+        if coverage["policy"]["mode"] == "optimization":
+            return None
         if coverage["complete"]:
             return None
         adaptive_search = coverage["policy"]["mode"] == "adaptive"
@@ -2871,17 +3206,31 @@ class Workflow:
             "attempts": history,
             "docking": best.get("docking", {}),
             "docking_history": self.state.docking_history,
+            "elite_archive": self.state.elite_archive,
             "convergence": self.state.convergence,
             "rbfe": rbfe,
             "fep": rbfe,
         }
 
-    def design(self, first_decision: dict[str, Any]) -> dict[str, Any]:
+    def design(
+        self,
+        first_decision: dict[str, Any],
+        *,
+        initial_history: list[dict[str, Any]] | None = None,
+        initial_seen_candidate_smiles: dict[str, int] | None = None,
+        start_attempt: int = 1,
+    ) -> dict[str, Any]:
         decision = first_decision
         settings = self._optimization_settings()
         hard_max = settings["hard_max_attempts"]
-        history: list[dict[str, Any]] = []
-        seen_candidate_smiles: dict[str, int] = {}
+        history: list[dict[str, Any]] = list(initial_history or [])
+        seen_candidate_smiles: dict[str, int] = dict(initial_seen_candidate_smiles or {})
+        if start_attempt > hard_max:
+            return self._accepted_output(
+                history,
+                self.run_dir / "reference-ligand.sdf",
+                "hard_safety_limit",
+            )
         reference_path = self.run_dir / "reference-ligand.sdf"
         receptor_path = self.run_dir / "receptor-protein-only.pdb"
 
@@ -2893,7 +3242,7 @@ class Workflow:
             "site_strategy": self.state.site_strategy,
             "active_target": self.state.active_target,
         })
-        for attempt in range(1, hard_max + 1):
+        for attempt in range(start_attempt, hard_max + 1):
             try:
                 self._validate_design(decision)
             except ReadyDecisionError as error:
@@ -3120,6 +3469,10 @@ class Workflow:
             trend_entry = self._record_docking_result(
                 attempt, transformation, candidate_path, docking
             )
+            self._update_working_memory(
+                transformation=transformation,
+                docking_entry=trend_entry,
+            )
             if trend_entry.get("stability_eligible"):
                 self.parent_candidates[attempt] = Chem.Mol(result.molecule)
                 self.parent_metadata[attempt] = {
@@ -3216,15 +3569,19 @@ class Workflow:
             "attempts": history,
         }
 
-    def run(self) -> dict[str, Any]:
+    def run(self, resume: bool = False) -> dict[str, Any]:
         self._emit("workflow_started", {
             "task": self.state.task,
             "run_dir": str(self.run_dir),
             "ligand_heavy_atoms": self.context.ligand.GetNumHeavyAtoms(),
             "protein_atoms": len(self.context.protein_atoms),
+            "resume": resume,
         })
-        first_decision = self.collect_context()
-        result = self.design(first_decision)
+        if resume:
+            result = self._resume_design()
+        else:
+            first_decision = self.collect_context()
+            result = self.design(first_decision)
         final = {"state": self.state.compact_view(), "result": result}
         self._write_json("result.json", final)
         self._emit("workflow_completed", {

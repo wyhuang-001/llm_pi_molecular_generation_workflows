@@ -1,0 +1,32 @@
+{
+  "gpt-5.4-mini": {
+    "model": "gpt-5.4-mini",
+    "inherit_current_provider": true
+  },
+  "gpt-5.6-luna": {
+    "model": "gpt-5.6-luna",
+    "inherit_current_provider": true
+  },
+  "doubao": {
+    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+    "model": "doubao-seed-evolving",
+    "wire_api": "responses",
+    "codex_config_dir": null,
+    "api_key_env": "ARK_API_KEY",
+    "api_key_file": "~/.config/simple-molecular-agent/doubao-api-key",
+    "timeout_seconds": 600,
+    "max_output_tokens": 8192,
+    "repair_max_output_tokens": 4096
+  },
+  "deepseek": {
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-v4-pro",
+    "wire_api": "chat_completions",
+    "codex_config_dir": null,
+    "api_key_env": "DEEPSEEK_API_KEY",
+    "api_key_file": "~/.config/simple-molecular-agent/deepseek-api-key",
+    "timeout_seconds": 600,
+    "max_output_tokens": 8192,
+    "repair_max_output_tokens": 4096
+  }
+}
