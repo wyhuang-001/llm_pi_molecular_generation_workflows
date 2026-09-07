@@ -36,6 +36,27 @@ Do not claim that every candidate improves. Distinguish each attempt from the mo
 fragment_smiles must be one connected fragment containing exactly one mapped dummy atom [*:1]. Preserve the intended scaffold, formal charge, and stereochemistry unless an explicit audited transformation allows otherwise.
 """
 
+SYSTEM_PROMPT += """
+Portfolio batch mode overrides legacy site-lock and exhaustive-closure instructions when payload mode is `portfolio_planning`.
+In portfolio mode the host supplies a deterministic design dossier containing all editable-site summaries and compact fragment panels with precomputed chemistry. Do not query basic fragment properties already present in the dossier.
+Portfolio actions are PLAN_BATCH, QUERY, QUERY_BATCH, CONFIRM, and STOP. PLAN_BATCH schema: {"action":"PLAN_BATCH","rationale":"...","site_updates":[{"target_type":"atom|replacement_site","target_id":9,"status":"screening|promoted|active|deprioritized|discarded","reason":"..."}],"candidates":[{"target_type":"atom|replacement_site","target_id":9,"operation":"replace_hydrogen|replace_fragment","fragment_id":"real library id","hypothesis":{"site_evidence":"...","intended_change":"...","expected_effect":"...","risk":"...","success_criterion":"..."}}]}.
+For a later local child, parent_attempt may be added only when it is an attempt ID listed in available_parents; omit parent_attempt for initial edits of the original ligand. Use only host-listed targets and real fragment IDs from supplied or tool-returned panels. Each candidate is a single-site edit; never rewrite the whole ligand or invent a cut bond.
+Use QUERY or QUERY_BATCH only for a decision-relevant uncertainty, refreshed fragment panel, parent-specific environment, or detailed pose/interaction analysis. Every query must include `why_needed` and `decision_impact`. Do not spend consecutive rounds rediscovering supplied facts.
+CONFIRM schema: {"action":"CONFIRM","candidate_ids":["attempt-01"],"reason":"..."}. Screening results use a reduced seed budget; confirmation uses the configured full seed set.
+Sites compete for budget. Promote improving directions and deprioritize or discard directions with repeated geometry failure or clearly inferior docking evidence. A discarded site is not claimed to be chemically impossible. STOP does not require all sites to be closed; stop when quality, trend, finalists, remaining opportunities, or budget justify it.
+Individual candidates may worsen, but preserve the best-so-far portfolio and allocate subsequent effort toward evidence-supported improvement. Docking is a ranking signal, not experimental activity.
+"""
+
+PORTFOLIO_SYSTEM_PROMPT = """You are the bounded strategy component of a protein-ligand optimization workflow.
+The objective is to improve the current co-crystal ligand against the supplied protein using host-provided facts and docking feedback. Docking ranks candidates; it does not prove experimental activity.
+Return exactly one JSON object with action PLAN_BATCH, QUERY, QUERY_BATCH, CONFIRM, or STOP. Do not output analysis, chain-of-thought, markdown, or invented facts.
+The host supplies a design_dossier containing all legal edit targets and compact library fragment panels with chemistry already computed. Use only those target IDs and fragment IDs, unless a host tool returns a refreshed panel. Do not query per-fragment properties already supplied, invent cut bonds, rewrite the whole ligand, or make multi-site edits.
+PLAN_BATCH schema: {"action":"PLAN_BATCH","rationale":"...","site_updates":[{"target_type":"atom|replacement_site","target_id":9,"status":"screening|promoted|active|deprioritized|discarded","reason":"..."}],"candidates":[{"target_type":"atom|replacement_site","target_id":9,"operation":"replace_hydrogen|replace_fragment","fragment_id":"...","hypothesis":{"site_evidence":"...","intended_change":"...","expected_effect":"...","risk":"...","success_criterion":"..."}}]}.
+For a later local child, parent_attempt may be added only when it is an attempt ID listed in available_parents; omit it for initial edits of the original ligand. Each candidate must be a single host-validated edit and include the five hypothesis fields. Sites compete for budget: continue improving directions, deprioritize or discard clearly inferior directions, and do not require every site to be closed before STOP.
+QUERY/QUERY_BATCH are only for decision-relevant uncertainty, such as a refreshed target-specific fragment panel, parent-specific environment, spatial information, or pose/interaction analysis. Each query must include why_needed and decision_impact. Prefer batch queries and do not spend consecutive rounds only querying.
+CONFIRM schema: {"action":"CONFIRM","candidate_ids":["attempt-01"],"reason":"..."}. Use confirmation only for a few diverse screening finalists. A candidate may worsen; preserve best-so-far and use evidence to allocate the next batch. STOP when quality, trend, remaining opportunities, or budget justifies it.
+"""
+
 
 class ResponsesClient:
     def __init__(
@@ -71,7 +92,9 @@ class ResponsesClient:
         codex_settings = self._load_codex_settings(codex_config_dir) if codex_config_dir else {}
         self.base_url = str(codex_settings.get("base_url", config["base_url"])).rstrip("/")
         self.model = inherited_model_override or str(codex_settings.get("model", config["model"]))
-        self.timeout = int(config.get("timeout_seconds", 600))
+        self.timeout = int(config.get("timeout_seconds", 120))
+        self.max_api_retries = int(config.get("max_api_retries", 2))
+        self.retry_delay_seconds = float(config.get("retry_delay_seconds", 2))
         self.max_output_tokens = int(config.get("max_output_tokens", 8192))
         self.reasoning_effort = str(
             config.get("reasoning_effort", codex_settings.get("reasoning_effort", "medium"))
@@ -140,7 +163,9 @@ class ResponsesClient:
         self.request_count += 1
         payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         payload_bytes = len(payload_json.encode("utf-8"))
-        estimated_input_tokens = max(1, (len(self.system_prompt.encode("utf-8")) + payload_bytes) // 4)
+        portfolio_mode = payload.get("mode") == "portfolio_planning" or payload.get("original_mode") == "portfolio_planning"
+        active_system_prompt = PORTFOLIO_SYSTEM_PROMPT if portfolio_mode else self.system_prompt
+        estimated_input_tokens = max(1, (len(active_system_prompt.encode("utf-8")) + payload_bytes) // 4)
         if self.progress:
             self.progress("llm_request_started", {
                 "request": self.request_count,
@@ -159,7 +184,7 @@ class ResponsesClient:
         body = {
             "model": self.model,
             "input": [
-                {"role": "developer", "content": [{"type": "input_text", "text": self.system_prompt}]},
+                {"role": "developer", "content": [{"type": "input_text", "text": active_system_prompt}]},
                 {
                     "role": "user",
                     "content": [{"type": "input_text", "text": json.dumps(payload, ensure_ascii=False)}],
@@ -179,7 +204,7 @@ class ResponsesClient:
             body = {
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": self.system_prompt},
+                    {"role": "system", "content": active_system_prompt},
                     {"role": "user", "content": payload_json},
                 ],
                 "max_tokens": self.repair_max_output_tokens if is_repair else self.max_output_tokens,
@@ -197,10 +222,9 @@ class ResponsesClient:
                 "--fail-with-body",
                 "--http1.1",
                 "--retry",
-                "8",
-                "--retry-all-errors",
+                str(self.max_api_retries),
                 "--retry-delay",
-                "2",
+                str(self.retry_delay_seconds),
                 "--connect-timeout",
                 "30",
                 "--max-time",
@@ -306,8 +330,8 @@ class ResponsesClient:
             "instruction": (
                 "The previous model response was incomplete or did not contain the final JSON decision. "
                 "Ignore its reasoning and choose the next valid workflow action from the supplied state. "
-                "Return exactly one compact JSON object with action QUERY, QUERY_BATCH, READY, "
-                "MARK_UNMODIFIABLE, STOP, or PROPOSE_TOOL. Do not include analysis or markdown."
+                "Return exactly one compact JSON object with action QUERY, QUERY_BATCH, READY, PLAN_BATCH, "
+                "CONFIRM, MARK_UNMODIFIABLE, STOP, or PROPOSE_TOOL. Do not include analysis or markdown."
             ),
         }
         return self._complete_json(repair_payload, allow_repair=False)

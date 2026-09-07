@@ -247,6 +247,32 @@ def test_fragment_library_is_searchable_and_auditable():
     assert result["library_path"].endswith("molecular_agent/data/fragments.json")
 
 
+def test_fragment_library_overview_and_diverse_panel_are_compact():
+    from molecular_agent.fragment_library import FragmentLibrary
+
+    library = FragmentLibrary(ROOT / "molecular_agent/data/fragments_unified.json")
+    overview = library.overview()
+    panel = library.panel(operation="substitute", limit=8, max_heavy_atoms=8)
+
+    assert overview["fragment_count"] > 20000
+    assert overview["operation_counts"]["substitute"] > 20000
+    assert len(panel) == 8
+    assert all("properties" not in item and "source_records" not in item for item in panel)
+    assert all({"fragment_id", "smiles", "chemical_tags", "molecular_weight"} <= item.keys() for item in panel)
+    assert len({(item["size_class"], tuple(item["chemical_tags"])) for item in panel}) > 1
+
+
+def test_design_dossier_contains_all_sites_and_fragment_panels():
+    tools = ToolRegistry(ComplexContext(TASK))
+    result, evidence = tools.execute("get_design_dossier", {"panel_size": 4})
+
+    assert result["status"] == "complete"
+    assert result["site_count"] == 19
+    assert all(len(site["fragment_panel"]) <= 4 for site in result["sites"])
+    assert all(site["supported_operation"] in {"replace_hydrogen", "replace_fragment"} for site in result["sites"])
+    assert evidence == {"design_dossier"}
+
+
 def test_unified_fragment_library_exposes_size_and_chemical_tags():
     from molecular_agent.fragment_library import FragmentLibrary
 
@@ -1099,6 +1125,7 @@ class CorrectInvalidClosureClient:
 
 def test_wrong_target_mark_unmodifiable_recovers_instead_of_crashing(tmp_path):
     workflow = Workflow(TASK, CorrectInvalidClosureClient(), tmp_path)
+    workflow.context.task["batch_optimization"]["enabled"] = False
     _prepare_locked_site_strategy(workflow, [
         {
             "target_type": "atom",
@@ -2058,6 +2085,75 @@ def test_api_non_object_response_is_diagnosed(tmp_path, monkeypatch):
     assert report["assistant_content"] == "[1,2]"
 
 
+class PortfolioPlanningClient:
+    def __init__(self):
+        self.calls = 0
+
+    def complete_json(self, payload):
+        assert payload["mode"] == "portfolio_planning"
+        self.calls += 1
+        if self.calls == 1:
+            assert payload["design_dossier"]["site_count"] == 19
+            return {
+                "action": "QUERY",
+                "question": "Refresh one compact polar fragment panel for atom 9.",
+                "tool": "get_fragment_panel",
+                "arguments": {
+                    "target_type": "atom",
+                    "target_id": 9,
+                    "size_classes": ["minimal", "small"],
+                    "chemical_tags": ["polar"],
+                    "limit": 4,
+                },
+                "why_needed": "Compare a focused polar direction with the initial diverse panel.",
+                "decision_impact": "Choose the first multi-site screening batch.",
+            }
+        if self.calls == 2:
+            assert payload["state"]["recent_tool_results"][0]["tool"] == "get_fragment_panel"
+            hypothesis = {
+                "site_evidence": "The host dossier reports an editable atom and measured local clearance.",
+                "intended_change": "Test a minimal local substituent.",
+                "expected_effect": "Probe pocket occupancy while preserving the co-crystal scaffold.",
+                "risk": "The edit may be neutral or geometrically rejected.",
+                "success_criterion": "Pass host geometry and enter screening docking.",
+            }
+            return {
+                "action": "PLAN_BATCH",
+                "rationale": "Compare two host-listed phenyl positions in one batch.",
+                "site_updates": [
+                    {"target_type": "atom", "target_id": 9, "status": "screening", "reason": "Good measured clearance."},
+                    {"target_type": "atom", "target_id": 10, "status": "screening", "reason": "Independent nearby vector."},
+                ],
+                "candidates": [
+                    {"target_type": "atom", "target_id": 9, "operation": "replace_hydrogen", "fragment_id": "curated-chloro", "hypothesis": hypothesis},
+                    {"target_type": "atom", "target_id": 10, "operation": "replace_hydrogen", "fragment_id": "curated-methyl", "hypothesis": hypothesis},
+                ],
+            }
+        return {
+            "action": "STOP",
+            "reason": "The bounded portfolio smoke batch is complete.",
+            "evidence": "Two independent two host-grounded candidates were screened.",
+        }
+
+
+def test_portfolio_workflow_keeps_optional_tools_and_batches_multiple_sites(tmp_path):
+    events = []
+    result = Workflow(
+        TASK,
+        PortfolioPlanningClient(),
+        tmp_path,
+        progress=lambda event, details: events.append((event, details)),
+    ).run()
+
+    assert result["result"]["status"] == "candidate_accepted"
+    assert len(result["result"]["attempts"]) == 2
+    assert result["state"]["batch_round"] == 1
+    assert result["state"]["site_board"]["atom:9"]["attempts"] == 1
+    assert result["state"]["site_board"]["atom:10"]["attempts"] == 1
+    assert any(item["tool"] == "get_fragment_panel" for item in result["state"]["observations"])
+    assert "candidate_geometry_accepted" in [event for event, _details in events]
+
+
 def test_scripted_workflow_produces_valid_local_candidate(tmp_path):
     events = []
     result = Workflow(
@@ -2662,6 +2758,7 @@ class RetryQueryClient:
 
 def test_rejected_candidate_geometry_cannot_satisfy_ready_gate(tmp_path):
     workflow = Workflow(TASK, RetryQueryClient(), tmp_path)
+    workflow.context.task["batch_optimization"]["enabled"] = False
     workflow.context.task["search_policy"] = {"mode": "family_coverage"}
     workflow.docking_adapter = NeverCalledDockingAdapter()
     with pytest.raises(RuntimeError, match="invalid READY decisions"):

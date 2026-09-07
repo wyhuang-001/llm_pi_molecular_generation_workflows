@@ -2,37 +2,45 @@
 
 一个从零实现的最小蛋白质-配体改造工作流。主工作流只读取当前项目中显式指定的任务和完整复合物 PDB，不扫描父目录，也不依赖原有工作流。配体三维坐标来自 PDB 的 `HETATM` 记录，化学键级、芳香性、电荷和氢数来自项目内对应的标准化学组件 CIF；运行时不把独立配体 SDF 作为输入契约。PDB `CONECT` 只用于校验原子连接集合，不再被当作完整键级定义。
 
+## 当前改动方案
+
+当前默认任务采用 `LLM_BATCHED_MULTISITE_OPTIMIZATION.md` 中的批量多位点优化方案：启动时由宿主准备位点 dossier 和片段化学信息，LLM 负责批量规划候选与搜索方向，宿主批量完成几何筛选和 docking；工具查询保留为处理不确定性的可选能力。
+
 ## 主工作流
 
 ```text
 任务 + 完整共晶复合物 PDB
-  -> 从 PDB 识别蛋白和配体坐标
-  -> 用本地化学组件 CIF 恢复并校验配体拓扑
-  -> LLM 自主选择结构或化学查询工具
-  -> LLM 选择有位点证据的带氢取代或非环侧链片段替换
-  -> RDKit 生成候选并保留参考配体中未替换骨架的坐标
-  -> 价态、净电荷、描述符和刚性蛋白碰撞检查
-  -> docking 生成并解析 top-N pose/score
-  -> docking 结果、完整历史和历史最佳反馈给 LLM，继续查询知识并改造
-  -> 达到 docking 平台期且 LLM 同意停止，或触发硬安全上限
+  -> 从 PDB 和本地 CIF 恢复蛋白、配体坐标与化学拓扑
+  -> 宿主一次性生成 ligand/pocket/interaction/全部合法位点 dossier
+  -> 宿主加载完整片段库，并为每个位点提供紧凑、多样的片段面板
+  -> LLM 用 PLAN_BATCH 为多个位点一次规划多个单点改造
+  -> 宿主批量完成 RDKit 构建、价态/电荷、碰撞和结构去重
+  -> 几何通过者使用 screening seed 依次 docking
+  -> 将各位点几何通过率、分数、pose、interaction 和 best-so-far 反馈给 LLM
+  -> LLM 继续规划、刷新特定片段面板、降权/舍弃位点或选择 CONFIRM
+  -> 少量 finalist 使用完整多 seed docking
+  -> LLM 主动停止，或达到批次、候选和请求预算
   -> 输出历史最佳候选和完整审计；RBFE 暂不进入实际循环
 ```
 
-主工作流没有固定 6 Å 口袋输入。`ComplexContext` 解析完整 PDB，后续如何选择、压缩或向 LLM 暴露结构上下文属于主工作流后续设计。
+主工作流仍解析完整 PDB，但只向 LLM 发送有界的结构化 dossier，不发送完整原始坐标和两万余条片段记录。旧的逐候选 READY、位点锁定和 Coverage 行为继续保留，供兼容任务和专项实验使用。
 
 docking 和 AsyncFEP/RBFE 保留为配置驱动 adapter，但当前实际设计循环只运行到 docking。多 seed docking 按配置顺序串行执行，避免同一 GPU 上并发 GNINA 进程导致原生崩溃；单个 reference 或 candidate seed 失败时默认最多重试 2 次、间隔 2 秒，可通过 `docking.max_retries` 和 `docking.retry_delay_seconds` 调整。每次执行都保存独立审计，最终 seed 结果记录 `execution_attempt_count`、`retry_count` 和 `retry_history`。docking 为 `complete` 时，top-N pose 属性和外部程序审计会反馈给 LLM；LLM 可查询新证据并更换位点或片段。若 LLM 不修改候选，循环以 `no_candidate_revision_after_docking` 停止，避免重复 docking。RBFE 配置暂时保留但不会被主工作流或 ablation 调用，结果明确记录为 `deferred`，不会伪造分数。
 
-## LLM 何时停止调用工具
+## LLM 与工具边界
 
-LLM 每轮可以返回 `QUERY`、`READY` 或 `PROPOSE_TOOL`，并自主决定查询顺序和查询内容。工具目录是能力菜单，不是固定查询流程。宿主当前只保留必要的确定性安全限制：
+默认批量优化支持 `PLAN_BATCH`、`QUERY`、`QUERY_BATCH`、`CONFIRM` 和 `STOP`：
 
-- 最终编辑原子必须查询过局部蛋白环境；
-- `replace_hydrogen` 的最终编辑原子必须查询过增长空间，并且存在可替换氢；
-- `replace_fragment` 必须先调用 `list_fragment_replacement_sites`，再选择宿主返回的 `replacement_site_id`；该操作不使用氢取代式增长探针；
-- `validate_candidate_geometry` 必须针对最终完整 transformation 执行；主工作流会在 READY 后再次确定性验证，最终 ablation 组还要求该工具结果为 `accepted`。
-- 候选必须通过 RDKit 解析、价态、净电荷和刚性碰撞检查。
+- 基础配体、口袋、位点和片段化学信息由 `get_design_dossier` 一次性提供，不允许再逐条查询片段基础性质；
+- 工具调用只用于刷新某个位点的片段面板、parent-specific 环境、空间形状或 docking/interaction 不确定性；
+- 每个补充查询必须说明 `why_needed` 和 `decision_impact`，连续纯查询轮数受限；
+- `PLAN_BATCH` 中每个候选必须引用宿主提供的合法位点和该位点已提供的真实 `fragment_id`；
+- 每个候选必须说明位点证据、结构改变、预期作用、风险和成功标准；
+- 宿主负责精确 transformation、RDKit 构建、几何验证、去重和 docking，LLM 不能自由猜测切键或重写整个配体；
+- 位点可被 `promoted`、`deprioritized` 或 `discarded`，但不要求全部关闭后才能停止；
+- 达到批次、候选、LLM 请求或停滞预算时，宿主可以停止；不设置总运行时间上限。
 
-宿主还会阻止完全重复的工具调用并限制最大上下文轮数。重复按规范化的 `tool + 完整 arguments` 判断，不是只按原子判断。单个重复调用会复用已有观察结果并留下审计记录；LLM 可用 `QUERY_BATCH` 一次请求多个互不依赖的工具，批内重复项会跳过，其他新调用继续执行。依赖前一个结果的查询仍应使用多轮 `QUERY`。若现有工具不足，`PROPOSE_TOOL` 只生成待审核提案，不直接执行任意代码。
+旧模式仍支持 `READY`、`MARK_UNMODIFIABLE` 和原有证据门，用于兼容及 Coverage 实验。
 
 ## 编辑操作和片段库
 
@@ -48,7 +56,7 @@ LLM 每轮可以返回 `QUERY`、`READY` 或 `PROPOSE_TOOL`，并自主决定查
 {"action":"READY","operation":"replace_fragment","replacement_site_id":"replacement-site-005","fragment_id":"fluoro","fragment_smiles":"[*:1]F","understanding":"...","edit_hypothesis":"..."}
 ```
 
-宿主由 `replacement_site_id` 恢复切键和方向，不接受 LLM 自由指定切键或删除集合。两种操作都必须针对完整 transformation 调用 `validate_candidate_geometry`，并在实际 design 阶段再次执行相同确定性构建和碰撞检查。当前仍是单步搜索：每个候选都只对原始共晶配体执行一次 transformation，不会在上一轮候选上叠加第二处改造。
+宿主由 `replacement_site_id` 恢复切键和方向，不接受 LLM 自由指定切键或删除集合。默认批量模式由宿主对每个 transformation 自动执行精确构建和碰撞检查，不要求 LLM 逐个调用 `validate_candidate_geometry`。候选始终只包含一个编辑位点；后续轮次可选择已验证 parent 在同一位点继续局部替换，但不在初始探索中组合多个位点。
 
 离线种子库位于 `molecular_agent/data/fragments.json`，可用 `search_fragment_library` 和 `get_fragment_record` 查询。常见化学名称通过 SMARTS 子结构匹配，其他词使用元数据文本匹配；结果严格遵守记录的 `operation` 或 `allowed_operations`，不会把仅标记为 `substitute` 的记录伪装成 `replace_fragment` 候选。项目提供 ChEMBL 导入器；ChEMBL 提供公开 REST API 和官方 FTP 下载，数据采用 CC BY-SA 3.0，并要求保留 ChEMBL ID、release 和署名。
 
@@ -91,9 +99,9 @@ mamba run -n molecular-agent-docking python scripts/build_unified_fragment_libra
 
 `docking_optimization` 配置主指标、显著改善阈值、seed 稳定性和硬安全上限。每轮同时记录原始 attempt score 与单调不下降的 best-so-far 轨迹；允许探索候选变差，不会伪造成每轮都改善。以 `minimizedAffinity` 为主指标时，candidate-reference delta 越负越好。候选必须达到 `minimum_seed_win_fraction` 才进入历史最佳竞争，quality 还会按 `seed_stddev_penalty * seed标准差` 扣分，避免由单一 seed 驱动选择。
 
-工作流支持 `search_policy.mode=adaptive` 的证据驱动搜索。启用 `site_lock_enabled` 后，LLM 先通过 `assess_edit_sites` 工具提交 host 校验过的位点优先级和位点类型（`core_anchor`、`pocket_extension`、`solvent_exposed`、`linker_or_sidechain` 或 `uncertain`）。宿主按该策略锁定当前最高优先级的开放位点，并将 `active_target`、`site_search` 和局部统计反馈给 LLM；`minimum_local_attempts` 和 `minimum_local_families` 是显式关闭前的证据下限，`local_patience` 只作为要求 LLM 重新评估的信号，不会自动把位点标为 plateau 或切换到下一位点。位点只有在 LLM 使用有证据理由的 `MARK_UNMODIFIABLE` 关闭后才切换。这样可形成不设局部尝试上限的位点内局部 SAR，而不是每轮在所有位点之间跳转。
+默认 `batch_optimization.enabled=true` 时采用多位点 portfolio 搜索。首轮可同时测试多个位点；后续根据各位点几何通过率、docking quality、seed 稳定性、pose 共识和相互作用变化动态分配预算。表现落后的位点可以降权或舍弃，不需要逐一声明不可修改。候选可以变差，但程序持续维护 best-so-far 和 elite archive。
 
-`generate_site_candidate_batch` 可由 LLM 调用，为一个锁定位点从 operation-compatible 片段库中批量取出候选，并执行确定性构建和刚性蛋白碰撞预筛选；它不执行 docking，也不替代 READY 的完整证据门。宿主会在发送给 LLM 的位点摘要中计算 `geometry_feasible_not_docked`：它是批次或确定性几何检查已接受、但尚未出现在 docking history 中的 transformation；这不是对整个片段库的穷举，未被查询的片段仍只是潜在候选。完整 observation、GNINA 原始输出、pose、候选结构和 provenance 只保存在运行目录，LLM 输入使用去重后的基线/当前位点/最近窗口和结构化指标摘要。`minimum_distinct_transformations_per_target` 仍是 adaptive 模式的最低多样性门槛。LLM 必须读取每个位点的化学环境、空间方向、已有相互作用、片段性质、attachment-centered 3D profile、docking 分数、seed 稳定性、pose 共识和相互作用变化，再决定继续提出新的化学上不同的 transformation，或使用有证据理由的 `MARK_UNMODIFIABLE` 关闭该位点。几何拒绝也会作为后续搜索证据反馈给 LLM。所有尝试由独立的 `exploration_attempts` 审计账本记录，不会把几何拒绝误认为成功 docking。每次 docking 的主指标、相对参考的表现、历史最佳、seed 稳定性、pose 一致性、相互作用变化和失败原因都会反馈给 LLM。候选变差不会单独触发停止；当前没有局部 `maximum_local_attempts`，`hard_max_attempts` 仍只作为防止进程失控的全局安全上限，而不是科学收敛条件。重复 transformation、重复工具调用和连续无进展决策会被拦截或要求 LLM 修正；最终 `candidate_path` 指向历史最佳候选，而不是最后一次尝试。
+screening 默认只使用 seed 17；LLM 用 `CONFIRM` 选择最多两个 finalist 后，再使用 17、29、43 做完整确认。旧的 `search_policy.mode=adaptive`、site lock、`READY` 和 `MARK_UNMODIFIABLE` 流程仍保留，但只在关闭批量模式后使用。
 
 这类收敛只表示固定 docking 协议下的搜索平台，不等价于实验活性或真实结合自由能收敛。
 
@@ -142,23 +150,23 @@ DeepSeek 暂按官方端点 `https://api.deepseek.com/v1`、模型 ID `deepseek-
 新建真实测试（会调用付费 LLM 和 GNINA；使用唯一运行目录）：
 
 ```bash
-RUN_ROOT=runs/current-$(date +%Y%m%d-%H%M%S) CONTEXT_ROUNDS=1024 EDIT_ATTEMPTS=160 ./run_docking_loop_test.sh --real --llm current
+RUN_ROOT=runs/current-$(date +%Y%m%d-%H%M%S) ./run_docking_loop_test.sh --real --llm current
 ```
 
 ```bash
-RUN_ROOT=runs/gpt-5.4-mini-$(date +%Y%m%d-%H%M%S) CONTEXT_ROUNDS=1024 EDIT_ATTEMPTS=160 ./run_docking_loop_test.sh --real --llm gpt-5.4-mini
+RUN_ROOT=runs/gpt-5.4-mini-$(date +%Y%m%d-%H%M%S) ./run_docking_loop_test.sh --real --llm gpt-5.4-mini
 ```
 
 ```bash
-RUN_ROOT=runs/gpt-5.6-luna-$(date +%Y%m%d-%H%M%S) CONTEXT_ROUNDS=1024 EDIT_ATTEMPTS=160 ./run_docking_loop_test.sh --real --llm gpt-5.6-luna
+RUN_ROOT=runs/gpt-5.6-luna-$(date +%Y%m%d-%H%M%S) ./run_docking_loop_test.sh --real --llm gpt-5.6-luna
 ```
 
 ```bash
-RUN_ROOT=runs/doubao-$(date +%Y%m%d-%H%M%S) CONTEXT_ROUNDS=1024 EDIT_ATTEMPTS=160 ./run_docking_loop_test.sh --real --llm doubao
+RUN_ROOT=runs/doubao-$(date +%Y%m%d-%H%M%S) ./run_docking_loop_test.sh --real --llm doubao
 ```
 
 ```bash
-RUN_ROOT=runs/deepseek-$(date +%Y%m%d-%H%M%S) CONTEXT_ROUNDS=1024 EDIT_ATTEMPTS=160 ./run_docking_loop_test.sh --real --llm deepseek
+RUN_ROOT=runs/deepseek-$(date +%Y%m%d-%H%M%S) ./run_docking_loop_test.sh --real --llm deepseek
 ```
 
 在未完成的旧运行中显式换用 DeepSeek：

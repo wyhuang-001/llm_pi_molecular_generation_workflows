@@ -140,7 +140,7 @@ def test_chat_completions_wire_format_and_repair(config, monkeypatch, truncated)
     client = ResponsesClient(config, llm_profile="deepseek", progress=lambda e, d: events.append((e, d)))
     assert client.complete_json({"mode": "test"})["action"] == "QUERY"
     assert len(calls) == (2 if truncated else 1)
-    assert calls[0]["max_tokens"] == 8192
+    assert calls[0]["max_tokens"] == 4096
     if truncated:
         assert calls[1]["max_tokens"] == 4096
     assert events[-1][1]["cached_input_tokens"] == 50

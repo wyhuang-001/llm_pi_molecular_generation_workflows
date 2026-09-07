@@ -123,7 +123,8 @@ class Workflow:
             raise RuntimeError(
                 f"Run already has a final result: {self.run_dir / 'result.json'}; use a new run directory"
             )
-        state_paths = sorted(
+        checkpoint_path = self.run_dir / "state-checkpoint.json"
+        state_paths = [checkpoint_path] if checkpoint_path.exists() else sorted(
             self.run_dir.glob("observation-*.json"),
             key=lambda path: int(path.stem.rsplit("-", 1)[1]),
         )
@@ -166,6 +167,10 @@ class Workflow:
         self.state.site_strategy = saved.get("site_strategy")
         self.state.active_target = saved.get("active_target")
         self.state.site_search = dict(saved.get("site_search", {}))
+        self.state.design_dossier = saved.get("design_dossier")
+        self.state.batch_history = list(saved.get("batch_history", []))
+        self.state.site_board = dict(saved.get("site_board", {}))
+        self.state.batch_round = int(saved.get("batch_round", 0))
         self.state.convergence = dict(saved.get("convergence", self.state.convergence))
         # Rebuild derived memory from authoritative persisted observations/events.
         self.state.global_memory = {}
@@ -796,6 +801,259 @@ class Workflow:
         if details:
             record["details"] = details
 
+    def _batch_settings(self) -> dict[str, Any]:
+        configured = self.context.task.get("batch_optimization") or {}
+        return {
+            "enabled": bool(configured.get("enabled", False)),
+            "panel_size": int(configured.get("panel_size", 6)),
+            "batch_size": int(configured.get("batch_size", 8)),
+            "max_batches": int(configured.get("max_batches", 3)),
+            "max_screening_candidates": int(configured.get("max_screening_candidates", 12)),
+            "max_confirmation_candidates": int(configured.get("max_confirmation_candidates", 2)),
+            "screening_seeds": [int(seed) for seed in configured.get("screening_seeds", [17])],
+            "confirmation_seeds": [int(seed) for seed in configured.get("confirmation_seeds", [17, 29, 43])],
+            "max_llm_decisions": int(configured.get("max_llm_decisions", 8)),
+            "max_query_only_rounds": int(configured.get("max_query_only_rounds", 2)),
+            "stagnation_batches": int(configured.get("stagnation_batches", 2)),
+        }
+
+    def _batch_enabled(self) -> bool:
+        # Scripted clients intentionally keep the legacy deterministic smoke path;
+        # real clients use the bounded portfolio path configured for the task.
+        return bool(
+            (self.context.task.get("batch_optimization") or {}).get("enabled", False)
+            and not isinstance(self.client, ScriptedDemoClient)
+        )
+
+    def _batch_state_view(self) -> dict[str, Any]:
+        settings = self._batch_settings()
+        return {
+            "task": self.state.task,
+            "mode": "portfolio_batch_optimization",
+            "round": self.state.batch_round,
+            "budget": {
+                "max_batches": settings["max_batches"],
+                "max_screening_candidates": settings["max_screening_candidates"],
+                "max_confirmation_candidates": settings["max_confirmation_candidates"],
+                "max_llm_decisions": settings["max_llm_decisions"],
+            },
+            "site_board": self._llm_safe_value(self.state.site_board),
+            "latest_batch": self._llm_safe_value(self.state.batch_history[-1:]),
+            "best_candidates": self._llm_safe_value(self.state.elite_archive[:6]),
+            "available_parents": [
+                self._llm_safe_value(metadata)
+                for attempt, metadata in sorted(self.parent_metadata.items())
+                if attempt > 0
+            ],
+            "docking_history": self._compact_docking_history()[-10:],
+            "attempted_transformations": [
+                self._compact_transformation(item.get("transformation"))
+                for item in self.state.exploration_attempts
+                if item.get("source") in {"batch_plan", "design"}
+            ][-30:],
+            "recent_tool_results": [
+                {
+                    "tool": item.tool,
+                    "arguments": item.arguments,
+                    "result": self._compact_observation_result(item.result),
+                }
+                for item in self.state.observations[-6:]
+                if item.tool != "get_design_dossier"
+            ],
+        }
+
+    def _batch_payload(self, instruction: str, feedback: dict[str, Any] | None = None) -> dict[str, Any]:
+        settings = self._batch_settings()
+        payload = {
+            "mode": "portfolio_planning",
+            "state": self._batch_state_view(),
+            "objective": {
+                "task": self.state.task,
+                "reference": "original co-crystal ligand",
+                "primary_metric": self._optimization_settings()["primary_metric"],
+                "constraint": "single-site, host-validated transformation; docking ranks candidates but does not prove activity",
+            },
+            "design_dossier": self._llm_safe_value(self.state.design_dossier),
+            "instruction": instruction,
+            "tool_catalog": {
+                name: details
+                for name, details in self.tools.catalog().items()
+                if name in {
+                    "get_fragment_panel", "get_atom_environment", "check_growth_space",
+                    "get_replacement_site_spatial_profile", "get_fragment_spatial_profile",
+                    "detect_basic_interactions", "get_ligand_fragment",
+                }
+            },
+            "limits": {
+                "batch_size": settings["batch_size"],
+                "max_llm_decisions": settings["max_llm_decisions"],
+            },
+        }
+        if feedback is not None:
+            payload["latest_feedback"] = self._llm_safe_value(feedback)
+        return payload
+
+    def _validate_portfolio_query(self, decision: dict[str, Any]) -> None:
+        allowed = {
+            "get_fragment_panel", "get_atom_environment", "check_growth_space",
+            "get_replacement_site_spatial_profile", "get_fragment_spatial_profile",
+            "detect_basic_interactions", "get_ligand_fragment",
+        }
+        queries = [decision] if decision.get("action") == "QUERY" else decision.get("queries")
+        if not isinstance(queries, list) or not queries:
+            raise RuntimeError("Portfolio QUERY_BATCH requires queries")
+        for query in queries:
+            if not isinstance(query, dict) or query.get("tool") not in allowed:
+                raise RuntimeError(
+                    "Portfolio tools are limited to uncertainty resolution and refreshed fragment panels; "
+                    "basic supplied facts and per-fragment property queries are not allowed"
+                )
+            if not isinstance(query.get("why_needed"), str) or not query["why_needed"].strip():
+                raise RuntimeError("Each portfolio tool query requires why_needed")
+            if not isinstance(query.get("decision_impact"), str) or not query["decision_impact"].strip():
+                raise RuntimeError("Each portfolio tool query requires decision_impact")
+
+    def _batch_target_exists(self, target_type: str, target_id: Any) -> bool:
+        return any(
+            item.get("target_type") == target_type and item.get("target_id") == target_id
+            for item in (self.state.design_dossier or {}).get("sites", [])
+        )
+
+    def _batch_record_site_updates(self, updates: Any) -> None:
+        if not isinstance(updates, list):
+            return
+        allowed = {"screening", "promoted", "active", "deprioritized", "discarded"}
+        for item in updates:
+            if not isinstance(item, dict):
+                raise RuntimeError("PLAN_BATCH site_updates must contain objects")
+            target_type, target_id = item.get("target_type"), item.get("target_id")
+            if target_type not in {"atom", "replacement_site"} or not self._batch_target_exists(target_type, target_id):
+                raise RuntimeError(f"PLAN_BATCH references unknown target: {target_type}:{target_id}")
+            status = item.get("status", "active")
+            reason = item.get("reason")
+            if status not in allowed or not isinstance(reason, str) or not reason.strip():
+                raise RuntimeError("PLAN_BATCH site update requires a valid status and reason")
+            key = self._target_key(target_type, target_id)
+            current = dict(self.state.site_board.get(key) or {})
+            current.update({"target_type": target_type, "target_id": target_id, "status": status, "reason": reason.strip()})
+            self.state.site_board[key] = current
+
+    def _batch_available_fragment_ids(self, target_type: str, target_id: Any) -> set[str]:
+        available: set[str] = set()
+        site = next(
+            (
+                item for item in (self.state.design_dossier or {}).get("sites", [])
+                if item.get("target_type") == target_type and item.get("target_id") == target_id
+            ),
+            None,
+        )
+        for record in (site or {}).get("fragment_panel", []):
+            if isinstance(record.get("fragment_id"), str):
+                available.add(record["fragment_id"])
+        for observation in self.state.observations:
+            if observation.tool != "get_fragment_panel":
+                continue
+            result = observation.result or {}
+            if result.get("target_type") != target_type or result.get("target_id") != target_id:
+                continue
+            for record in result.get("fragments", []):
+                if isinstance(record.get("fragment_id"), str):
+                    available.add(record["fragment_id"])
+        return available
+
+    def _batch_transformation(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(candidate, dict):
+            raise RuntimeError("Each PLAN_BATCH candidate must be an object")
+        target_type, target_id = candidate.get("target_type"), candidate.get("target_id")
+        if not self._batch_target_exists(target_type, target_id):
+            raise RuntimeError(f"PLAN_BATCH references unknown target: {target_type}:{target_id}")
+        if candidate.get("operation") not in {"replace_hydrogen", "replace_fragment"}:
+            raise RuntimeError("PLAN_BATCH candidate has unsupported operation")
+        fragment_id = candidate.get("fragment_id")
+        if not isinstance(fragment_id, str):
+            raise RuntimeError("PLAN_BATCH requires a library fragment_id")
+        if fragment_id not in self._batch_available_fragment_ids(target_type, target_id):
+            raise RuntimeError(
+                f"Fragment {fragment_id} was not supplied for target {target_type}:{target_id}; "
+                "request a refreshed target-specific panel before using it"
+            )
+        parent_attempt = candidate.get("parent_attempt")
+        # Some models use 1 as an informal first-parent marker. During the
+        # initial batch only parent 0 exists, so normalize that marker safely.
+        if parent_attempt == 1 and len(self.parent_candidates) == 1 and 0 in self.parent_candidates:
+            parent_attempt = None
+        if parent_attempt is not None and parent_attempt not in self.parent_candidates:
+            raise RuntimeError(
+                f"Unknown parent_attempt {parent_attempt}; omit it for the original ligand or choose an available parent"
+            )
+        decision = {
+            "action": "READY",
+            "understanding": str((candidate.get("hypothesis") or {}).get("site_evidence", "batch site evidence")),
+            "edit_hypothesis": str((candidate.get("hypothesis") or {}).get("intended_change", "batch transformation")),
+            "operation": candidate.get("operation"),
+            "fragment_id": candidate.get("fragment_id"),
+            "parent_attempt": parent_attempt,
+        }
+        if target_type == "atom":
+            decision["edit_atom_index"] = target_id
+        else:
+            decision["replacement_site_id"] = target_id
+        return self._transformation(decision)
+
+    def _validate_batch_plan(self, decision: dict[str, Any]) -> list[dict[str, Any]]:
+        candidates = decision.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            raise RuntimeError("PLAN_BATCH requires a non-empty candidates array")
+        settings = self._batch_settings()
+        if len(candidates) > settings["batch_size"]:
+            raise RuntimeError(f"PLAN_BATCH exceeds batch_size={settings['batch_size']}")
+        self._batch_record_site_updates(decision.get("site_updates", []))
+        normalized = []
+        seen = set()
+        for candidate in candidates:
+            transformation = self._batch_transformation(candidate)
+            key = self._transformation_key(transformation)
+            if key in seen or self._transformation_was_attempted(transformation):
+                raise RuntimeError("PLAN_BATCH contains a duplicate or already attempted transformation")
+            seen.add(key)
+            hypothesis = candidate.get("hypothesis")
+            if not isinstance(hypothesis, dict) or any(
+                not isinstance(hypothesis.get(key), str) or not hypothesis.get(key).strip()
+                for key in ("site_evidence", "intended_change", "expected_effect", "risk", "success_criterion")
+            ):
+                raise RuntimeError("Each PLAN_BATCH candidate requires a complete evidence-backed hypothesis")
+            normalized.append({"candidate": candidate, "transformation": transformation})
+        return normalized
+
+    def _record_batch_observation(self, batch: dict[str, Any]) -> None:
+        self.state.batch_history.append(batch)
+        self.state.batch_history = self.state.batch_history[-8:]
+        self._write_json(f"batch-{self.state.batch_round:02d}.json", batch)
+        self._write_json("state-checkpoint.json", self.state.compact_view())
+
+    def _batch_dossier(self) -> None:
+        arguments = {"panel_size": self._batch_settings()["panel_size"]}
+        self._emit("tool_started", {"tool": "get_design_dossier", "arguments": arguments})
+        result, evidence = self.tools.execute("get_design_dossier", arguments)
+        observation = ToolObservation("get_design_dossier", arguments, result, evidence)
+        self.state.observations.append(observation)
+        self.state.evidence.update(evidence | {"edit_site_environment", "edit_site_geometry"})
+        self.state.call_signatures.add(self._signature(observation.tool, observation.arguments))
+        self.state.design_dossier = result
+        for site in result.get("sites", []):
+            key = self._target_key(site["target_type"], site["target_id"])
+            self.state.site_board.setdefault(key, {
+                "target_type": site["target_type"], "target_id": site["target_id"],
+                "status": "unexplored", "attempts": 0, "best_quality": None,
+            })
+        self._write_json("design-dossier.json", result)
+        self._write_json("observation-01.json", self.state.compact_view())
+        self._emit("tool_completed", {
+            "tool": "get_design_dossier",
+            "evidence": sorted(evidence),
+            "result": {"status": result.get("status"), "site_count": result.get("site_count")},
+        })
+
     def _query_payload(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = {
             "mode": "context_collection",
@@ -837,6 +1095,13 @@ class Workflow:
             details.update({"tool": decision.get("tool"), "arguments": decision.get("arguments")})
         elif action == "QUERY_BATCH":
             details["queries"] = decision.get("queries")
+        elif action == "PLAN_BATCH":
+            details.update({
+                "candidate_count": len(decision.get("candidates", [])) if isinstance(decision.get("candidates"), list) else None,
+                "site_updates": decision.get("site_updates"),
+            })
+        elif action == "CONFIRM":
+            details.update({"candidate_ids": decision.get("candidate_ids")})
         elif action == "READY":
             details.update({
                 "operation": decision.get("operation", "replace_hydrogen"),
@@ -1067,6 +1332,8 @@ class Workflow:
             "QUERY",
             "QUERY_BATCH",
             "READY",
+            "PLAN_BATCH",
+            "CONFIRM",
             "MARK_UNMODIFIABLE",
             "PROPOSE_TOOL",
             "STOP",
@@ -1373,10 +1640,11 @@ class Workflow:
 
     def _search_policy(self) -> dict[str, Any]:
         configured = self.context.task.get("search_policy") or {}
-        mode = str(configured.get("mode", "family_coverage"))
+        batch_mode = self._batch_enabled()
+        mode = "portfolio" if batch_mode else str(configured.get("mode", "family_coverage"))
         return {
             "mode": mode,
-            "site_lock_enabled": bool(configured.get("site_lock_enabled", False)),
+            "site_lock_enabled": False if batch_mode else bool(configured.get("site_lock_enabled", False)),
             "site_strategy_required": bool(configured.get("site_strategy_required", False)),
             "minimum_prioritized_sites": int(configured.get("minimum_prioritized_sites", 1)),
             "local_patience": int(configured.get("local_patience", 3)),
@@ -1866,8 +2134,9 @@ class Workflow:
                 mode = "decision_repair"
                 instruction = (
                     "Return exactly one complete JSON object with a top-level string action. "
-                    "The action must be one of QUERY, QUERY_BATCH, READY, MARK_UNMODIFIABLE, STOP, or "
-                    "PROPOSE_TOOL; it must never be a registered tool name. Use QUERY with question, tool, "
+                    "The action must be one of QUERY, QUERY_BATCH, READY, PLAN_BATCH, CONFIRM, "
+                    "MARK_UNMODIFIABLE, STOP, or PROPOSE_TOOL; it must never be a registered tool name. "
+                    "Use QUERY with question, tool, "
                     "and arguments; QUERY_BATCH with a queries array; READY with a complete transformation; "
                     "MARK_UNMODIFIABLE with a precise target, scope, and reason; STOP with a reason; or "
                     "PROPOSE_TOOL. Do not return bare tool arguments or explanatory prose."
@@ -3117,7 +3386,7 @@ class Workflow:
         )
         validated_regions = self._validated_design_regions()
         docked_regions = self._docked_design_regions()
-        global_search = self._global_search_coverage()
+        global_search = {} if self._batch_enabled() else self._global_search_coverage()
         best_entry = next(
             (item for item in self.state.docking_history if item.get("attempt") == best_attempt),
             None,
@@ -3147,6 +3416,9 @@ class Workflow:
             "design_region_count_is_descriptive_only": True,
             "global_search": global_search,
             "next_decision": (
+                "Review the portfolio and choose another evidence-backed batch, confirmation, or STOP. "
+                "No exhaustive site-closure gate applies."
+                if self._batch_enabled() else
                 "LLM should continue with a new evidence-backed transformation. STOP is blocked until "
                 "global_search.complete is true, unless hard_max_attempts is reached."
             ),
@@ -3191,7 +3463,9 @@ class Workflow:
         )
         self.state.convergence["termination_reason"] = stopping_reason
         self.state.convergence["converged"] = False
-        self.state.convergence["global_search"] = self._global_search_coverage()
+        self.state.convergence["global_search"] = (
+            {} if self._batch_enabled() else self._global_search_coverage()
+        )
         rbfe = {
             "stage": "rbfe",
             "status": "deferred",
@@ -3204,13 +3478,446 @@ class Workflow:
             "candidate_path": best["candidate_path"],
             "reference_path": str(reference_path),
             "attempts": history,
-            "docking": best.get("docking", {}),
+            "docking": best.get("confirmation") or best.get("docking", {}),
             "docking_history": self.state.docking_history,
             "elite_archive": self.state.elite_archive,
             "convergence": self.state.convergence,
             "rbfe": rbfe,
             "fep": rbfe,
         }
+
+    def _batch_screen_and_dock(
+        self,
+        planned: list[dict[str, Any]],
+        history: list[dict[str, Any]],
+        seen_candidate_smiles: dict[str, int],
+        reference_path: Path,
+        receptor_path: Path,
+    ) -> dict[str, Any]:
+        """Screen one LLM batch, then dock accepted structures without another LLM turn."""
+        screening = {
+            "candidates": [
+                {
+                    **item["candidate"],
+                    **item["transformation"],
+                    "parent_attempt": item["transformation"].get("parent_attempt"),
+                    "target_type": item["candidate"].get("target_type"),
+                    "target_id": item["candidate"].get("target_id"),
+                    "hypothesis": item["candidate"].get("hypothesis"),
+                }
+                for item in planned
+            ]
+        }
+        screen_result = self.tools.screen_candidate_batch(screening["candidates"])
+        accepted = screen_result.get("accepted", [])
+        rejected = screen_result.get("rejected", [])
+        for item in accepted + rejected:
+            transformation = item.get("transformation") or {}
+            self._record_exploration_attempt(
+                transformation,
+                "batch_geometry_accepted" if item in accepted else "geometry_rejected",
+                "batch_plan",
+                reason=item.get("error"),
+            )
+        batch_result = {
+            "batch_round": self.state.batch_round,
+            "submitted": len(planned),
+            "geometry_accepted": len(accepted),
+            "geometry_rejected": len(rejected),
+            "screening": [
+                {
+                    "position": item.get("position"),
+                    "target_type": self._transformation_target(item.get("transformation") or {}).get("target_type"),
+                    "target_id": self._transformation_target(item.get("transformation") or {}).get("target_id"),
+                    "transformation": self._compact_transformation(item.get("transformation")),
+                    "status": item.get("status"),
+                    "canonical_smiles": item.get("canonical_smiles"),
+                    "failure_class": item.get("failure_class"),
+                    "error": item.get("error"),
+                    "hypothesis": item.get("hypothesis"),
+                }
+                for item in accepted + rejected
+            ],
+            "docking": [],
+        }
+        if not reference_path.exists():
+            write_sdf(EditResult(self.context.ligand, {"status": "reference"}), reference_path, name="reference-ligand")
+        if not receptor_path.exists():
+            self.context.write_receptor_pdb(receptor_path)
+        settings = self._batch_settings()
+        for item in accepted:
+            transformation = dict(item.get("transformation") or {})
+            candidate_smiles = item.get("canonical_smiles")
+            if not isinstance(candidate_smiles, str) or candidate_smiles in seen_candidate_smiles:
+                continue
+            attempt = len(history) + 1
+            seen_candidate_smiles[candidate_smiles] = attempt
+            parent_attempt = transformation.get("parent_attempt")
+            parent = self._resolve_parent_candidate(parent_attempt)
+            result = apply_transformation(parent, transformation, self.context.protein_atoms, seed=17)
+            self.state.evidence.add("candidate_geometry")
+            self._emit("candidate_geometry_accepted", {
+                "attempt": attempt,
+                "canonical_smiles": candidate_smiles,
+                "property_delta": result.report.get("property_delta"),
+            })
+            target = self._transformation_target(transformation)
+            site_key = self._target_key(target["target_type"], target["target_id"])
+            site_state = self.state.site_board.setdefault(site_key, {
+                "target_type": target["target_type"], "target_id": target["target_id"],
+                "status": "screening", "attempts": 0, "best_quality": None,
+            })
+            site_state["attempts"] = int(site_state.get("attempts", 0)) + 1
+            candidate_path = self.run_dir / f"candidate-{attempt:02d}.sdf"
+            write_sdf(result, candidate_path, name=f"candidate-{attempt:02d}")
+            report = {
+                "attempt": attempt,
+                "parent_attempt": parent_attempt,
+                "generation": transformation.get("generation", 1),
+                "decision": {"action": "PLAN_BATCH", "candidate": item.get("hypothesis")},
+                "transformation": transformation,
+                "validation": result.report,
+                "candidate_path": str(candidate_path),
+            }
+            self._emit("docking_started", {"attempt": attempt, "candidate_path": str(candidate_path)})
+            docking = self.docking_adapter.run_with_reference_baseline(
+                candidate_path=candidate_path,
+                receptor_path=receptor_path,
+                reference_path=reference_path,
+                output_dir=self.run_dir / f"docking-attempt-{attempt:02d}",
+                reference_output_dir=self.run_dir / "docking-reference-baseline",
+                reference_result=self.reference_docking_result,
+                seeds_override=settings["screening_seeds"],
+            ) if hasattr(self.docking_adapter, "run_with_reference_baseline") else self.docking_adapter.run(
+                candidate_path=candidate_path,
+                receptor_path=receptor_path,
+                reference_path=reference_path,
+                output_dir=self.run_dir / f"docking-attempt-{attempt:02d}",
+            )
+            report["docking"] = docking
+            history.append(report)
+            self._emit("docking_completed", {
+                "attempt": attempt,
+                "status": docking.get("status"),
+                "seed_count": docking.get("seed_count"),
+                "pose_count_per_seed": docking.get("pose_count_per_seed"),
+                "error": docking.get("error") or docking.get("message"),
+            })
+            self._record_candidate_history(report, transformation)
+            if docking.get("status") == "complete":
+                baseline = docking.get("reference_baseline")
+                if isinstance(baseline, dict) and baseline.get("status") == "complete":
+                    self.reference_docking_result = baseline
+                trend = self._record_docking_result(attempt, transformation, candidate_path, docking)
+                trend["evaluation_stage"] = "screening"
+                self._update_working_memory(transformation=transformation, docking_entry=trend)
+                if isinstance(trend.get("quality"), (int, float)) and (
+                    site_state.get("best_quality") is None
+                    or float(trend["quality"]) > float(site_state["best_quality"])
+                ):
+                    site_state["best_quality"] = float(trend["quality"])
+                    site_state["best_attempt"] = attempt
+                if trend.get("stability_eligible"):
+                    self.parent_candidates[attempt] = Chem.Mol(result.molecule)
+                    self.parent_metadata[attempt] = {
+                        "attempt": attempt,
+                        "generation": transformation.get("generation", 1),
+                        "target_type": self._transformation_target(transformation)["target_type"],
+                        "target_id": self._transformation_target(transformation)["target_id"],
+                        "quality": trend.get("quality"),
+                        "canonical_smiles": candidate_smiles,
+                        "candidate_path": str(candidate_path),
+                    }
+                batch_result["docking"].append({
+                    "attempt": attempt,
+                    "status": docking.get("status"),
+                    "quality": trend.get("quality"),
+                    "delta": trend.get("delta_candidate_minus_reference"),
+                    "seed_win_fraction": trend.get("seed_win_fraction"),
+                    "seed_stddev": trend.get("seed_stddev"),
+                    "is_new_best": trend.get("is_new_best"),
+                    "pose_consensus": trend.get("pose_consensus"),
+                    "interaction_consensus": trend.get("interaction_consensus"),
+                })
+            else:
+                batch_result["docking"].append({"attempt": attempt, "status": docking.get("status"), "error": docking.get("error")})
+            self._write_json(f"edit-attempt-{attempt:02d}.json", report)
+        self._write_json("docking-history.json", {"history": self.state.docking_history, "convergence": self.state.convergence})
+        self._record_batch_observation(batch_result)
+        return batch_result
+
+    def _batch_confirm(self, decision: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, Any]:
+        settings = self._batch_settings()
+        ids = decision.get("candidate_ids")
+        if not isinstance(ids, list) or not ids or len(ids) > settings["max_confirmation_candidates"]:
+            raise RuntimeError("CONFIRM requires a bounded non-empty candidate_ids array")
+        confirmations = []
+        for value in ids:
+            try:
+                attempt = int(str(value).split("-")[-1])
+            except ValueError as error:
+                raise RuntimeError(f"Invalid confirmation candidate ID: {value}") from error
+            report = next((item for item in history if item.get("attempt") == attempt), None)
+            if report is None or not report.get("candidate_path"):
+                raise RuntimeError(f"Unknown confirmation candidate: {value}")
+            if hasattr(self.docking_adapter, "run_with_reference_baseline"):
+                docking = self.docking_adapter.run_with_reference_baseline(
+                    candidate_path=Path(report["candidate_path"]),
+                    receptor_path=self.run_dir / "receptor-protein-only.pdb",
+                    reference_path=self.run_dir / "reference-ligand.sdf",
+                    output_dir=self.run_dir / f"confirmation-attempt-{attempt:02d}",
+                    reference_output_dir=self.run_dir / "docking-reference-baseline",
+                    reference_result=self.reference_docking_result,
+                    seeds_override=settings["confirmation_seeds"],
+                )
+            else:
+                docking = self.docking_adapter.run(
+                    candidate_path=Path(report["candidate_path"]),
+                    receptor_path=self.run_dir / "receptor-protein-only.pdb",
+                    reference_path=self.run_dir / "reference-ligand.sdf",
+                    output_dir=self.run_dir / f"confirmation-attempt-{attempt:02d}",
+                )
+            report["confirmation"] = docking
+            metric_name = self._optimization_settings()["primary_metric"]
+            metric = ((docking.get("comparison") or {}).get("metrics") or {}).get(metric_name) or {}
+            delta_summary = metric.get("delta_candidate_minus_reference") or {}
+            delta = delta_summary.get("mean")
+            direction = metric.get("direction")
+            raw_quality = (
+                (-float(delta) if direction == "lower_is_better" else float(delta))
+                if isinstance(delta, (int, float)) else None
+            )
+            seed_stddev = float(delta_summary.get("stddev", 0.0) or 0.0)
+            seed_win_fraction = float(metric.get("candidate_better_seed_fraction", 0.0) or 0.0)
+            eligible = (
+                raw_quality is not None
+                and seed_win_fraction + 1e-9 >= self._optimization_settings()["minimum_seed_win_fraction"]
+            )
+            confirmed_quality = (
+                raw_quality - self._optimization_settings()["seed_stddev_penalty"] * seed_stddev
+                if eligible else None
+            )
+            trend = next((item for item in self.state.docking_history if item.get("attempt") == attempt), None)
+            if trend is not None:
+                trend["confirmation"] = {
+                    "status": docking.get("status"),
+                    "primary_metric": metric_name,
+                    "delta_candidate_minus_reference": delta,
+                    "seed_stddev": seed_stddev,
+                    "seed_win_fraction": seed_win_fraction,
+                    "stability_eligible": eligible,
+                    "quality": confirmed_quality,
+                    "pose_consensus": docking.get("pose_consensus"),
+                    "interaction_consensus": docking.get("interaction_consensus"),
+                }
+            candidate_record = next((item for item in self.state.candidate_history if item.get("attempt") == attempt), None)
+            if candidate_record is not None:
+                candidate_record["confirmation"] = {
+                    "status": docking.get("status"),
+                    "comparison": docking.get("comparison"),
+                    "pose_consensus": docking.get("pose_consensus"),
+                    "interaction_consensus": docking.get("interaction_consensus"),
+                }
+            confirmations.append({
+                "attempt": attempt,
+                "status": docking.get("status"),
+                "confirmed_quality": confirmed_quality,
+                "stability_eligible": eligible,
+                "comparison": docking.get("comparison"),
+                "pose_consensus": docking.get("pose_consensus"),
+                "interaction_consensus": docking.get("interaction_consensus"),
+            })
+            self._write_json(f"edit-attempt-{attempt:02d}.json", report)
+        confirmed = [
+            item for item in confirmations if isinstance(item.get("confirmed_quality"), (int, float))
+        ]
+        if confirmed:
+            best_confirmed = max(confirmed, key=lambda item: float(item["confirmed_quality"]))
+            self.state.convergence["best_attempt"] = best_confirmed["attempt"]
+            self.state.convergence["best_quality"] = best_confirmed["confirmed_quality"]
+            self.state.convergence["selection_stage"] = "confirmation"
+        self._write_json("docking-history.json", {
+            "history": self.state.docking_history,
+            "convergence": self.state.convergence,
+        })
+        self._write_json("state-checkpoint.json", self.state.compact_view())
+        return {"action": "CONFIRM", "confirmations": confirmations}
+
+    def portfolio_optimize(self, resume: bool = False) -> dict[str, Any]:
+        """Run bounded multi-site, batch-planned optimization."""
+        settings = self._batch_settings()
+        history: list[dict[str, Any]] = []
+        seen: dict[str, int] = {}
+        reference_path = self.run_dir / "reference-ligand.sdf"
+        receptor_path = self.run_dir / "receptor-protein-only.pdb"
+        self._design_phase = True
+        if resume:
+            reports, progress = self._restore_run_state()
+            history = list(reports)
+            for report in reports:
+                canonical = ((report.get("validation") or {}).get("candidate") or {}).get("canonical_smiles")
+                if isinstance(canonical, str):
+                    seen[canonical] = int(report["attempt"])
+            if self.state.design_dossier is None:
+                self._batch_dossier()
+        else:
+            self._batch_dossier()
+        self.state.site_board = self.state.site_board or {}
+        instruction = (
+            "Continue from the restored portfolio without repeating completed transformations. Review the current "
+            "site board and prior batches, then return PLAN_BATCH, CONFIRM, or STOP."
+            if resume else
+            "Use the supplied design dossier to plan the first multi-site screening batch. Select chemically "
+            "diverse library fragments for several plausible targets. Return PLAN_BATCH with at most the configured "
+            "batch size; do not query basic fragment properties already supplied."
+        )
+        decisions = 0
+        query_only_rounds = 0
+        decision = self._repair_decision(
+            self.client.complete_json(self._batch_payload(instruction)),
+            self._batch_payload(instruction),
+            "portfolio_planning",
+        )
+        while decisions < settings["max_llm_decisions"] and self.state.batch_round < settings["max_batches"]:
+            decisions += 1
+            action = decision.get("action")
+            if action in {"QUERY", "QUERY_BATCH"}:
+                query_only_rounds += 1
+                if query_only_rounds > settings["max_query_only_rounds"]:
+                    rejection = {
+                        "status": "rejected",
+                        "failure_class": "query_only_budget_exhausted",
+                        "instruction": "The query-only budget is exhausted. Return PLAN_BATCH, CONFIRM, or STOP now.",
+                    }
+                    decision = self._repair_decision(
+                        self.client.complete_json(self._batch_payload(rejection["instruction"], rejection)),
+                        self._batch_payload(rejection["instruction"], rejection),
+                        "portfolio_planning",
+                    )
+                    query_only_rounds = settings["max_query_only_rounds"]
+                    continue
+                self._validate_portfolio_query(decision)
+                self._handle_decision(decision)
+                decision = self._repair_decision(
+                    self.client.complete_json(self._batch_payload(
+                        "Use the new evidence to return PLAN_BATCH, CONFIRM, or STOP. Do not query supplied facts."
+                    )),
+                    self._batch_payload("Use the new evidence to return PLAN_BATCH, CONFIRM, or STOP. Do not query supplied facts."),
+                    "portfolio_planning",
+                )
+                continue
+            if action == "PLAN_BATCH":
+                query_only_rounds = 0
+                self._record_decision(decision)
+                try:
+                    planned = self._validate_batch_plan(decision)
+                except (RuntimeError, ValueError) as error:
+                    rejection = {
+                        "status": "rejected",
+                        "failure_class": "invalid_batch_plan",
+                        "error": str(error),
+                        "instruction": "Correct the PLAN_BATCH using only dossier-listed targets and fragment IDs; then return PLAN_BATCH, CONFIRM, or STOP.",
+                    }
+                    self.state.tool_rejections.append(rejection)
+                    decision = self._repair_decision(
+                        self.client.complete_json(self._batch_payload(rejection["instruction"], rejection)),
+                        self._batch_payload(rejection["instruction"], rejection),
+                        "portfolio_planning",
+                    )
+                    continue
+                used_screening = sum(int(item.get("submitted", 0)) for item in self.state.batch_history)
+                remaining_screening = settings["max_screening_candidates"] - used_screening
+                if remaining_screening <= 0:
+                    break
+                planned = planned[:remaining_screening]
+                self.state.batch_round += 1
+                result = self._batch_screen_and_dock(
+                    planned, history, seen, reference_path, receptor_path,
+                )
+                if not result["docking"] and not history:
+                    break
+                stagnation = settings["stagnation_batches"]
+                recent_batches = self.state.batch_history[-stagnation:]
+                if (
+                    stagnation > 0
+                    and len(recent_batches) == stagnation
+                    and not any(
+                        docking.get("is_new_best")
+                        for batch in recent_batches
+                        for docking in batch.get("docking", [])
+                    )
+                ):
+                    decision = {
+                        "action": "STOP",
+                        "reason": f"No new portfolio best was found in the last {stagnation} batches.",
+                        "evidence": "The configured stagnation batch limit was reached.",
+                    }
+                    self._record_decision(decision)
+                    break
+                decision = self._repair_decision(
+                    self.client.complete_json(self._batch_payload(
+                        "Review the latest batch feedback. Promote improving sites, deprioritize or discard clearly "
+                        "inferior sites, then return PLAN_BATCH for the next batch, CONFIRM for a few finalists, or STOP.",
+                        result,
+                    )),
+                    self._batch_payload("Review the latest batch feedback and choose PLAN_BATCH, CONFIRM, or STOP.", result),
+                    "portfolio_planning",
+                )
+                continue
+            if action == "CONFIRM":
+                self._record_decision(decision)
+                try:
+                    confirmation = self._batch_confirm(decision, history)
+                except RuntimeError as error:
+                    rejection = {
+                        "status": "rejected",
+                        "failure_class": "invalid_confirmation",
+                        "error": str(error),
+                        "instruction": "Choose only existing screening candidate IDs within the confirmation budget, or return PLAN_BATCH/STOP.",
+                    }
+                    self.state.tool_rejections.append(rejection)
+                    decision = self._repair_decision(
+                        self.client.complete_json(self._batch_payload(rejection["instruction"], rejection)),
+                        self._batch_payload(rejection["instruction"], rejection),
+                        "portfolio_planning",
+                    )
+                    continue
+                decision = self._repair_decision(
+                    self.client.complete_json(self._batch_payload(
+                        "Review the confirmation results. Return STOP if the portfolio is adequate; otherwise return "
+                        "one final PLAN_BATCH only when a clearly supported new direction remains.",
+                        confirmation,
+                    )),
+                    self._batch_payload("Review confirmation results and return STOP or a justified PLAN_BATCH.", confirmation),
+                    "portfolio_planning",
+                )
+                continue
+            if action == "STOP":
+                self._record_decision(decision)
+                break
+            raise RuntimeError(f"Unsupported portfolio action: {action!r}")
+        if not history:
+            return {"status": "no_candidate_accepted", "stopping_reason": "portfolio_no_candidate", "attempts": history}
+        if not any(report.get("confirmation") for report in history):
+            quality_by_attempt = {
+                item.get("attempt"): item.get("quality") for item in self.state.docking_history
+            }
+            ranked = sorted(
+                history,
+                key=lambda report: (
+                    quality_by_attempt.get(report.get("attempt")) is not None,
+                    float(quality_by_attempt.get(report.get("attempt")) or float("-inf")),
+                ),
+                reverse=True,
+            )
+            finalists = [
+                f"attempt-{int(report['attempt']):02d}"
+                for report in ranked[: settings["max_confirmation_candidates"]]
+            ]
+            if finalists:
+                self._batch_confirm({"action": "CONFIRM", "candidate_ids": finalists}, history)
+        reason = "llm_stop" if decision.get("action") == "STOP" else "portfolio_budget_limit"
+        return self._accepted_output(history, reference_path, reason)
 
     def design(
         self,
@@ -3578,7 +4285,9 @@ class Workflow:
             "resume": resume,
         })
         if resume:
-            result = self._resume_design()
+            result = self.portfolio_optimize(resume=True) if self._batch_enabled() else self._resume_design()
+        elif self._batch_enabled():
+            result = self.portfolio_optimize()
         else:
             first_decision = self.collect_context()
             result = self.design(first_decision)
@@ -3607,6 +4316,36 @@ class ScriptedDemoClient:
         self.step = 0
 
     def complete_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("mode") == "portfolio_planning":
+            if payload.get("latest_feedback") or payload.get("state", {}).get("latest_batch"):
+                return {
+                    "action": "STOP",
+                    "reason": "The deterministic scripted portfolio smoke test completed one batch.",
+                    "evidence": "At least one host-screened candidate was evaluated.",
+                }
+            return {
+                "action": "PLAN_BATCH",
+                "rationale": "Run one small host-grounded screening candidate for the smoke test.",
+                "site_updates": [{
+                    "target_type": "atom",
+                    "target_id": 10,
+                    "status": "screening",
+                    "reason": "Atom 10 is a host-listed editable phenyl site.",
+                }],
+                "candidates": [{
+                    "target_type": "atom",
+                    "target_id": 10,
+                    "operation": "replace_hydrogen",
+                    "fragment_id": "curated-fluoro",
+                    "hypothesis": {
+                        "site_evidence": "The host dossier lists atom 10 and its local growth clearance.",
+                        "intended_change": "Replace one hydrogen with fluorine.",
+                        "expected_effect": "Test a minimal local substituent without rewriting the scaffold.",
+                        "risk": "The edit may not improve docking.",
+                        "success_criterion": "The candidate passes deterministic geometry and reaches docking.",
+                    },
+                }],
+            }
         observations = payload["state"]["observations"]
         if not any(item["tool"] == "get_edit_site_candidates" for item in observations):
             return {

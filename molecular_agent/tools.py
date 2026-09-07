@@ -34,6 +34,49 @@ class ToolRegistry:
                 {"edit_site_candidates"},
                 {"type": "object", "properties": {}, "additionalProperties": False},
             ),
+            "get_design_dossier": (
+                self.get_design_dossier,
+                {"design_dossier"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "panel_size": {"type": "integer", "minimum": 2, "maximum": 20},
+                    },
+                    "additionalProperties": False,
+                },
+            ),
+            "screen_candidate_batch": (
+                self.screen_candidate_batch,
+                {"candidate_batch"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "candidates": {"type": "array", "minItems": 1, "maxItems": 32},
+                    },
+                    "required": ["candidates"],
+                    "additionalProperties": False,
+                },
+            ),
+            "get_fragment_panel": (
+                self.get_fragment_panel,
+                {"fragment_panel"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "target_type": {"type": "string", "enum": ["atom", "replacement_site"]},
+                        "target_id": {},
+                        "size_classes": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["minimal", "small", "medium", "large"]},
+                        },
+                        "chemical_tags": {"type": "array", "items": {"type": "string"}},
+                        "max_heavy_atoms": {"type": "integer", "minimum": 1, "maximum": 12},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 30},
+                    },
+                    "required": ["target_type", "target_id"],
+                    "additionalProperties": False,
+                },
+            ),
             "assess_edit_sites": (
                 self.assess_edit_sites,
                 {"site_strategy"},
@@ -260,6 +303,18 @@ class ToolRegistry:
                 "Returns all host-supported atom and replacement-site targets with deterministic local "
                 "environment, interaction, and directional geometry summaries for strategy assessment."
             ),
+            "get_design_dossier": (
+                "Returns one compact deterministic dossier containing ligand, pocket, interactions, all "
+                "editable sites, the complete library summary, and diverse operation-compatible panels."
+            ),
+            "screen_candidate_batch": (
+                "Builds and geometrically screens a bounded set of LLM-selected transformations. "
+                "It does not run docking."
+            ),
+            "get_fragment_panel": (
+                "Returns a refreshed, diverse panel with complete precomputed chemistry for one host-listed "
+                "target. Use it only when the initial panel lacks a decision-relevant chemical direction."
+            ),
             "assess_edit_sites": (
                 "Submit one priority and site_type assessment for each currently plausible host target. "
                 "The host validates target IDs; this is an LLM hypothesis record, not an affinity prediction."
@@ -307,6 +362,9 @@ class ToolRegistry:
         covers = {
             "get_ligand_info": True,
             "get_edit_site_candidates": True,
+            "get_design_dossier": True,
+            "screen_candidate_batch": True,
+            "get_fragment_panel": True,
             "assess_edit_sites": True,
             "get_pocket_residues": float(arguments.get("radius", 0)) >= 5.0,
             "detect_basic_interactions": float(arguments.get("cutoff", 0)) >= 4.0,
@@ -411,6 +469,179 @@ class ToolRegistry:
                 "These are deterministic host-supported targets and rigid-structure summaries. Priority and "
                 "site type remain LLM assessments; receptor flexibility and binding free energy are not modeled."
             ),
+        }
+
+    @staticmethod
+    def _site_max_fragment_heavy_atoms(site: dict[str, Any]) -> int:
+        if site.get("target_type") == "atom":
+            clearance = (site.get("growth_probe") or {}).get("minimum_clearance")
+        else:
+            values = [
+                item.get("minimum_protein_atom_distance_along_probe")
+                for item in (site.get("directional_clearance") or [])
+                if isinstance(item, dict)
+            ]
+            numeric = [float(value) for value in values if isinstance(value, (int, float))]
+            clearance = max(numeric) if numeric else None
+        if not isinstance(clearance, (int, float)):
+            return 8
+        if clearance < 1.5:
+            return 2
+        if clearance < 2.0:
+            return 4
+        if clearance < 3.0:
+            return 8
+        return 12
+
+    def get_design_dossier(self, panel_size: int = 6) -> dict[str, Any]:
+        """Build the bounded initial context for portfolio-style optimization."""
+        if not 2 <= int(panel_size) <= 20:
+            raise ValueError("panel_size must be between 2 and 20")
+        sites = self.get_edit_site_candidates()
+        enriched_sites = []
+        for site in sites["atom_sites"] + sites["replacement_sites"]:
+            operation = "substitute" if site["target_type"] == "atom" else "replace_fragment"
+            max_heavy_atoms = self._site_max_fragment_heavy_atoms(site)
+            enriched_sites.append({
+                **site,
+                "supported_operation": (
+                    "replace_hydrogen" if site["target_type"] == "atom" else "replace_fragment"
+                ),
+                "recommended_max_fragment_heavy_atoms": max_heavy_atoms,
+                "fragment_panel": self.fragment_library.panel(
+                    operation=operation,
+                    limit=int(panel_size),
+                    max_heavy_atoms=max_heavy_atoms,
+                ),
+            })
+        return {
+            "status": "complete",
+            "ligand": self.get_ligand_info(),
+            "pocket": self.get_pocket_residues(6.0),
+            "reference_interactions": self.detect_basic_interactions(4.5),
+            "fragment_library": self.fragment_library.overview(),
+            "sites": enriched_sites,
+            "site_count": len(enriched_sites),
+            "panel_size_per_site": int(panel_size),
+            "tool_policy": (
+                "Base chemistry and site facts are already supplied. Tools remain available only for "
+                "decision-relevant uncertainty, refreshed panels, parent-specific facts, or pose analysis."
+            ),
+        }
+
+    def screen_candidate_batch(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        """Deterministically construct and geometrically screen an LLM-selected batch."""
+        if not isinstance(candidates, list) or not candidates:
+            raise ValueError("screen_candidate_batch requires a non-empty candidates array")
+        if len(candidates) > 32:
+            raise ValueError("screen_candidate_batch accepts at most 32 candidates")
+        accepted = []
+        rejected = []
+        seen_structures: set[str] = set()
+        for position, candidate in enumerate(candidates, start=1):
+            if not isinstance(candidate, dict):
+                rejected.append({
+                    "position": position,
+                    "status": "rejected",
+                    "failure_class": "invalid_candidate_spec",
+                    "error": "Candidate must be an object",
+                })
+                continue
+            transformation = {
+                key: candidate[key]
+                for key in (
+                    "operation", "edit_atom_index", "replacement_site_id", "fragment_id",
+                    "fragment_smiles", "parent_attempt", "replace_existing_substituent",
+                )
+                if candidate.get(key) is not None
+            }
+            target_type = candidate.get("target_type")
+            target_id = candidate.get("target_id")
+            if target_type == "atom":
+                transformation.setdefault("operation", "replace_hydrogen")
+                transformation.setdefault("edit_atom_index", target_id)
+            elif target_type == "replacement_site":
+                transformation.setdefault("operation", "replace_fragment")
+                transformation.setdefault("replacement_site_id", target_id)
+            result = self.validate_candidate_geometry(**transformation)
+            item = {
+                "position": position,
+                "hypothesis": candidate.get("hypothesis"),
+                "transformation": result.get("transformation", transformation),
+                "status": result.get("status"),
+                "failure_class": result.get("failure_class"),
+                "error": result.get("error"),
+                "validation": result,
+            }
+            canonical = ((result.get("candidate") or {}).get("canonical_smiles"))
+            if result.get("status") == "accepted" and isinstance(canonical, str):
+                if canonical in seen_structures:
+                    item.update({
+                        "status": "rejected",
+                        "failure_class": "duplicate_candidate_structure",
+                        "error": "Another candidate in this batch generated the same canonical structure.",
+                    })
+                    rejected.append(item)
+                    continue
+                seen_structures.add(canonical)
+                item["canonical_smiles"] = canonical
+                accepted.append(item)
+            else:
+                rejected.append(item)
+        return {
+            "status": "complete",
+            "submitted_count": len(candidates),
+            "accepted_count": len(accepted),
+            "rejected_count": len(rejected),
+            "accepted": accepted,
+            "rejected": rejected,
+            "limitation": (
+                "Accepted candidates passed deterministic construction and rigid-protein geometry only; "
+                "they have not yet been docked."
+            ),
+        }
+
+    def get_fragment_panel(
+        self,
+        target_type: str,
+        target_id: Any,
+        size_classes: list[str] | None = None,
+        chemical_tags: list[str] | None = None,
+        max_heavy_atoms: int | None = None,
+        limit: int = 12,
+    ) -> dict[str, Any]:
+        dossier = self.get_edit_site_candidates()
+        sites = dossier["atom_sites"] + dossier["replacement_sites"]
+        site = next(
+            (
+                item for item in sites
+                if item.get("target_type") == target_type and item.get("target_id") == target_id
+            ),
+            None,
+        )
+        if site is None:
+            raise ValueError(f"Unknown host target: {target_type}:{target_id}")
+        operation = "substitute" if target_type == "atom" else "replace_fragment"
+        capacity = self._site_max_fragment_heavy_atoms(site)
+        effective_max = min(capacity, int(max_heavy_atoms or capacity))
+        fragments = self.fragment_library.panel(
+            operation=operation,
+            limit=int(limit),
+            max_heavy_atoms=effective_max,
+            size_classes=size_classes,
+            chemical_tags_any=chemical_tags,
+        )
+        return {
+            "status": "complete",
+            "target_type": target_type,
+            "target_id": target_id,
+            "operation": operation,
+            "site_capacity_heavy_atoms": capacity,
+            "effective_max_heavy_atoms": effective_max,
+            "requested_size_classes": size_classes,
+            "requested_chemical_tags": chemical_tags,
+            "count": len(fragments),
+            "fragments": fragments,
         }
 
     def assess_edit_sites(

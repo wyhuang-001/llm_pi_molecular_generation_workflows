@@ -276,6 +276,147 @@ class FragmentLibrary:
             ),
         }
 
+    def _compact_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Return the chemistry needed for LLM selection without bulky provenance."""
+        smiles = record.get("smiles")
+        if not isinstance(smiles, str):
+            raise ValueError("Fragment record is missing smiles")
+        properties = self._properties(smiles)
+        return {
+            "fragment_id": record.get("fragment_id"),
+            "name": record.get("name"),
+            "smiles": smiles,
+            "canonical_smiles": record.get("canonical_smiles") or properties["canonical_smiles"],
+            "allowed_operations": sorted(self._allowed_operations(record)),
+            "size_class": record.get("size_class") or properties["size_class"],
+            "chemical_tags": record.get("chemical_tags") or properties["chemical_tags"],
+            "attachment_atom_element": record.get("attachment_atom_element"),
+            "formal_charge": record.get("formal_charge", properties["formal_charge"]),
+            "heavy_atoms": record.get("heavy_atoms", properties["heavy_atoms"]),
+            "molecular_weight": record.get("molecular_weight", properties["molecular_weight"]),
+            "logp": record.get("logp", properties["logp"]),
+            "hbd": record.get("hbd", properties["hbd"]),
+            "hba": record.get("hba", properties["hba"]),
+            "tpsa": record.get("tpsa", properties["tpsa"]),
+            "rotatable_bonds": record.get("rotatable_bonds", properties["rotatable_bonds"]),
+            "ring_count": record.get("ring_count", properties["ring_count"]),
+            "aromatic_ring_count": record.get(
+                "aromatic_ring_count", properties["aromatic_ring_count"]
+            ),
+            "curated": bool(record.get("curated", False)),
+        }
+
+    def overview(self) -> dict[str, Any]:
+        """Summarize the complete host-side library without sending every record."""
+        size_counts: Counter[str] = Counter()
+        tag_counts: Counter[str] = Counter()
+        operation_counts: Counter[str] = Counter()
+        charge_counts: Counter[str] = Counter()
+        for record in self.records:
+            if not isinstance(record, dict) or not isinstance(record.get("smiles"), str):
+                continue
+            heavy_atoms = record.get("heavy_atoms")
+            if not isinstance(heavy_atoms, int):
+                molecule = Chem.MolFromSmiles(record["smiles"])
+                if molecule is None:
+                    continue
+                heavy_atoms = molecule.GetNumHeavyAtoms()
+            size_counts[str(record.get("size_class") or size_class_for(heavy_atoms))] += 1
+            tag_counts.update(record.get("chemical_tags") or [])
+            operation_counts.update(self._allowed_operations(record))
+            charge_counts[str(record.get("formal_charge", 0))] += 1
+        return {
+            "library_path": str(self.path),
+            "fragment_count": len(self.records),
+            "size_class_counts": dict(sorted(size_counts.items())),
+            "chemical_tag_counts": dict(tag_counts.most_common()),
+            "operation_counts": dict(sorted(operation_counts.items())),
+            "formal_charge_counts": dict(sorted(charge_counts.items())),
+            "selection_contract": (
+                "The complete library is loaded by the host. The LLM receives compact diverse panels "
+                "and may request refreshed panels; per-fragment property queries are not required."
+            ),
+        }
+
+    def panel(
+        self,
+        *,
+        operation: str,
+        limit: int = 12,
+        max_heavy_atoms: int = 12,
+        size_classes: list[str] | None = None,
+        chemical_tags_any: list[str] | None = None,
+        exclude_fragment_ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Select a deterministic, chemically diverse panel from the full library."""
+        if limit < 1:
+            return []
+        allowed_sizes = set(size_classes or SIZE_CLASSES)
+        unknown_sizes = allowed_sizes - set(SIZE_CLASSES)
+        if unknown_sizes:
+            raise ValueError(f"Unknown size classes: {sorted(unknown_sizes)}")
+        requested_tags = {
+            str(value).lower().strip() for value in (chemical_tags_any or []) if str(value).strip()
+        }
+        excluded = exclude_fragment_ids or set()
+        buckets: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        tag_priority = (
+            "halogen", "alkyl", "polar", "heteroaryl", "nitrile",
+            "hbond_donor", "hbond_acceptor", "cyclic", "other",
+        )
+        for record in self.records:
+            if not isinstance(record, dict) or record.get("fragment_id") in excluded:
+                continue
+            if operation not in self._allowed_operations(record):
+                continue
+            smiles = record.get("smiles")
+            if not isinstance(smiles, str):
+                continue
+            heavy_atoms = record.get("heavy_atoms")
+            if not isinstance(heavy_atoms, int):
+                molecule = Chem.MolFromSmiles(smiles)
+                if molecule is None:
+                    continue
+                heavy_atoms = molecule.GetNumHeavyAtoms()
+            size = str(record.get("size_class") or size_class_for(heavy_atoms))
+            tags = {str(value).lower() for value in (record.get("chemical_tags") or [])}
+            if heavy_atoms > max_heavy_atoms or size not in allowed_sizes:
+                continue
+            if requested_tags and not requested_tags.intersection(tags):
+                continue
+            primary_tag = next((tag for tag in tag_priority if tag in tags), "other")
+            buckets.setdefault((size, primary_tag), []).append(record)
+
+        for records in buckets.values():
+            records.sort(
+                key=lambda item: (
+                    not bool(item.get("curated", False)),
+                    -int(item.get("source_molecule_count", 0) or 0),
+                    str(item.get("fragment_id", "")),
+                )
+            )
+        ordered_keys = [
+            (size, tag)
+            for size in ("minimal", "small", "medium", "large")
+            for tag in tag_priority
+            if (size, tag) in buckets
+        ]
+        selected: list[dict[str, Any]] = []
+        cursor = 0
+        while len(selected) < limit and ordered_keys:
+            key = ordered_keys[cursor % len(ordered_keys)]
+            records = buckets[key]
+            if records:
+                selected.append(self._compact_record(records.pop(0)))
+            if not records:
+                ordered_keys.remove(key)
+                if not ordered_keys:
+                    break
+                cursor %= len(ordered_keys)
+            else:
+                cursor += 1
+        return selected
+
     def get(self, fragment_id: str) -> dict[str, Any]:
         for record in self.records:
             if isinstance(record, dict) and record.get("fragment_id") == fragment_id:

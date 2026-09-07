@@ -1,6 +1,6 @@
 # `molecular_agent/workflow.py` 代码说明
 
-> 本文根据当前工作区中的 `molecular_agent/workflow.py` 编写。代码当前约 3666 行，下面的行号以本次记录时的文件为准；如果后续继续修改代码，行号可能发生变化。
+> 本文根据当前工作区中的 `molecular_agent/workflow.py` 编写。文件同时保留旧的 QUERY/READY 兼容路径和默认的 portfolio batch 路径；批量多位点方案见 `LLM_BATCHED_MULTISITE_OPTIMIZATION.md`。代码行号会随后续修改变化。
 >
 > 本文件只解释 `workflow.py` 的职责、状态流转、证据门、候选生成、docking 反馈、恢复和持久化逻辑，不重复粘贴完整源代码。完整工具的具体化学实现主要位于 `molecular_agent/tools.py`、`editing.py`、`structure.py` 和 `fragment_library.py`。
 

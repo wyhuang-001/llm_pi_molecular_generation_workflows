@@ -39,7 +39,12 @@ class AgentState:
     fragment_memory: dict[str, Any] = field(default_factory=dict)
     candidate_memory: dict[str, Any] = field(default_factory=dict)
     elite_archive: list[dict[str, Any]] = field(default_factory=list)
-    memory_schema_version: int = 1
+    # Portfolio/batch optimization state. The full event history remains authoritative.
+    design_dossier: dict[str, Any] | None = None
+    batch_history: list[dict[str, Any]] = field(default_factory=list)
+    site_board: dict[str, dict[str, Any]] = field(default_factory=dict)
+    batch_round: int = 0
+    memory_schema_version: int = 2
     convergence: dict[str, Any] = field(default_factory=lambda: {
         "status": "not_started",
         "converged": False,
@@ -85,6 +90,10 @@ class AgentState:
             "fragment_memory": self.fragment_memory,
             "candidate_memory": self.candidate_memory,
             "elite_archive": self.elite_archive,
+            "design_dossier": self.design_dossier,
+            "batch_history": self.batch_history,
+            "site_board": self.site_board,
+            "batch_round": self.batch_round,
             "memory_schema_version": self.memory_schema_version,
             "site_strategy": self.site_strategy,
             "active_target": self.active_target,

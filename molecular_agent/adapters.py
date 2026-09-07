@@ -130,10 +130,12 @@ class DockingAdapter(CommandAdapter):
         super().__init__("docking", config, run_dir, progress=progress)
         self._reference_results: dict[int, dict[str, Any]] = {}
 
-    def _seeds(self) -> list[int]:
-        configured = self.config.get("seeds", [self.config.get("seed", 17)])
+    def _seeds(self, override: list[int] | None = None) -> list[int]:
+        configured = override if override is not None else self.config.get(
+            "seeds", [self.config.get("seed", 17)]
+        )
         if not isinstance(configured, list) or not configured:
-            raise ValueError("docking.seeds must be a non-empty list of integers")
+            raise ValueError("docking seeds must be a non-empty list of integers")
         seeds = [int(seed) for seed in configured]
         if len(set(seeds)) != len(seeds):
             raise ValueError("docking.seeds must not contain duplicates")
@@ -657,6 +659,7 @@ class DockingAdapter(CommandAdapter):
         output_dir: Path,
         reference_output_dir: Path,
         reference_result: dict[str, Any] | None = None,
+        seeds_override: list[int] | None = None,
     ) -> dict[str, Any]:
         """Run paired reference/candidate docking for every configured seed."""
         if self.config.get("enabled") is not True:
@@ -667,7 +670,7 @@ class DockingAdapter(CommandAdapter):
                 output_dir=output_dir,
             )
 
-        seeds = self._seeds()
+        seeds = self._seeds(seeds_override)
         reference_results: dict[int, dict[str, Any]] = {}
         candidate_results: dict[int, dict[str, Any]] = {}
         comparisons = []

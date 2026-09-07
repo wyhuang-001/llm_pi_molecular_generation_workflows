@@ -616,7 +616,7 @@ items=[
     ("Docking历史",".../real/docking-history.json",NAVY),
     ("最佳候选",".../real/candidate-20.sdf",TEAL),
     ("参考配体",".../real/reference-ligand.sdf",NAVY),
-    ("项目说明","README.md / MODIFICATION_PLAN.md",TEAL),
+    ("项目说明","README.md / LLM_BATCHED_MULTISITE_OPTIMIZATION.md",TEAL),
 ]
 for i,(name,path,c) in enumerate(items):
     y=1.25+i*0.83

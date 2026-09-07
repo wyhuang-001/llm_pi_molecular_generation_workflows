@@ -14,8 +14,10 @@
     "codex_config_dir": null,
     "api_key_env": "ARK_API_KEY",
     "api_key_file": "~/.config/simple-molecular-agent/doubao-api-key",
-    "timeout_seconds": 600,
-    "max_output_tokens": 8192,
+    "timeout_seconds": 120,
+    "max_api_retries": 2,
+    "retry_delay_seconds": 2,
+    "max_output_tokens": 4096,
     "repair_max_output_tokens": 4096
   },
   "deepseek": {
@@ -25,8 +27,10 @@
     "codex_config_dir": null,
     "api_key_env": "DEEPSEEK_API_KEY",
     "api_key_file": "~/.config/simple-molecular-agent/deepseek-api-key",
-    "timeout_seconds": 600,
-    "max_output_tokens": 8192,
+    "timeout_seconds": 120,
+    "max_api_retries": 2,
+    "retry_delay_seconds": 2,
+    "max_output_tokens": 4096,
     "repair_max_output_tokens": 4096
   }
 }
