@@ -1,0 +1,116 @@
+{
+  "task": "Optimize the 4WKQ EGFR ligand with the cut-point-free closed pool. Choose one host-listed site and one change type the site allows, or STOP.",
+  "complex_path": "4WKQ_-_hbond-opt.pdb",
+  "ligand_selector": {
+    "chain": "A",
+    "residue_name": "IRE",
+    "residue_number": 1101
+  },
+  "single_edit_mode": {
+    "enabled": true
+  },
+  "fragment_library_path": "design/fragments-multisite.json",
+  "closed_pool": {
+    "enabled": true,
+    "mode": "multisite",
+    "manifest_path": "design/pool-manifest-multisite.json"
+  },
+  "max_context_rounds": 60,
+  "candidate_construction": {
+    "initial_receptor_clash_policy": "defer_to_docking"
+  },
+  "external_research": {
+    "enabled": false,
+    "required": false
+  },
+  "receptor_preparation": {
+    "retain_hetero_residue_names": [
+      "CSX"
+    ]
+  },
+  "pose_retention": {
+    "enabled": true,
+    "core_atom_indices": [
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30
+    ],
+    "top_n": 20,
+    "reference_native_rmsd": 2.0,
+    "candidate_reference_rmsd": 2.0,
+    "max_core_displacement": 3.0,
+    "maximum_heavy_atom_overlap": 0.55,
+    "family_rmsd": 2.0,
+    "minimum_passing_seeds": 2,
+    "missing_seed_penalty": 1.0,
+    "anchors": [
+      {
+        "type": "hydrogen_bond",
+        "method": "plip",
+        "ligand_atom_index": 18,
+        "ligand_role": "acceptor",
+        "protein_residue": "MET:A:793",
+        "protein_atom_name": "N",
+        "max_distance": 3.5,
+        "min_donor_angle": 100.0
+      }
+    ]
+  },
+  "docking_optimization": {
+    "primary_metric": "minimizedAffinity",
+    "minimum_improvement": 0.25,
+    "seed_stddev_penalty": 0.25,
+    "minimum_seed_win_fraction": 0.6666666666666666,
+    "hard_max_attempts": 30
+  },
+  "fragment_replacement": {
+    "max_removed_heavy_atom_fraction": 0.4,
+    "protected_core_atom_indices": [
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30
+    ]
+  },
+  "search_policy": {
+    "mode": "adaptive",
+    "site_lock_enabled": false,
+    "site_strategy_required": false
+  },
+  "edit_site_table_path": "design/sites-multisite.json"
+}

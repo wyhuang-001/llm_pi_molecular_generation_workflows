@@ -86,6 +86,9 @@ def main() -> None:
                 "model": client.model,
                 "base_url": client.base_url,
                 "wire_api": client.wire_api,
+                "request_timeout_seconds": client.timeout,
+                "max_api_retries": client.max_api_retries,
+                "retry_delay_seconds": client.retry_delay_seconds,
                 "resume": args.resume,
             }
             with (args.run_dir / "llm-selection.jsonl").open("a", encoding="utf-8") as handle:

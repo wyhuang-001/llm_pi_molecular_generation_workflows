@@ -1,4 +1,7 @@
 config.json
+config.single_edit.json
+4WKQ/benchmark-private/
+.playwright-mcp/
 .deepseek_api_key
 .aicloud_api_key
 runs/*

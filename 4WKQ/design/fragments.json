@@ -1,0 +1,554 @@
+{
+  "schema_version": 1,
+  "allowed_operations": [
+    "replace_fragment"
+  ],
+  "fragments": [
+    {
+      "fragment_id": "F001",
+      "smiles": "COCCN(CCOC)CCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F002",
+      "smiles": "C1CCN2CCCC(O[*:1])C2C1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F003",
+      "smiles": "O[C@@H](CCN1CCOCC1)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F004",
+      "smiles": "CN1CCN(CCCO[*:1])CC1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F005",
+      "smiles": "C(CCN1CCOCC1)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F006",
+      "smiles": "OC(CO[*:1])Cn1ccnc1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F007",
+      "smiles": "CC(C)C[C@@](C)(N)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F008",
+      "smiles": "CCN(CC)CC(C)O[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F009",
+      "smiles": "C1CNC(CO[*:1])=N1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F010",
+      "smiles": "CNCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F011",
+      "smiles": "CC(C)(C)NCCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F012",
+      "smiles": "C(CCN1CCCC1)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F013",
+      "smiles": "CC1COCCN1CCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F014",
+      "smiles": "CNCC(C)(O)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F015",
+      "smiles": "OCCC(O[*:1])C1=NCCN1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F016",
+      "smiles": "C1CCN(CCCCO[*:1])CC1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F017",
+      "smiles": "CC(CN1CCCC1)O[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F018",
+      "smiles": "C1CCN(CCCO[*:1])C1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F019",
+      "smiles": "CN1C2COCC1CC(O[*:1])C2",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F020",
+      "smiles": "CN(C)CCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F021",
+      "smiles": "CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F022",
+      "smiles": "C1CCN(CCO[*:1])C1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F023",
+      "smiles": "CC(CO)(CCO)NCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F024",
+      "smiles": "CC(CO[*:1])NCCN(C)C",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F025",
+      "smiles": "OCCCN(CCO)CCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F026",
+      "smiles": "CCN(CC)CCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F027",
+      "smiles": "CCN1CCN(CCO[*:1])CC1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F028",
+      "smiles": "CN(C)CCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F029",
+      "smiles": "C1CN(CCO[*:1])CCO1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F030",
+      "smiles": "C1CN2CCC(O[*:1])(C1)C2",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F031",
+      "smiles": "CCN(C)CCNCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F032",
+      "smiles": "C1CCN(CCO[*:1])CC1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F033",
+      "smiles": "N[C@H]1C[C@H](O[*:1])[C@@H](N)C1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F034",
+      "smiles": "c1[nH]nc2c1CCC[C@@H]2O[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F035",
+      "smiles": "CCN(C)CCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F036",
+      "smiles": "C1CC(O[*:1])CN1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F037",
+      "smiles": "COCCCNCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F038",
+      "smiles": "CN1C[C@@H](F)[C@@H](O[*:1])C1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F039",
+      "smiles": "CNCC(O)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F040",
+      "smiles": "COCCNCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F041",
+      "smiles": "N#CCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F042",
+      "smiles": "CC(C)O[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F043",
+      "smiles": "CC1CCN(CCO[*:1])CC1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F044",
+      "smiles": "CC(CO)(CO)NCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F045",
+      "smiles": "NCC(O)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F046",
+      "smiles": "O[C@@H](CO[*:1])CN1CCOCC1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F047",
+      "smiles": "Cc1nn(C(=O)CO[*:1])c(C)c1C",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F048",
+      "smiles": "OCCN(CO)CC(O)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F049",
+      "smiles": "CC(CO[*:1])N1CCCC1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F050",
+      "smiles": "CC(C)NCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F051",
+      "smiles": "CC(C)NCCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F052",
+      "smiles": "O[C@@H](CCO[*:1])CN1CCOCC1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F053",
+      "smiles": "CN1CCN(CCO[*:1])CC1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F054",
+      "smiles": "O[C@H](CO[*:1])CN1CCOCC1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F055",
+      "smiles": "OC(CCO[*:1])Cn1ccnc1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F056",
+      "smiles": "C1CCN(CCCO[*:1])CC1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F057",
+      "smiles": "CNCCC(O)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F058",
+      "smiles": "COCCN(CCO[*:1])COC",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F059",
+      "smiles": "CN(C)CCCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F060",
+      "smiles": "c1cn(CCCO[*:1])cn1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F061",
+      "smiles": "CC(C)(CN)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F062",
+      "smiles": "C[C@H]1C[C@@H](O[*:1])CC(C)(C)N1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F063",
+      "smiles": "CC(CO[*:1])NC(C)(CO)CO",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F064",
+      "smiles": "NC/C(=C/F)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F065",
+      "smiles": "CC(C)C[C@@H](N)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F066",
+      "smiles": "CNCCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F067",
+      "smiles": "CN(C)CCNCCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F068",
+      "smiles": "c1cn(CCO[*:1])cn1",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F069",
+      "smiles": "CCN(CC)CCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F070",
+      "smiles": "OCCN(CCO)CC(O)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F071",
+      "smiles": "C1CC2CC(O[*:1])C(C1)N2",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F072",
+      "smiles": "NC[C@H](O)CO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F073",
+      "smiles": "OCCN(CCO)CCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F074",
+      "smiles": "CCN(CC)CCCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F075",
+      "smiles": "CC(C)(C)NCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F076",
+      "smiles": "CN(C)CCNCCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F077",
+      "smiles": "CCCN(CC)CCO[*:1]",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    },
+    {
+      "fragment_id": "F078",
+      "smiles": "CC(CO[*:1])N(CCO)CCO",
+      "allowed_operations": [
+        "replace_fragment"
+      ]
+    }
+  ]
+}

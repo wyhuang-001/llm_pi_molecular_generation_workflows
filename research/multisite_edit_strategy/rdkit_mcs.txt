@@ -1,0 +1,337 @@
+index
+modules |
+next |
+previous |
+The RDKit 2026.03.6 documentation »
+Python API Reference »
+rdkit package »
+rdkit.Chem package »
+rdkit.Chem.rdFMCS module
+rdkit.Chem.rdFMCS module
+
+Module containing a C++ implementation of the FMCS algorithm
+
+class rdkit.Chem.rdFMCS.AtomCompare(*values)
+
+Bases: Enum
+
+CompareAny = 0
+CompareAnyHeavyAtom = 3
+CompareElements = 1
+CompareIsotopes = 2
+class rdkit.Chem.rdFMCS.BondCompare(*values)
+
+Bases: Enum
+
+CompareAny = 0
+CompareOrder = 1
+CompareOrderExact = 2
+class rdkit.Chem.rdFMCS.MCSAcceptance(self)
+
+Bases: object
+
+Base class. Subclass and override MCSAcceptance.__call__() to define a custom boolean callback function. Returning True will cause the MCS candidate to be accepted, False to be rejected
+
+class rdkit.Chem.rdFMCS.MCSAtomCompare(self)
+
+Bases: object
+
+Base class. Subclass and override MCSAtomCompare.__call__() to define custom atom compare functions, then set MCSParameters.AtomTyper to an instance of the subclass
+
+CheckAtomCharge(self, parameters: rdkit.Chem.rdFMCS.MCSAtomCompareParameters, mol1: rdkit.Chem.rdchem.Mol, atom1: int, mol2: rdkit.Chem.rdchem.Mol, atom2: int) → bool
+
+Return True if both atoms have the same formal charge
+
+CheckAtomChirality(self, parameters: rdkit.Chem.rdFMCS.MCSAtomCompareParameters, mol1: rdkit.Chem.rdchem.Mol, atom1: int, mol2: rdkit.Chem.rdchem.Mol, atom2: int) → bool
+
+Return True if both atoms have, or have not, a chiral tag
+
+CheckAtomRingMatch(self, parameters: rdkit.Chem.rdFMCS.MCSAtomCompareParameters, mol1: rdkit.Chem.rdchem.Mol, atom1: int, mol2: rdkit.Chem.rdchem.Mol, atom2: int) → bool
+
+Return True if both atoms are, or are not, in a ring
+
+class rdkit.Chem.rdFMCS.MCSAtomCompareParameters(self)
+
+Bases: object
+
+Parameters controlling how atom-atom matching is done
+
+property CompleteRingsOnly
+
+results cannot include lone ring atoms
+
+property MatchChiralTag
+
+include atom chirality in the match
+
+property MatchFormalCharge
+
+include formal charge in the match
+
+property MatchIsotope
+
+use isotope atom queries in MCSResults
+
+property MatchValences
+
+include atom valences in the match
+
+property MaxDistance
+
+Require atoms to be within this many angstroms in 3D
+
+property RingMatchesRingOnly
+
+ring atoms are only allowed to match other ring atoms
+
+class rdkit.Chem.rdFMCS.MCSBondCompare(self)
+
+Bases: object
+
+Base class. Subclass and override MCSBondCompare.__call__() to define custom bond compare functions, then set MCSParameters.BondTyper to an instance of the subclass
+
+CheckBondRingMatch(self, parameters: rdkit.Chem.rdFMCS.MCSBondCompareParameters, mol1: rdkit.Chem.rdchem.Mol, bond1: int, mol2: rdkit.Chem.rdchem.Mol, bond2: int) → bool
+
+Return True if both bonds are, or are not, part of a ring
+
+CheckBondStereo(self, parameters: rdkit.Chem.rdFMCS.MCSBondCompareParameters, mol1: rdkit.Chem.rdchem.Mol, bond1: int, mol2: rdkit.Chem.rdchem.Mol, bond2: int) → bool
+
+Return True if both bonds have, or have not, a stereo descriptor
+
+class rdkit.Chem.rdFMCS.MCSBondCompareParameters(self)
+
+Bases: object
+
+Parameters controlling how bond-bond matching is done
+
+property CompleteRingsOnly
+
+results cannot include partial rings
+
+property MatchFusedRings
+
+enforce check on ring fusion, i.e. alpha-methylnaphthalene won’t match beta-methylnaphtalene, but decalin will match cyclodecane unless MatchFusedRingsStrict is True
+
+property MatchFusedRingsStrict
+
+only enforced if MatchFusedRings is True; the ring fusion must be the same in both query and target, i.e. decalin won’t match cyclodecane
+
+property MatchStereo
+
+include bond stereo in the comparison
+
+property RingMatchesRingOnly
+
+ring bonds are only allowed to match other ring bonds
+
+class rdkit.Chem.rdFMCS.MCSFinalMatchCheck(self)
+
+Bases: object
+
+Base class. Subclass and override MCSFinalMatchCheck.__call__() to define a custom boolean callback function. Returning True will cause the growing seed to be accepted, False to be rejected
+
+class rdkit.Chem.rdFMCS.MCSParameters(self)
+
+Bases: object
+
+Parameters controlling how the MCS is constructed
+
+property AtomCompareParameters
+
+parameters for comparing atoms
+
+property AtomTyper
+
+atom typer to be used. Must be one of the members of the rdFMCS.AtomCompare class or an instance of a user-defined subclass of rdFMCS.MCSAtomCompare
+
+property BondCompareParameters
+
+parameters for comparing bonds
+
+property BondTyper
+
+bond typer to be used. Must be one of the members of the rdFMCS.BondCompare class or an instance of a user-defined subclass of rdFMCS.MCSBondCompare
+
+property FinalMatchChecker
+
+seed final match checker callback class. Must be a user-defined subclass of rdFMCS.MCSFinalMatchCheck
+
+property InitialSeed
+
+SMILES string to be used as the seed of the MCS
+
+property MaximizeBonds
+
+toggles maximizing the number of bonds (instead of the number of atoms)
+
+property ProgressCallback
+
+progress callback class. Must be a user-defined subclass of rdFMCS.MCSProgress
+
+property ShouldAcceptMCS
+
+MCS acceptance callback class. Must be a user-defined subclass of rdFMCS.MCSAcceptance
+
+property StoreAll
+
+toggles storage of degenerate MCSs
+
+property Threshold
+
+fraction of the dataset that must contain the MCS
+
+property Timeout
+
+timeout (in seconds) for the calculation
+
+property Verbose
+
+toggles verbose mode
+
+class rdkit.Chem.rdFMCS.MCSProgress(self)
+
+Bases: object
+
+Base class. Subclass and override MCSProgress.__call__() to define a custom callback function
+
+class rdkit.Chem.rdFMCS.MCSProgressData(self)
+
+Bases: object
+
+Information about the MCS progress
+
+property numAtoms
+
+number of atoms in MCS
+
+property numBonds
+
+number of bonds in MCS
+
+property seedProcessed
+
+number of processed seeds
+
+class rdkit.Chem.rdFMCS.MCSResult
+
+Bases: object
+
+used to return MCS results
+
+property canceled
+
+if True, the MCS calculation did not finish
+
+property degenerateSmartsQueryMolDict
+
+Dictionary collecting all degenerate (SMARTS, queryMol) pairs (empty if MCSParameters.StoreAll is False)
+
+property numAtoms
+
+number of atoms in MCS
+
+property numBonds
+
+number of bonds in MCS
+
+property queryMol
+
+query molecule for the MCS
+
+property smartsString
+
+SMARTS string for the MCS
+
+class rdkit.Chem.rdFMCS.RingCompare(*values)
+
+Bases: Enum
+
+IgnoreRingFusion = 0
+PermissiveRingFusion = 1
+StrictRingFusion = 2
+
+Table of Contents
+rdkit.Chem.rdFMCS module
+AtomCompare
+AtomCompare.CompareAny
+AtomCompare.CompareAnyHeavyAtom
+AtomCompare.CompareElements
+AtomCompare.CompareIsotopes
+BondCompare
+BondCompare.CompareAny
+BondCompare.CompareOrder
+BondCompare.CompareOrderExact
+MCSAcceptance
+MCSAtomCompare
+MCSAtomCompare.CheckAtomCharge()
+MCSAtomCompare.CheckAtomChirality()
+MCSAtomCompare.CheckAtomRingMatch()
+MCSAtomCompareParameters
+MCSAtomCompareParameters.CompleteRingsOnly
+MCSAtomCompareParameters.MatchChiralTag
+MCSAtomCompareParameters.MatchFormalCharge
+MCSAtomCompareParameters.MatchIsotope
+MCSAtomCompareParameters.MatchValences
+MCSAtomCompareParameters.MaxDistance
+MCSAtomCompareParameters.RingMatchesRingOnly
+MCSBondCompare
+MCSBondCompare.CheckBondRingMatch()
+MCSBondCompare.CheckBondStereo()
+MCSBondCompareParameters
+MCSBondCompareParameters.CompleteRingsOnly
+MCSBondCompareParameters.MatchFusedRings
+MCSBondCompareParameters.MatchFusedRingsStrict
+MCSBondCompareParameters.MatchStereo
+MCSBondCompareParameters.RingMatchesRingOnly
+MCSFinalMatchCheck
+MCSParameters
+MCSParameters.AtomCompareParameters
+MCSParameters.AtomTyper
+MCSParameters.BondCompareParameters
+MCSParameters.BondTyper
+MCSParameters.FinalMatchChecker
+MCSParameters.InitialSeed
+MCSParameters.MaximizeBonds
+MCSParameters.ProgressCallback
+MCSParameters.ShouldAcceptMCS
+MCSParameters.StoreAll
+MCSParameters.Threshold
+MCSParameters.Timeout
+MCSParameters.Verbose
+MCSProgress
+MCSProgressData
+MCSProgressData.numAtoms
+MCSProgressData.numBonds
+MCSProgressData.seedProcessed
+MCSResult
+MCSResult.canceled
+MCSResult.degenerateSmartsQueryMolDict
+MCSResult.numAtoms
+MCSResult.numBonds
+MCSResult.queryMol
+MCSResult.smartsString
+RingCompare
+RingCompare.IgnoreRingFusion
+RingCompare.PermissiveRingFusion
+RingCompare.StrictRingFusion
+Previous topic
+
+rdkit.Chem.rdFingerprintGenerator module
+
+Next topic
+
+rdkit.Chem.rdForceFieldHelpers module
+
+This Page
+Show Source
+Quick search
+index
+modules |
+next |
+previous |
+The RDKit 2026.03.6 documentation »
+Python API Reference »
+rdkit package »
+rdkit.Chem package »
+rdkit.Chem.rdFMCS module
+© Copyright 2026, Greg Landrum and other RDKit contributors. Created using Sphinx 9.1.0.

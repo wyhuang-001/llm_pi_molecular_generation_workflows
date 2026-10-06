@@ -26,6 +26,39 @@ def size_class_for(heavy_atoms: int) -> str:
     return "oversized"
 
 
+# Fragment records only ever support two kinds of edit: attaching a fragment at an
+# existing atom (``atom:addition``) or swapping a bound side for a fragment
+# (``bond:replacement``).  Frozen catalogs and older callers still spell these
+# ``substitute`` / ``replace_hydrogen`` and ``replace_fragment``; every spelling is
+# canonicalised to the two-axis label before any comparison or search filter, so a
+# legacy catalog never returns zero records for a canonical search.
+OPERATION_ALIASES = {
+    "substitute": "atom:addition",
+    "replace_hydrogen": "atom:addition",
+    "addition": "atom:addition",
+    "atom:addition": "atom:addition",
+    "replace_fragment": "bond:replacement",
+    "terminal_substituent_swap": "bond:replacement",
+    "replacement": "bond:replacement",
+    "bond:replacement": "bond:replacement",
+    "element_swap": "atom:replacement",
+    "atom:replacement": "atom:replacement",
+    "ring_atom_swap": "ring:replacement",
+    "ring_size_edit": "ring:replacement",
+    "ring:replacement": "ring:replacement",
+    "delete_substituent": "bond:deletion",
+    "deletion": "bond:deletion",
+    "bond:deletion": "bond:deletion",
+}
+
+
+def canonical_operation(operation: Any) -> Any:
+    """Return the canonical two-axis label of an edit operation."""
+    if not isinstance(operation, str):
+        return operation
+    return OPERATION_ALIASES.get(operation, operation)
+
+
 def chemical_tags(molecule: Chem.Mol) -> list[str]:
     heavy_atoms = [atom for atom in molecule.GetAtoms() if atom.GetAtomicNum() > 1]
     symbols = {atom.GetSymbol() for atom in heavy_atoms}
@@ -103,10 +136,10 @@ class FragmentLibrary:
             return
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         if isinstance(payload, dict):
-            self.records = payload.get("fragments", [])
+            self.records = payload.get("fragments") or payload.get("records") or []
             configured = payload.get("allowed_operations")
             if isinstance(configured, list):
-                self.default_allowed_operations = {str(value) for value in configured}
+                self.default_allowed_operations = {canonical_operation(str(value)) for value in configured}
         elif isinstance(payload, list):
             self.records = payload
         else:
@@ -138,11 +171,11 @@ class FragmentLibrary:
     def _allowed_operations(self, record: dict[str, Any]) -> set[str]:
         configured = record.get("allowed_operations")
         if isinstance(configured, list):
-            return {str(value) for value in configured}
+            return {canonical_operation(str(value)) for value in configured}
         if self.default_allowed_operations:
             return set(self.default_allowed_operations)
         operation = record.get("operation")
-        return {str(operation)} if isinstance(operation, str) else set()
+        return {canonical_operation(str(operation))} if isinstance(operation, str) else set()
 
     @staticmethod
     def smiles_equivalent(left: str, right: str) -> bool:
@@ -158,7 +191,7 @@ class FragmentLibrary:
         )
 
     def allows_operation(self, record: dict[str, Any], operation: str) -> bool:
-        return operation in self._allowed_operations(record)
+        return canonical_operation(operation) in self._allowed_operations(record)
 
     def search(
         self,
@@ -170,6 +203,8 @@ class FragmentLibrary:
         chemical_tag: str | None = None,
     ) -> dict[str, Any]:
         query = query.lower().strip()
+        requested_operation = operation
+        operation = canonical_operation(operation)
         if size_class is not None and size_class not in SIZE_CLASSES:
             raise ValueError(f"Unknown size_class: {size_class}")
         chemical_tag = chemical_tag.lower().strip() if isinstance(chemical_tag, str) else None
@@ -204,7 +239,7 @@ class FragmentLibrary:
             match_mode = "unfiltered"
         matches = []
         operation_compatible_records = sum(
-            isinstance(record, dict) and operation in self._allowed_operations(record)
+            isinstance(record, dict) and self.allows_operation(record, operation)
             for record in self.records
         )
         filtered_compatible_records = 0
@@ -213,7 +248,7 @@ class FragmentLibrary:
         for record in self.records:
             if not isinstance(record, dict):
                 continue
-            if operation not in self._allowed_operations(record):
+            if not self.allows_operation(record, operation):
                 continue
             smiles = record.get("smiles")
             if not isinstance(smiles, str):
@@ -260,6 +295,7 @@ class FragmentLibrary:
             "query_smarts": query_smarts,
             "match_mode": match_mode,
             "operation": operation,
+            "requested_operation": requested_operation,
             "size_class": size_class,
             "chemical_tag": chemical_tag,
             "operation_compatible_records": operation_compatible_records,
@@ -323,7 +359,11 @@ class FragmentLibrary:
                 heavy_atoms = molecule.GetNumHeavyAtoms()
             size_counts[str(record.get("size_class") or size_class_for(heavy_atoms))] += 1
             tag_counts.update(record.get("chemical_tags") or [])
-            operation_counts.update(self._allowed_operations(record))
+            stored = record.get("allowed_operations")
+            if isinstance(stored, list):
+                operation_counts.update(str(value) for value in stored)
+            else:
+                operation_counts.update(str(record.get("operation", "unspecified")))
             charge_counts[str(record.get("formal_charge", 0))] += 1
         return {
             "library_path": str(self.path),
@@ -367,7 +407,7 @@ class FragmentLibrary:
         for record in self.records:
             if not isinstance(record, dict) or record.get("fragment_id") in excluded:
                 continue
-            if operation not in self._allowed_operations(record):
+            if not self.allows_operation(record, operation):
                 continue
             smiles = record.get("smiles")
             if not isinstance(smiles, str):

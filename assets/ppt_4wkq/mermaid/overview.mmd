@@ -1,0 +1,16 @@
+flowchart LR
+    A("4WKQ 结构") --> B("LLM 设计")
+    B --> C("计算验证")
+    C --> D("候选排序")
+    D --> E("优先候选")
+    D -. "结果反馈" .-> B
+
+    classDef structure fill:#F0F7FB,stroke:#8EB7CE,color:#244C68,stroke-width:1.5px;
+    classDef design fill:#EAF7F6,stroke:#62ABA8,color:#176D70,stroke-width:1.7px;
+    classDef verify fill:#F2F7FB,stroke:#89AFC5,color:#244C68,stroke-width:1.5px;
+    classDef output fill:#FFF5E5,stroke:#DCAC67,color:#92611F,stroke-width:1.5px;
+    class A structure;
+    class B design;
+    class C,D verify;
+    class E output;
+    linkStyle default stroke:#749BAC,stroke-width:1.7px;

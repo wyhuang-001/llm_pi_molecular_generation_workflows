@@ -1,0 +1,53 @@
+{
+  "query_date": "2026-09-27",
+  "chembl_api": "https://www.ebi.ac.uk/chembl/api/data/",
+  "europe_pmc_api": "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+  "rcsb_search_api": "https://search.rcsb.org/rcsbsearch/v2/query",
+  "rcsb_graphql": "https://data.rcsb.org/graphql",
+  "target_activity_inclusion": "ChEMBL target exact-match activities, standard_relation =, standard_type in IC50/Ki/Kd",
+  "literature_inclusion": "egfr_all_chembl_documents contains all 1093 ChEMBL documents linked to the 21315 exact IC50/Ki/Kd EGFR potency records retrieved by this query (988 publications, 93 patents, 12 datasets). egfr_publication_series_ge25 is the high-density subset of 117 publications with at least 25 unique compounds each.",
+  "selected_system": {
+    "target": "human EGFR kinase",
+    "target_chembl_id": "CHEMBL203",
+    "uniprot": "P00533",
+    "reference_ligand": "gefitinib",
+    "ligand_chembl_id": "CHEMBL939",
+    "pdb_id": "4WKQ",
+    "resolution_angstrom": 1.85,
+    "pdb_ligand_code": "IRE"
+  },
+  "primary_sar_document": {
+    "document_chembl_id": "CHEMBL1134804",
+    "doi": "10.1016/S0960-894X(01)00344-4",
+    "compound_count": 28
+  },
+  "gefitinib_related_expansion_documents": [
+    {
+      "document_chembl_id": "CHEMBL1147701",
+      "doi": "10.1016/j.bmcl.2006.02.025",
+      "relationship": "C6 carbon-linked 4-anilinoquinazolines with gefitinib measured as an internal control",
+      "compound_count": 35,
+      "activity_record_count": 69,
+      "use": "high-priority add-on; keep biochemical and cellular assays separate"
+    },
+    {
+      "document_chembl_id": "CHEMBL4431348",
+      "doi": "10.1016/j.bmcl.2016.08.007",
+      "relationship": "explicit tricyclic oxazine/oxazepine-fused gefitinib analogues",
+      "compound_count": 14,
+      "activity_record_count": 23,
+      "use": "secondary rigidification and pose-retention challenge"
+    }
+  ],
+  "gefitinib_related_database": {
+    "activity_record_count": 120,
+    "unique_molecule_count": 75,
+    "unique_analogue_count_excluding_gefitinib_and_erlotinib": 73,
+    "normalization_rule": "Only compare or calculate fold changes within the same assay_chembl_id; do not pool IC50 values across documents or assays."
+  },
+  "secondary_sar_document": {
+    "document_chembl_id": "CHEMBL1129291",
+    "doi": "10.1021/jm9503613",
+    "compound_count": 64
+  }
+}

@@ -2,108 +2,217 @@
 
 一个从零实现的最小蛋白质-配体改造工作流。主工作流只读取当前项目中显式指定的任务和完整复合物 PDB，不扫描父目录，也不依赖原有工作流。配体三维坐标来自 PDB 的 `HETATM` 记录，化学键级、芳香性、电荷和氢数来自项目内对应的标准化学组件 CIF；运行时不把独立配体 SDF 作为输入契约。PDB `CONECT` 只用于校验原子连接集合，不再被当作完整键级定义。
 
-## 当前改动方案
+## 当前工作流：顺序式、位点锁定的局部优化
 
-当前默认任务采用 `LLM_BATCHED_MULTISITE_OPTIMIZATION.md` 中的批量多位点优化方案：启动时由宿主准备位点 dossier 和片段化学信息，LLM 负责批量规划候选与搜索方向，宿主批量完成几何筛选和 docking；工具查询保留为处理不确定性的可选能力。
-
-## 主工作流
+当前只保留顺序式的单候选优化流程，不保留 portfolio/batch 设计模式。每次 LLM 决策只提出一个单点 transformation；Host 完成确定性构建、几何检查、docking、pose/native-like 评价和相互作用分析，再把结果反馈给 LLM。
 
 ```text
 任务 + 完整共晶复合物 PDB
-  -> 从 PDB 和本地 CIF 恢复蛋白、配体坐标与化学拓扑
-  -> 宿主一次性生成 ligand/pocket/interaction/全部合法位点 dossier
-  -> 宿主加载完整片段库，并为每个位点提供紧凑、多样的片段面板
-  -> LLM 用 PLAN_BATCH 为多个位点一次规划多个单点改造
-  -> 宿主批量完成 RDKit 构建、价态/电荷、碰撞和结构去重
-  -> 几何通过者使用 screening seed 依次 docking
-  -> 将各位点几何通过率、分数、pose、interaction 和 best-so-far 反馈给 LLM
-  -> LLM 继续规划、刷新特定片段面板、降权/舍弃位点或选择 CONFIRM
-  -> 少量 finalist 使用完整多 seed docking
-  -> LLM 主动停止，或达到批次、候选和请求预算
-  -> 输出历史最佳候选和完整审计；RBFE 暂不进入实际循环
+  -> Host 从 PDB/CIF 恢复蛋白、配体坐标与化学拓扑
+  -> LLM 通过 QUERY 获取配体、口袋、相互作用和合法位点证据
+  -> LLM 用 assess_edit_sites 给所有可行位点排序并定义 site_type
+  -> Host 锁定当前最高优先级 active_target
+  -> LLM 一次提出一个新 transformation
+  -> Host 用 RDKit 构建、检查价态/电荷/碰撞/重复结构
+  -> 通过候选执行 docking、native-like pose gate、RMSD 和相互作用分析
+  -> Host 更新 candidate_history、docking_history 和 sar_memory
+  -> LLM 根据累计证据继续当前位点，或用 MARK_UNMODIFIABLE 关闭当前位点
+  -> Host 自动推进到下一个未关闭位点
+  -> 所有位点完成证据驱动搜索后，LLM STOP；RBFE 暂不进入主循环
 ```
 
-主工作流仍解析完整 PDB，但只向 LLM 发送有界的结构化 dossier，不发送完整原始坐标和两万余条片段记录。旧的逐候选 READY、位点锁定和 Coverage 行为继续保留，供兼容任务和专项实验使用。
+LLM 不批量提交多个候选，也不要求把整个片段库全部尝试一遍。搜索是按“位点—化学假设—单个候选—反馈”的闭环进行的。完整审计仍写入 run directory；docking 是固定协议下的排序和稳定性信号，不等价于实验活性或真实结合自由能。
 
-docking 和 AsyncFEP/RBFE 保留为配置驱动 adapter，但当前实际设计循环只运行到 docking。多 seed docking 按配置顺序串行执行，避免同一 GPU 上并发 GNINA 进程导致原生崩溃；单个 reference 或 candidate seed 失败时默认最多重试 2 次、间隔 2 秒，可通过 `docking.max_retries` 和 `docking.retry_delay_seconds` 调整。每次执行都保存独立审计，最终 seed 结果记录 `execution_attempt_count`、`retry_count` 和 `retry_history`。docking 为 `complete` 时，top-N pose 属性和外部程序审计会反馈给 LLM；LLM 可查询新证据并更换位点或片段。若 LLM 不修改候选，循环以 `no_candidate_revision_after_docking` 停止，避免重复 docking。RBFE 配置暂时保留但不会被主工作流或 ablation 调用，结果明确记录为 `deferred`，不会伪造分数。
+## LLM 与 Host 的边界
 
-## LLM 与工具边界
+当前有效动作包括：
 
-默认批量优化支持 `PLAN_BATCH`、`QUERY`、`QUERY_BATCH`、`CONFIRM` 和 `STOP`：
+- `QUERY` / `QUERY_BATCH`：获取尚未提供且能改变下一步决策的 Host 证据；`QUERY_BATCH` 只用于独立证据查询，不用于批量生成候选；
+- `READY`：提交一个具体的、单个位点的 transformation；
+- `MARK_UNMODIFIABLE`：在当前位点的证据驱动搜索结束后关闭该位点或一个明确的 modification family；
+- `STOP`：在全局搜索完成或安全预算耗尽时停止。
 
-- 基础配体、口袋、位点和片段化学信息由 `get_design_dossier` 一次性提供，不允许再逐条查询片段基础性质；
-- 工具调用只用于刷新某个位点的片段面板、parent-specific 环境、空间形状或 docking/interaction 不确定性；
-- 每个补充查询必须说明 `why_needed` 和 `decision_impact`，连续纯查询轮数受限；
-- `PLAN_BATCH` 中每个候选必须引用宿主提供的合法位点和该位点已提供的真实 `fragment_id`；
-- 每个候选必须说明位点证据、结构改变、预期作用、风险和成功标准；
-- 宿主负责精确 transformation、RDKit 构建、几何验证、去重和 docking，LLM 不能自由猜测切键或重写整个配体；
-- 位点可被 `promoted`、`deprioritized` 或 `discarded`，但不要求全部关闭后才能停止；
-- 达到批次、候选、LLM 请求或停滞预算时，宿主可以停止；不设置总运行时间上限。
+LLM 负责：
 
-旧模式仍支持 `READY`、`MARK_UNMODIFIABLE` 和原有证据门，用于兼容及 Coverage 实验。
+- 理解 SMILES、分子图、口袋几何和相互作用证据；
+- 选择当前 active target；
+- 提出可证伪的局部化学假设；
+- 选择一个操作和一个片段；
+- 根据历史 SAR、pose 和 docking 反馈决定继续、关闭位点或停止。
 
-## 编辑操作和片段库
+Host 负责：
 
-主工作流支持两种受控 transformation，并继续兼容旧的 `edit_atom_index + fragment_smiles` READY 格式：
+- 确定合法位点和允许操作；
+- 精确执行 RDKit transformation；
+- 检查价态、电荷、连接性、碰撞和结构重复；
+- 运行 docking、RMSD/native-like pose gate 和 PLIP；
+- 保存候选历史、失败记录、SAR memory 和 provenance。
+
+## 编辑位点和改变类型（两条正交轴）
+
+编辑不再用一个一维操作名描述，而是 **位点类型 × 改变类型**：
+
+```text
+site_type（在哪里改）        change_type（改什么）
+  atom    带可替换氢的原子      addition     成一根新键
+  bond    一根定向单键          deletion     切一根键并删掉相连部分
+  linker  两端保留的链原子      replacement  替换一个原子元素，或换掉相连部分
+  ring    环骨架原子
+```
+
+组合出的操作标签就是 `site_type:change_type`，例如 `atom:addition`、`bond:deletion`、`bond:replacement`、`ring:replacement`。
+
+每个位点在 dossier 中只列出**它自己允许**的改变类型（`allowed_change_types`）：
 
 ```json
-{"action":"READY","operation":"replace_hydrogen","edit_atom_index":10,"fragment_id":"fluoro","fragment_smiles":"[*:1]F","understanding":"...","edit_hypothesis":"..."}
+{
+  "target_type": "atom",
+  "site_type": "atom",
+  "target_id": 10,
+  "allowed_change_types": ["addition"]
+}
 ```
-
-`replace_hydrogen` 要求锚点有可替换氢。`replace_fragment` 不要求锚点有氢。LLM 不能自由猜测 `cut_bond`：它先调用 `list_fragment_replacement_sites`，宿主只枚举合法的定向非环单键切割，并为每个选项返回固定的 `replacement_site_id`、保留骨架、删除侧、连接原子、原子集合、片段 SMILES 和 attachment vector。默认排除删除超过原始重原子 40% 的方向，并可通过 `protected_core_atom_indices` 保护指定核心原子：
 
 ```json
-{"action":"READY","operation":"replace_fragment","replacement_site_id":"replacement-site-005","fragment_id":"fluoro","fragment_smiles":"[*:1]F","understanding":"...","edit_hypothesis":"..."}
+{
+  "target_type": "bond",
+  "site_type": "bond",
+  "target_id": "bond-site-005",
+  "cut_bond": [10, 9],
+  "allowed_change_types": ["deletion", "replacement"],
+  "removed_reference_interactions": [
+    {"kind": "hydrogen_bond", "protein_atom": "MET:A:793:N", "distance": 2.71}
+  ]
+}
 ```
 
-宿主由 `replacement_site_id` 恢复切键和方向，不接受 LLM 自由指定切键或删除集合。默认批量模式由宿主对每个 transformation 自动执行精确构建和碰撞检查，不要求 LLM 逐个调用 `validate_candidate_geometry`。候选始终只包含一个编辑位点；后续轮次可选择已验证 parent 在同一位点继续局部替换，但不在初始探索中组合多个位点。
+各自的要求：
 
-离线种子库位于 `molecular_agent/data/fragments.json`，可用 `search_fragment_library` 和 `get_fragment_record` 查询。常见化学名称通过 SMARTS 子结构匹配，其他词使用元数据文本匹配；结果严格遵守记录的 `operation` 或 `allowed_operations`，不会把仅标记为 `substitute` 的记录伪装成 `replace_fragment` 候选。项目提供 ChEMBL 导入器；ChEMBL 提供公开 REST API 和官方 FTP 下载，数据采用 CC BY-SA 3.0，并要求保留 ChEMBL ID、release 和署名。
+- `atom:addition`：位点必须有可替换氢；需要连接一个片段。
+- `bond:replacement`：必须使用 Host 返回的 `bond_site_id`，LLM 不能猜测 `cut_bond`、删除集合或连接方向。
+- `bond:deletion`：同样使用 `bond_site_id`，但**不需要片段**；Host 会移除该侧并让锚点补氢。
+- `atom:replacement` / `ring:replacement`：换一个原子的元素，需要 `element`，不需要片段。环骨架上的元素替换会被报告为 T2。
 
-小规模抽样可继续使用 REST 模式。全量构建应使用官方 `chemreps` FTP 快照：下载支持 `curl` 断点续传和官方 SHA256 校验，BRICS 派生状态保存在 SQLite checkpoint 中，中断后重新执行相同命令即可恢复：
+`deletion` 的关键差别是：它的后果是 **Host 可确定计算的事实**，不是预测。位点会给出 `removed_heavy_atoms`、`removed_fragment_smiles` 以及 `removed_reference_interactions`（哪些参考接触会消失），由 LLM 判断这个代价是否值得。
 
-```bash
-mamba run -n molecular-agent python scripts/download_chembl_fragments.py \
-  --source ftp \
-  --molecules 0 \
-  --max-parent-mw 350 \
-  --max-fragment-heavy-atoms 12 \
-  --cache-dir cache \
-  --checkpoint molecular_agent/data/chembl_fragments.checkpoint.sqlite \
-  --output molecular_agent/data/chembl_fragments.json
+`linker:addition` / `linker:deletion`（内部连接子长度调整）已经在 taxonomy 中定义，但当前阶段不发射 linker 位点、也不执行：链长变化会移动整个下游片段，需要在非刚性协议下单独定义评价方式。
+
+这些改变类型不是 LLM 自由发明的，而是由以下信息共同决定：
+
+```text
+分子图合法性
++ 位点原子类型和氢数
++ 原始配体局部化学环境
++ 口袋接触和相互作用
++ 外向向量与空间 clearance
++ 片段的 operation compatibility
 ```
 
-原始全量派生库保留所有合法单连接点片段。工作流建议使用保守精炼子集：至少两个 ChEMBL 来源分子支持，仅保留常见药化元素、中性且无自由基的片段，并去除 RDKit PAINS/Brenk 警示：
+## 顺序式多位点搜索策略
 
-```bash
-mamba run -n molecular-agent python scripts/filter_fragment_library.py \
-  --input molecular_agent/data/chembl_fragments.json \
-  --output molecular_agent/data/chembl_fragments_working.json \
-  --min-source-molecules 2
+当存在多个位点时，不是把所有位点同时提交给 LLM，也不是修改一个位点后自动把新分子再累积修改另一个位点。当前策略是：
+
+1. Host 列出所有合法位点；
+2. LLM 根据配体化学、口袋环境、相互作用和空间信息给位点排序；
+3. Host 将最高优先级未关闭位点设置为 `active_target`；
+4. 当前位点一次只测试一个候选；
+5. 当前位点关闭后，Host 才推进到下一个位点；
+6. 默认每个候选都从原始共晶配体构建，除非明确启用同一位点的 parent-child 局部优化策略；
+7. 不允许把不同位点的编辑自动组合到一个分子中。
+
+因此，多位点搜索更接近：
+
+```text
+site A: hypothesis 1 -> feedback -> hypothesis 2 -> close
+site B: hypothesis 1 -> feedback -> hypothesis 2 -> close
+site C: ...
 ```
 
-在任务 JSON 中用 `fragment_library_path` 指向工作库。联网只发生在显式执行导入脚本时，设计工作流始终读取本地快照。ChEMBL 来源：`https://www.ebi.ac.uk/chembl/`；许可与署名：`https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/`。
+而不是：
 
-项目还提供统一片段库，由 10 条 CC0 curated seed 片段和 ChEMBL working 子集合并生成：
-
-```bash
-mamba run -n molecular-agent-docking python scripts/build_unified_fragment_library.py \
-  --seed molecular_agent/data/fragments.json \
-  --working molecular_agent/data/chembl_fragments_working.json \
-  --output molecular_agent/data/fragments_unified.json
+```text
+site A + site B + site C 一次规划并行生成
 ```
 
-统一库为每条记录保留 `fragment_id`、`name`、`smiles`、来源记录、`allowed_operations` 和 ChEMBL provenance，并写入确定性的 `size_class` 与 `chemical_tags`。尺寸层级为 `minimal`（1 个重原子）、`small`（2-4）、`medium`（5-8）和 `large`（9-12）；同时保存电荷、分子量、LogP、HBD、HBA、TPSA、环数和可旋转键等基础性质。`size_class` 是 LLM 可选择的动作空间，不是宿主强制的小到大执行顺序。`search_fragment_library` 和 `generate_site_candidate_batch` 支持用 `size_class`、`chemical_tag` 过滤，最终候选仍必须经过几何验证和 docking。
+## 如何避免穷举所有片段
+
+LLM 不以“未使用片段数量”作为继续搜索的理由。每个新候选必须满足至少一个明确目的：
+
+- 验证一个新的相互作用假设；
+- 测试一个空间方向或体积级别；
+- 比较极性、疏水性、芳香性或氢键能力变化；
+- 针对上一个候选的失败原因做结构性修正；
+- 检验一个局部 SAR 趋势；
+- 对一个 native-like pose 中保留/丢失的 interaction 做定向补偿。
+
+搜索优先使用：
+
+```text
+同一位点
++ 尚未尝试的化学 family
++ 与当前口袋和方向匹配的片段
++ 能区分两个竞争假设的候选
+```
+
+`search_fragment_library` 和 `get_fragment_panel` 用于按化学标签、大小和 operation compatibility 取得候选；`get_fragment_spatial_profile` 只在片段的形状或延伸范围会改变决策时调用。没有决策相关假设时，不继续查询或生成新片段。
+
+## 位点何时停止
+
+位点不会因为固定尝试次数自动关闭，也不会因为一个候选变差就关闭。当前停止逻辑分三层：
+
+### 1. 硬性不可行
+
+如果 Host 证明位点不能进行合法编辑，例如：
+
+- 没有可替换氢；
+- 没有合法 replacement site；
+- 所有允许操作均违反价态或连接性；
+- 所有候选都发生确定性严重碰撞；
+- site table 将位点标记为 protected/hard-reject；
+
+则可以由 LLM 用 `MARK_UNMODIFIABLE` 关闭。
+
+### 2. 局部证据饱和
+
+如果当前位点已经测试了若干**化学上不同**的假设，并且：
+
+- 没有 native-like 且 docking proxy 改善的候选；
+- 新候选重复已有 modification family；
+- clearance、碰撞或构象问题持续出现；
+- 关键 interaction 持续丢失；
+- SAR memory 不再支持新的可区分方向；
+
+LLM 可以在引用这些证据后关闭位点。
+
+### 3. 仍有明确可检验方向
+
+如果当前位点虽然已有失败候选，但仍然存在：
+
+- 一个未测试的化学 family；
+- 一个由口袋几何支持的方向；
+- 一个保留 anchor 的 native-like 改造；
+- 一个可以验证当前 SAR 假设的替代片段；
+
+则不能仅因为 docking 变差就关闭位点，应继续提出一个新的单候选。
+
+`local_patience` 目前是 Host 给 LLM 的复查信号，不是“达到 N 次就自动停止”的科学结论。最终的 `MARK_UNMODIFIABLE` 必须保留理由和证据。
 
 ## Docking 趋势和收敛
 
-`docking_optimization` 配置主指标、显著改善阈值、seed 稳定性和硬安全上限。每轮同时记录原始 attempt score 与单调不下降的 best-so-far 轨迹；允许探索候选变差，不会伪造成每轮都改善。以 `minimizedAffinity` 为主指标时，candidate-reference delta 越负越好。候选必须达到 `minimum_seed_win_fraction` 才进入历史最佳竞争，quality 还会按 `seed_stddev_penalty * seed标准差` 扣分，避免由单一 seed 驱动选择。
+`docking_optimization` 配置主指标、显著改善阈值、seed 稳定性和硬安全上限。每轮同时记录原始 attempt score 与单调 best-so-far 轨迹；允许探索候选变差，不会伪造成每轮都改善。以 `minimizedAffinity` 为主指标时，candidate-reference delta 越负越好。候选必须达到 `minimum_seed_win_fraction` 才进入历史最佳竞争，quality 还会按 `seed_stddev_penalty * seed 标准差` 扣分。
 
-默认 `batch_optimization.enabled=true` 时采用多位点 portfolio 搜索。首轮可同时测试多个位点；后续根据各位点几何通过率、docking quality、seed 稳定性、pose 共识和相互作用变化动态分配预算。表现落后的位点可以降权或舍弃，不需要逐一声明不可修改。候选可以变差，但程序持续维护 best-so-far 和 elite archive。
+只有在以下信息同时被考虑后，LLM 才应决定是否继续：
 
-screening 默认只使用 seed 17；LLM 用 `CONFIRM` 选择最多两个 finalist 后，再使用 17、29、43 做完整确认。旧的 `search_policy.mode=adaptive`、site lock、`READY` 和 `MARK_UNMODIFIABLE` 流程仍保留，但只在关闭批量模式后使用。
+```text
+docking proxy
++ seed 稳定性
++ native-like pose / RMSD
++ interaction retained/gained/lost
++ 当前位点的化学 family 覆盖
++ 仍未验证的合理假设
+```
 
-这类收敛只表示固定 docking 协议下的搜索平台，不等价于实验活性或真实结合自由能收敛。
+这些信号仍然不能直接解释为实验活性。
 
 ## 示例体系
 
@@ -127,12 +236,72 @@ mamba run -n molecular-agent python -m molecular_agent.cli \
 
 ```bash
 cp config.example.json config.json
-export OPENAI_API_KEY='...'
+# 将 API key 直接填写到 config.json 的 api_key 字段
 mamba run -n molecular-agent python -m molecular_agent.cli \
   --task input/task.json --config config.json --run-dir runs/live
 ```
 
-默认示例端点为 `https://api.p1-103n1x.com/v1`，客户端调用 Responses API 的 `/responses`。配置可用 `api_key_file` 指定纯文本 key 文件；环境变量优先于该文件。CLI 默认实时打印 LLM 决策、工具调用、候选几何检查、docking 命令、相对分数趋势和停止原因，并将完整审计 JSON 写入 `--run-dir`；使用 `--quiet` 可关闭实时事件，使用 `--full-json` 可在结束时额外打印完整结果。
+默认示例端点为 `https://api.p1-103n1x.com/v1`，客户端调用 Responses API 的 `/responses`。配置可用 `api_key` 直接填写 key，也可用 `api_key_file` 指定纯文本 key 文件；配置文件中的 `api_key` 优先，其次才读取环境变量或 Codex 凭据。CLI 默认实时打印 LLM 决策、工具调用、候选几何检查、docking 命令、相对分数趋势和停止原因，并将完整审计 JSON 写入 `--run-dir`；使用 `--quiet` 可关闭实时事件，使用 `--full-json` 可在结束时额外打印完整结果。
+
+### 一次性 Playwright MCP 研究与图片输入
+
+任务文件可以配置原生 MCP stdio 研究。Host 会在第一次 LLM 请求前启动一次 MCP server，执行固定的 `calls`，将文本、来源、结构文件和截图保存到运行目录的 `external-research/`，后续迭代只复用保存的结果，不再浏览：
+
+```json
+{
+  "external_research": {
+    "enabled": true,
+    "required": true,
+    "transport": "mcp_stdio",
+    "mcp_command": ["npx", "-y", "@playwright/mcp@0.0.82", "--headless", "--browser", "chromium", "--no-sandbox", "--image-responses", "allow"],
+    "environment": {"PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS": "1"},
+    "include_tool_catalog": true,
+    "calls": [
+      {"tool": "browser_navigate", "arguments": {"url": "https://www.rcsb.org/structure/1H1Q"}},
+      {"tool": "browser_snapshot", "arguments": {}},
+      {"tool": "browser_take_screenshot", "arguments": {"fullPage": true}}
+    ]
+  }
+}
+```
+
+`--image-responses allow` 负责让 MCP 返回图片；`--caps vision` 只负责额外的坐标鼠标操作，并不是视觉模型开关。研究返回的图片会保存为 artifact，ResponsesClient 会把它们转换为 `input_image`；Chat Completions 则转换为 `image_url`。如果当前模型或供应商不支持图片输入，在 LLM 配置中设置 `"send_images": false`，此时仍会保留图片文件和文本/结构化证据。
+
+当前输入提供了一个不覆盖原始 `input/task.json` 的单编辑配置。推荐统一使用本地 `config.single_edit.json`（已加入 `.gitignore`），填写 `base_url`、`model`、`api_key`；不设置 `codex_config_dir`，避免覆盖 endpoint/model。不需要 export。不要将真实 key 放入受版本控制的 example 文件。
+
+```bash
+# config.single_edit.json 不存在时，从 config.single_edit.example.json 复制并填写
+mamba run -n molecular-agent-docking python -m molecular_agent.cli --task input/task.single_edit.json --config config.single_edit.json --run-dir "runs/single-edit-$(date +%Y%m%d-%H%M%S)"
+```
+
+**先校准，再设计：** 当前任务已启用 `pose_retention`。浏览器/LLM 运行前，Host 检查原配体全部 top-N redocking poses 对共晶的核心恢复和少数原子级锚点，要求至少两个 seed 支持同一 family，冻结 redocked 主参考。候选自由 docking，按对冻结参考的直接核心 RMSD/锚点门控后才排序；不固定骨架坐标，不回退 rank 1。受体保留 TPO 等白名单修饰残基。校准失败会明确停止，而不是继续增加候选。协议、默认阈值、离线审计工具和当前未通过的真实校准结果详见 [POSE_RETENTION.md](POSE_RETENTION.md)。
+
+`input/task.single_edit.json` 的第一阶段外部研究只访问对应 RCSB 结构页面 `https://www.rcsb.org/structure/1H1Q` 及其 RCSB entry/chemical-component JSON 记录，随后保存 snapshot 和结构页面 screenshot。不做 PubChem、ChEMBL、BindingDB、UniProt 或在线 SDF 下载。该阶段只提取结构身份、实验质量、配体身份、结合位点/报道 anchor、构建体/突变/物种和文献元数据；原子坐标、分子图、精确距离、RMSD、native-like pose、当前候选相互作用和 docking 仍由 Host 权威生成。导航说明不再伪装为 SDF 文件。
+
+首个 LLM 请求专门分析文本和截图，返回最多 12 条有 source_id 的结构观察和不确定性，保存 `research-memory.json`。观察区分 reported_fact、visual_observation、hypothesis；Host 只校验格式与来源引用，不宣称验证了模型解读。后续所有设计请求只带摘要，不带图片、原始网页或 MCP 工具目录。恢复运行复用已保存摘要；不完整摘要阻止进入设计。原始证据继续留作审计。
+
+单编辑模式禁止 `parent_attempt`：每次都从原始共晶配体构造一个候选，不累积以前的修改。位点仍由 LLM 自选。best-so-far 只参与比较，不是构造基底；主 docking 指标始终与原始配体的同 seed baseline 比较。每轮保留一份原始配体完整图和性质，性质不重复在 ligand 顶层展开。候选完整图/性质保存为 `molecule-attempt-XX.json`，不把全部历史图重发给模型。
+
+暂时不会访问 PubChem、ChEMBL、UniProt、DrugBank 或 BindingDB。原始输入中的 `input/raw/2A6.cif` 和 `input/ligand.sdf` 仍作为 Host 的本地结构依据。当前机器中 GNINA 和 PLIP 都位于 `molecular-agent-docking` 环境，因此实际运行使用该环境；MCP 客户端通过 `PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1` 跳过 Playwright 的依赖预检，并使用已经验证可以启动的 Chromium。
+
+PLIP 已安装并验证：
+
+```text
+PLIP 3.0.1
+molecular-agent-docking/bin/plip
+```
+
+启用 `plip.enabled` 后，Host 将指定 pose 自动组装为受体复合物并调用 PLIP，保存 `evaluated-complex.pdb`、`report.xml`、`interaction-result.json`、`atom-mapping.json` 和日志。新门控流程分析通过几何预筛的各 poses，最终反馈绑定到所选 Evaluation Pose；未启用门控的旧流程仍使用 rank 1。采用 `--nohydro --nofix`，不让 PLIP 补氢、修复或优化坐标；PDB 投影精度为 0.001 Å。缺氢可能影响氢键识别，PDB 键感知也不等同于 SDF 化学权威，这些限制记录在结果中。
+
+下一轮反馈包含按 seed 的 interaction-type/residue 保留、新增、丢失和计数，不发送原始 XML。PLIP 软反馈失败标记 unavailable，不当作零相互作用；如果显式配置了 PLIP 原子级硬锚点，其评价失败则不能放行该 pose。当前 1H1Q 硬锚点使用 Host 独立的供体/羰基受体几何检查，其余 PLIP 作用是软反馈。集成 smoke test 不是候选优化效果证明。
+
+### 4WKQ 结构测试与盲标签小库方案
+
+新增独立结构校准任务 `4WKQ/task.calibration.json`，不覆盖旧 1H1Q 任务。4WKQ–gefitinib 已完成真实三 seed 原配体校准，三个 seed 均通过固定核心与 MET793 原子级氢键门控。输入显式氢、CCD 的 `CL` 元素符号及 CSX797 保留策略已经处理。
+
+78条匿名混合侧链库已冻结在 `4WKQ/design/`；正式闭集任务为 `4WKQ/task.benchmark.json`，只允许 C6 单编辑，每次展示完整78条目录，最多20个唯一候选，实验标签与成员映射仅由私有离线评估器读取。已真实跑完一轮20候选、三seed随机基线并完成独立评价，未调用付费LLM。初始构象碰撞在此 benchmark 中保留为诊断，最终 docking poses 必须通过重原子碰撞、RMSD及锚点门控。
+
+运行命令、隔离边界、评估方式及实际验证结果见 [`4WKQ/BENCHMARK_RUNNING.md`](4WKQ/BENCHMARK_RUNNING.md)；方案依据见 [`4WKQ/BENCHMARK_PLAN.md`](4WKQ/BENCHMARK_PLAN.md)。此任务是隐藏活性标签的回顾性选择/重发现，不是结构完全留出的 de novo 发现测试。
 
 ### 选择多个 LLM（不替换原配置）
 
@@ -140,12 +309,12 @@ CLI 和 `run_docking_loop_test.sh` 均支持 `--llm current|gpt-5.4-mini|gpt-5.6
 
 - `current`：沿用原 `--config` 中的模型/端点/Codex 配置，默认仍是原模型。
 - `gpt-5.4-mini`：沿用 `current` 的端点、Codex 配置和认证信息，仅把模型覆盖为 `gpt-5.4-mini`，继续使用 Responses API。
-- `gpt-5.6-luna`：沿用 `current` 的端点、Codex 配置和认证信息，仅把模型覆盖为 `gpt-5.6-luna`，继续使用 Responses API。
+- `gpt-5.6-luna`：沿用 `current` 的端点、Codex 配置和认证信息，仅把模型覆盖为 `gpt-5.6-luna`，继续使用 Responses API。考虑到该端点曾出现连接重置，Luna profile 使用 600 秒请求/重试窗口、最多 5 次重试和 10 秒重试间隔。客户端启用 curl `--retry-all-errors`，因此 TLS reset 等错误也会自动重试。
 - `doubao`：使用火山方舟 `https://ark.cn-beijing.volces.com/api/v3/responses` 和模型 `doubao-seed-evolving`，从 `ARK_API_KEY` 或项目外的 `~/.config/simple-molecular-agent/doubao-api-key` 读取认证信息。
 - `deepseek`：加载 `molecular_agent/data/llm_profiles.json` 中的独立配置，使用 Chat Completions 协议，不读取原模型的认证信息。
 - 未指定时读取配置的 `llm_profile`，缺省为 `current`。脚本把显式选择写入该运行的 `runtime-config.json`；恢复时省略参数则沿用运行配置。直接 CLI 的 `--llm` 是本次调用覆盖，恢复时请再次指定。
 
-DeepSeek 暂按官方端点 `https://api.deepseek.com/v1`、模型 ID `deepseek-v4-pro` 配置，尚未真实验证服务端是否支持。优先读取 `DEEPSEEK_API_KEY`，否则读取项目外的 `~/.config/simple-molecular-agent/deepseek-api-key`（权限应为 `600`）。不要把明文 Key 写入配置或 Git。
+DeepSeek 使用官方端点 `https://api.deepseek.com/v1`、模型 ID `deepseek-flash`（Chat Completions 协议）。优先读取 `DEEPSEEK_API_KEY`，否则读取项目外的 `~/.config/simple-molecular-agent/deepseek-api-key`（权限应为 `600`）。不要把明文 Key 写入配置或 Git。
 
 新建真实测试（会调用付费 LLM 和 GNINA；使用唯一运行目录）：
 
@@ -175,12 +344,12 @@ RUN_ROOT=runs/deepseek-$(date +%Y%m%d-%H%M%S) ./run_docking_loop_test.sh --real 
 RUN_ROOT=runs/docking-loop-real-160 ./run_docking_loop_test.sh --real --resume --llm deepseek --skip-tests
 ```
 
-模型选择不会修改 docking/RBFE 参数，也不做自动故障切换。每次 CLI 启动会追加非敏感的 `llm-selection.jsonl`，记录所选 profile、模型和端点；同一次运行切换模型后属于混合模型运行，不能作为单模型对照实验。
+模型选择不会修改 docking/RBFE 参数，也不做自动故障切换。每次 CLI 启动会追加非敏感的 `llm-selection.jsonl`，记录所选 profile、模型、端点和有效重试参数；同一次运行切换模型后属于混合模型运行，不能作为单模型对照实验。
 
 若供应商的模型 ID 或端点不同，可在主配置增加覆盖（不改原模型字段）：
 
 ```json
-{"llm_profiles": {"deepseek": {"base_url": "https://api.deepseek.com/v1", "model": "deepseek-v4-pro"}}}
+{"llm_profiles": {"deepseek": {"base_url": "https://api.deepseek.com/v1", "model": "deepseek-flash"}}}
 ```
 
 ### LLM 工作记忆与完整审计
@@ -208,7 +377,7 @@ RUN_ROOT=runs/docking-loop-codex-gpt56-20260902-171109 \
   ./run_docking_loop_test.sh --real --resume --skip-tests
 ```
 
-恢复时 attempt 编号从旧 history 的最大编号之后继续；如果上次停在 parent local batch，恢复会重新请求尚未成功记录的工具调用，然后继续 local child docking。恢复前应确认代码、task、fragment library、docking config 与原运行一致。
+恢复时 attempt 编号从旧 history 的最大编号之后继续；如果上次停在 parent 局部优化，恢复会重新请求尚未成功记录的工具调用，然后继续同一位点的 local child docking。恢复前应确认代码、task、fragment library、docking config 与原运行一致。
 
 ## 独立工具预算对比实验
 
@@ -300,6 +469,8 @@ ABLATION_BASE_URL="https://your-compatible-endpoint/v1" \
 ABLATION_MODEL=gpt-5.6-sol \
 ./run_ablation.sh
 ```
+
+以下描述的是**未启用 `pose_retention` 的旧流程**；当前单编辑任务请以 [POSE_RETENTION.md](POSE_RETENTION.md) 的全 pose 门控和冻结参考协议为准。
 
 主工作流读取配置中的模型和端点；`config.aicloud.json` 已配置为从 `~/.codex` 读取 `gpt-5.6-sol` 和 Responses API endpoint，不受独立 ablation 的 `ABLATION_MODEL` 或 `ABLATION_BASE_URL` 影响。若在 `config.json` 或 `config.aicloud.json` 中启用 `docking.command`，候选通过几何检查后会写出 protein-only receptor、reference-ligand、候选 constrained pose。系统默认使用 `[17, 29, 43]` 三个固定 seed；对每个 seed，先在 `docking-reference-baseline/seed-*/` 中用同一 receptor、同一 reference autobox 和同一 GNINA 参数独立重对接参考分子，再在 `docking-attempt-XX/seed-*/` 中对接候选，并按相同 seed 配对比较。结果包含每个 seed 的 rank-1 分数、差值、均值、样本标准差、范围、候选胜出次数和胜率。每个 seed 还分别记录 GNINA rank-1 和按各评分指标选择的最优 pose；三个 seed 的 rank-1 pose 会在共享受体坐标系中计算重原子 RMSD 共识，并与参考配体比较跨 seed 残基接触共识。对于 `minimizedAffinity`，更负表示相对更好；对于 `CNNscore`、`CNNaffinity` 和 `CNN_VS`，更正表示相对更好。命令、stdout/stderr、返回码、docked SDF 和 pose 属性摘要会分别写入各 seed 目录。该差值和 pose 共识只是同一协议下的排序与稳定性指标，不是实验亲和力或活性结论。`rbfe` 配置仅保留供未来阶段使用，本轮不执行。Codex 配置有效后，主工作流会使用 `gpt-5.6-sol`；不需要在项目中保存 API key。
 

@@ -1,0 +1,15 @@
+{
+  "slide_count": 5,
+  "white_backgrounds": 5,
+  "mermaid_slides": [
+    2,
+    3,
+    5
+  ],
+  "embedded_mermaid_svg_count": 3,
+  "original_coordinates_unchanged": true,
+  "generative_structure_images_used": false,
+  "out_of_bounds_shapes": [],
+  "llm_best_delta": -0.36725333333333293,
+  "random_best_delta": -0.507423333333333
+}

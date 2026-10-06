@@ -1,0 +1,17 @@
+{
+  "output": "deliverables/科研汇报_保留骨架的分子优化智能体_白底紧凑版.pptx",
+  "slide_count": 7,
+  "white_backgrounds": 7,
+  "workflow_slides": [
+    3,
+    4,
+    5
+  ],
+  "native_workflows_and_plots": true,
+  "llm_candidate_count": 20,
+  "pose_passing": 20,
+  "stability_eligible": 16,
+  "llm_best_delta": -0.36725333333333293,
+  "random_best_delta": -0.507423333333333,
+  "out_of_bounds_shapes": []
+}

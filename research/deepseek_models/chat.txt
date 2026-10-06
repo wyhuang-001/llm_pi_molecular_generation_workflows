@@ -1,0 +1,663 @@
+Skip to main content
+DeepSeek API Docs
+Resources
+English
+DeepSeek Platform
+Quick Start
+API Guides
+API Reference
+News
+Change Log
+Chat Completions API
+Responses API
+FIM Completion API (Beta)
+Lists Models
+Get User Balance
+Files
+Upload File
+List Files
+Retrieve File
+Delete File
+Chat Completions API
+POST
+/chat/completions
+
+Creates a model response for the given chat conversation.
+
+Request​
+APPLICATION/JSON
+
+BODY
+
+REQUIRED
+
+messages
+
+object[]
+
+REQUIRED
+
+Possible values: >= 1
+
+A list of messages comprising the conversation so far.
+
+Array [
+
+oneOf
+
+System message
+User message
+Assistant message
+Tool message
+content
+string
+REQUIRED
+
+The contents of the system message.
+
+role
+string
+REQUIRED
+
+Possible values: [system]
+
+The role of the messages author, in this case system.
+
+name
+string
+
+An optional name for the participant. Provides the model information to differentiate between participants of the same role.
+
+]
+
+model
+string
+REQUIRED
+
+Possible values: [deepseek-flash, deepseek-v4-pro]
+
+ID of the model to use. Use deepseek-flash or deepseek-v4-pro.
+
+thinking
+
+object
+
+NULLABLE
+
+Controls the switch between thinking and non-thinking mode.
+
+type
+string
+
+Possible values: [enabled, disabled]
+
+Default value: enabled
+
+If set to enabled, then use thinking mode. If set to disabled, then use non-thinking model.
+
+reasoning_effort
+string
+
+Possible values: [none, low, high, max]
+
+Controls the thinking mode toggle and the thinking effort. none disables thinking mode; low / high / max enable thinking mode. The default effort is high. For compatibility with existing software, minimal is accepted and mapped to low, and medium / xhigh are accepted and mapped to high.
+
+max_tokens
+integer
+NULLABLE
+
+The maximum number of tokens that can be generated in the chat completion.
+
+The total length of input tokens and generated tokens is limited by the model's context length.
+
+The value must be between 1 and 384K (393216). When not set, the default is 8K in non-thinking mode, 64K in thinking mode (128K with reasoning_effort set to max). Please refer to the Models & Pricing page for details.
+
+response_format
+
+object
+
+NULLABLE
+
+An object specifying the format that the model must output. Setting to { "type": "json_object" } enables JSON Output, which guarantees the message the model generates is valid JSON.
+
+Important: When using JSON Output, you must also instruct the model to produce JSON yourself via a system or user message. Without this, the model may generate an unending stream of whitespace until the generation reaches the token limit, resulting in a long-running and seemingly "stuck" request. Also note that the message content may be partially cut off if finish_reason="length", which indicates the generation exceeded max_tokens or the conversation exceeded the max context length.
+
+type
+string
+
+Possible values: [text, json_object]
+
+Default value: text
+
+Must be one of text or json_object.
+
+stop
+string | string[]
+
+NULLABLE
+
+Up to 16 sequences where the API will stop generating further tokens.
+
+oneOf
+
+Single stop sequence
+Stop sequence list
+
+string
+
+stream
+boolean
+NULLABLE
+
+If set, partial message deltas will be sent. Tokens will be sent as data-only server-sent events (SSE) as they become available, with the stream terminated by a data: [DONE] message.
+
+stream_options
+
+object
+
+NULLABLE
+
+Options for streaming response. Must be set together with stream: true; if stream is not set to true, the API returns a 400 error.
+
+include_usage
+boolean
+
+If set to true, all chunks in the stream will include a usage field, whose value is null on every chunk except the last one. If omitted or set to false, the usage field is absent from all chunks except the last one.
+
+Either way, the last chunk before the data: [DONE] message carries the token usage statistics for the entire request in its usage field. Note that no separate usage-only chunk is emitted: the statistics ride on the last content chunk, whose choices array always contains exactly one element that carries no new content and a non-null finish_reason.
+
+temperature
+number
+NULLABLE
+
+Possible values: <= 2
+
+Default value: 1
+
+What sampling temperature to use, between 0 and 2. Higher values like 0.8 will make the output more random, while lower values like 0.2 will make it more focused and deterministic.
+
+We generally recommend altering this or top_p but not both. Has no effect in thinking mode.
+
+top_p
+number
+NULLABLE
+
+Possible values: <= 1
+
+Default value: 1
+
+An alternative to sampling with temperature, called nucleus sampling, where the model considers the results of the tokens with top_p probability mass. So 0.1 means only the tokens comprising the top 10% probability mass are considered.
+
+The value must be greater than 0 and at most 1. We generally recommend altering this or temperature but not both. It only takes effect in thinking mode, where the effective range is 0.95–1.0: values below 0.95 are treated as 0.95. In non-thinking mode it is fixed at 1.0 and the value you pass is ignored.
+
+tools
+
+object[]
+
+NULLABLE
+
+A list of tools the model may call. Currently, only functions are supported as a tool. Use this to provide a list of functions the model may generate JSON inputs for. Tool names must be unique.
+
+Array [
+
+type
+string
+REQUIRED
+
+Possible values: [function]
+
+The type of the tool. Currently, only function is supported.
+
+function
+
+object
+
+REQUIRED
+
+description
+string
+
+A description of what the function does, used by the model to choose when and how to call the function.
+
+name
+string
+REQUIRED
+
+The name of the function to be called. Must be a-z, A-Z, 0-9, or contain underscores and dashes, with a maximum length of 128.
+
+parameters
+
+object
+
+The parameters the functions accepts, described as a JSON Schema object. See the Tool Calls Guide for examples, and the JSON Schema reference for documentation about the format.
+
+Omitting parameters defines a function with an empty parameter list.
+
+property name*
+any
+
+The parameters the functions accepts, described as a JSON Schema object. See the Tool Calls Guide for examples, and the JSON Schema reference for documentation about the format.
+
+Omitting parameters defines a function with an empty parameter list.
+
+strict
+boolean
+
+Default value: false
+
+If set to true, the API will use strict-mode for the tool calls to ensure the output always complies with the function's JSON schema. This is a Beta feature, for more details please refer to Tool Calls Guide
+
+]
+
+tool_choice
+string | object
+
+NULLABLE
+
+Controls which (if any) tool is called by the model.
+
+none means the model will not call any tool and instead generates a message.
+
+auto means the model can pick between generating a message or calling one or more tools.
+
+required means the model must call one or more tools.
+
+Specifying a particular tool via {"type": "function", "function": {"name": "my_function"}} forces the model to call that tool.
+
+none is the default when no tools are present. auto is the default if tools are present.
+
+required and named tool choices are not supported in thinking mode; the API returns a 400 error. Disable thinking mode first to use them.
+
+oneOf
+
+ChatCompletionToolChoice
+ChatCompletionNamedToolChoice
+
+string
+
+Possible values: [none, auto, required]
+
+logprobs
+boolean
+NULLABLE
+
+Whether to return log probabilities of the output tokens or not. If true, returns the log probabilities of each output token returned in the content of message.
+
+top_logprobs
+integer
+NULLABLE
+
+Possible values: <= 20
+
+An integer between 0 and 20 specifying the number of most likely tokens to return at each token position, each with an associated log probability. logprobs must be set to true if this parameter is used.
+
+user_id
+NULLABLE
+
+A custom user_id. Allowed character set is [a-zA-Z0-9\-_], with a maximum length of 512. Do not include user privacy information in the user_id.
+
+user_id can be used to distinguish user identities on your side to help us with content safety review.
+user_id can be used for KVCache isolation for privacy management.
+user_id can be used for scheduling isolation of users on your business side.
+For more details on the user_id parameter, please refer to Rate Limit & Isolation
+frequency_penalty
+DEPRECATED
+
+This parameter is no longer supported. It will not take effect if you pass it to the API.
+
+presence_penalty
+DEPRECATED
+
+This parameter is no longer supported. It will not take effect if you pass it to the API.
+
+Responses​
+200 (No streaming)
+200 (Streaming)
+
+OK, returns a chat completion object
+
+APPLICATION/JSON
+Schema
+Example (from schema)
+Example
+
+SCHEMA
+
+id
+string
+REQUIRED
+
+A unique identifier for the chat completion.
+
+choices
+
+object[]
+
+REQUIRED
+
+A list of chat completion choices.
+
+Array [
+
+finish_reason
+string
+REQUIRED
+
+Possible values: [stop, length, content_filter, tool_calls, insufficient_system_resource, aborted]
+
+The reason the model stopped generating tokens. This will be stop if the model hit a natural stop point or a provided stop sequence, length if the maximum number of tokens specified in the request was reached, content_filter if content was omitted due to a flag from our content filters, tool_calls if the model called a tool, insufficient_system_resource if the request is interrupted due to insufficient resource of the inference system, or aborted if the generation was interrupted.
+
+index
+integer
+REQUIRED
+
+The index of the choice in the list of choices.
+
+message
+
+object
+
+REQUIRED
+
+A chat completion message generated by the model.
+
+content
+string
+NULLABLE
+REQUIRED
+
+The contents of the message.
+
+reasoning_content
+string
+NULLABLE
+
+For thinking mode only. The reasoning contents of the assistant message, before the final answer.
+
+tool_calls
+
+object[]
+
+The tool calls generated by the model.
+
+Array [
+
+id
+string
+REQUIRED
+
+The ID of the tool call.
+
+type
+string
+REQUIRED
+
+Possible values: [function]
+
+The type of the tool. Currently, only function is supported.
+
+function
+
+object
+
+REQUIRED
+
+The function that the model called.
+
+name
+string
+REQUIRED
+
+The name of the function to call.
+
+arguments
+string
+REQUIRED
+
+The arguments to call the function with, as generated by the model in JSON format. Note that the model does not always generate valid JSON, and may hallucinate parameters not defined by your function schema. Validate the arguments in your code before calling your function.
+
+]
+
+role
+string
+REQUIRED
+
+Possible values: [assistant]
+
+The role of the author of this message.
+
+logprobs
+
+object
+
+NULLABLE
+
+REQUIRED
+
+Log probability information for the choice.
+
+content
+
+object[]
+
+NULLABLE
+
+REQUIRED
+
+A list of message content tokens with log probability information.
+
+Array [
+
+token
+string
+REQUIRED
+
+The token.
+
+logprob
+number
+REQUIRED
+
+The log probability of this token, if it is within the top 20 most likely tokens. Otherwise, the value -9999.0 is used to signify that the token is very unlikely.
+
+bytes
+integer[]
+NULLABLE
+REQUIRED
+
+A list of integers representing the UTF-8 bytes representation of the token. Useful in instances where characters are represented by multiple tokens and their byte representations must be combined to generate the correct text representation. Can be null if there is no bytes representation for the token.
+
+top_logprobs
+
+object[]
+
+REQUIRED
+
+List of the most likely tokens and their log probability, at this token position. In rare cases, there may be fewer than the number of requested top_logprobs returned.
+
+Array [
+
+token
+string
+REQUIRED
+
+The token.
+
+logprob
+number
+REQUIRED
+
+The log probability of this token, if it is within the top 20 most likely tokens. Otherwise, the value -9999.0 is used to signify that the token is very unlikely.
+
+bytes
+integer[]
+NULLABLE
+REQUIRED
+
+A list of integers representing the UTF-8 bytes representation of the token. Useful in instances where characters are represented by multiple tokens and their byte representations must be combined to generate the correct text representation. Can be null if there is no bytes representation for the token.
+
+]
+
+]
+
+reasoning_content
+
+object[]
+
+NULLABLE
+
+A list of message content tokens with log probability information.
+
+Array [
+
+token
+string
+REQUIRED
+
+The token.
+
+logprob
+number
+REQUIRED
+
+The log probability of this token, if it is within the top 20 most likely tokens. Otherwise, the value -9999.0 is used to signify that the token is very unlikely.
+
+bytes
+integer[]
+NULLABLE
+REQUIRED
+
+A list of integers representing the UTF-8 bytes representation of the token. Useful in instances where characters are represented by multiple tokens and their byte representations must be combined to generate the correct text representation. Can be null if there is no bytes representation for the token.
+
+top_logprobs
+
+object[]
+
+REQUIRED
+
+List of the most likely tokens and their log probability, at this token position. In rare cases, there may be fewer than the number of requested top_logprobs returned.
+
+Array [
+
+token
+string
+REQUIRED
+
+The token.
+
+logprob
+number
+REQUIRED
+
+The log probability of this token, if it is within the top 20 most likely tokens. Otherwise, the value -9999.0 is used to signify that the token is very unlikely.
+
+bytes
+integer[]
+NULLABLE
+REQUIRED
+
+A list of integers representing the UTF-8 bytes representation of the token. Useful in instances where characters are represented by multiple tokens and their byte representations must be combined to generate the correct text representation. Can be null if there is no bytes representation for the token.
+
+]
+
+]
+
+]
+
+created
+integer
+REQUIRED
+
+The Unix timestamp (in seconds) of when the chat completion was created.
+
+model
+string
+REQUIRED
+
+The model used for the chat completion.
+
+system_fingerprint
+string
+REQUIRED
+
+This fingerprint represents the backend configuration that the model runs with.
+
+object
+string
+REQUIRED
+
+Possible values: [chat.completion]
+
+The object type, which is always chat.completion.
+
+usage
+
+object
+
+Usage statistics for the completion request.
+
+completion_tokens
+integer
+REQUIRED
+
+Number of tokens in the generated completion.
+
+prompt_tokens
+integer
+REQUIRED
+
+Number of tokens in the prompt. It equals prompt_cache_hit_tokens + prompt_cache_miss_tokens.
+
+prompt_tokens_details
+
+object
+
+REQUIRED
+
+Breakdown of tokens used in the prompt.
+
+cached_tokens
+integer
+
+Number of tokens in the prompt that hit the context cache. Same as prompt_cache_hit_tokens.
+
+prompt_cache_hit_tokens
+integer
+REQUIRED
+
+Number of tokens in the prompt that hits the context cache.
+
+prompt_cache_miss_tokens
+integer
+REQUIRED
+
+Number of tokens in the prompt that misses the context cache.
+
+total_tokens
+integer
+REQUIRED
+
+Total number of tokens used in the request (prompt + completion).
+
+completion_tokens_details
+
+object
+
+Breakdown of tokens used in a completion.
+
+reasoning_tokens
+integer
+
+Tokens generated by the model for reasoning.
+
+Loading...
+Next
+Responses API
+WeChat Official Account
+Community
+Email
+Discord
+Twitter
+More
+GitHub
+Copyright © 2026 DeepSeek, Inc.

@@ -1,0 +1,73 @@
+{
+  "schema_version": 2,
+  "tier_threshold_heavy_atoms": 3,
+  "design_contract": {
+    "host_supplies": [
+      "edit sites",
+      "fragment catalog",
+      "deterministic validation and compilation"
+    ],
+    "designer_decides": [
+      "which site",
+      "which operation",
+      "which fragment"
+    ],
+    "catalog_carries": [
+      "fragment identity",
+      "size class",
+      "chemistry",
+      "allowed operations"
+    ],
+    "catalog_does_not_carry": [
+      "site assignment",
+      "cut bond",
+      "retained scaffold",
+      "reference-ligand position",
+      "provenance or literature membership",
+      "per-fragment tier"
+    ]
+  },
+  "public_files": {
+    "catalog": "4WKQ/design/fragments_v2.json",
+    "catalog_sha256": "6b06d9ed305b4cc93804145f8d05ae86d3a2d0c5d5f5c0e50d375be80a421edb",
+    "sites": "4WKQ/design/sites-v2.json",
+    "sites_sha256": "c6c675e7d4fc6e3f521ddafe22b347960d510a793fc4f93d90d2afda909adfa4",
+    "edit_rules": "molecular_agent/data/edit_rules_v2.json",
+    "edit_rules_sha256": "02aabc6afe1058b443787b7919e48656070e56f2c88f41b11bd1d2139ddfb473",
+    "general_library": "molecular_agent/data/fragment_library_v2.json",
+    "general_library_sha256": "eede5d25300dd86a62366ddf5ac7f7e886a2c3ef77c60166cdd89f71a88edbee"
+  },
+  "input_files": {
+    "pool_v1": {
+      "path": "4WKQ/design/fragments.json",
+      "sha256": "42326333c86bcb625e96984c1ffafe728dc9f44f6e3602099b7858a0af07f05f"
+    },
+    "general_library_v1": {
+      "path": "molecular_agent/data/fragments_unified.json",
+      "sha256": "54d9a06dcd29ce3153696a0c476572aca9b280b904bb09d991b650c37631d02d"
+    },
+    "complex": {
+      "path": "4WKQ/4WKQ_-_hbond-opt.pdb",
+      "sha256": "9990588aa537b55ecb7185ce700e7e59bb52023a1f558b491ef8ff7acb354c97"
+    }
+  },
+  "counts": {
+    "catalog_total": 370,
+    "catalog_by_size_class": {
+      "large": 140,
+      "medium": 115,
+      "minimal": 12,
+      "small": 103
+    },
+    "catalog_background_selected": 270,
+    "catalog_one_atom_groups": 12,
+    "catalog_two_atom_groups": 11,
+    "v1_pool_retained": 77,
+    "general_library_entries": 20046,
+    "general_library_base_entries": 9458,
+    "general_library_extensions": 10588,
+    "atom_site_count": 31,
+    "cut_site_count": 11,
+    "protected_atom_count": 10
+  }
+}

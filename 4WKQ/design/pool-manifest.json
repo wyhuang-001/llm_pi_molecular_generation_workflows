@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "library_sha256": "42326333c86bcb625e96984c1ffafe728dc9f44f6e3602099b7858a0af07f05f",
+  "structure_source_identity": {
+    "complex_sha256": "9990588aa537b55ecb7185ce700e7e59bb52023a1f558b491ef8ff7acb354c97",
+    "component_sha256": "b179923a096d1c15f22884a4c1d3713ee3ac67a1cae30c1ca43782ccf4bb2443",
+    "ligand_selector": {
+      "chain": "A",
+      "residue_name": "IRE",
+      "residue_number": 1101
+    },
+    "receptor_policy": "ATOM plus reviewed HETATM, blank/A altloc, no added receptor H",
+    "ligand_hydrogen_policy": "RDKit AddHs(addCoords=True), unchanged crystal heavy coordinates"
+  },
+  "cut_bond": [
+    10,
+    9
+  ],
+  "candidate_count": 78,
+  "maximum_unique_candidates": 20,
+  "maximum_design_requests": 60,
+  "catalog_order": "frozen",
+  "descriptor_method": "RDKit attachment-fragment descriptors",
+  "rdkit_version": "2025.09.5",
+  "allowed_operations": [
+    "replace_fragment"
+  ]
+}

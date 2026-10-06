@@ -1,0 +1,155 @@
+{
+  "task": "提高配体对靶点的结合活性",
+  "complex_path": "complex.pdb",
+  "ligand_selector": {
+    "chain": "A",
+    "residue_name": "2A6",
+    "residue_number": 1298
+  },
+  "max_context_rounds": 32,
+  "fragment_library_path": "../molecular_agent/data/fragments_unified.json",
+  "single_edit_mode": {
+    "enabled": true
+  },
+  "external_research": {
+    "enabled": true,
+    "required": true,
+    "transport": "mcp_stdio",
+    "timeout_seconds": 240,
+    "mcp_command": [
+      "npx",
+      "-y",
+      "@playwright/mcp@0.0.82",
+      "--headless",
+      "--browser",
+      "chromium",
+      "--no-sandbox",
+      "--image-responses",
+      "allow"
+    ],
+    "environment": {
+      "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS": "1"
+    },
+    "include_tool_catalog": true,
+    "research_stage": "stage1_structure_context",
+    "scope": {
+      "stage": "stage1_structure_context",
+      "purpose": "Collect structure identity, structure quality, ligand identity, binding-site context, construct context, and literature metadata before design.",
+      "required_categories": [
+        "structure_identity",
+        "structure_quality",
+        "ligand_identity",
+        "binding_site",
+        "construct_context",
+        "literature_context"
+      ],
+      "allowed_evidence": [
+        "RCSB structure-page metadata",
+        "RCSB entry and chemical-component records",
+        "structure-paper metadata and reported binding-site context when supplied"
+      ],
+      "host_authoritative": [
+        "atomic coordinates",
+        "molecular graph and bond orders",
+        "exact distances and hydrogen-bond geometry",
+        "RMSD and native-like pose classification",
+        "candidate docking scores",
+        "candidate pose interactions"
+      ],
+      "prohibited_claims": [
+        "experimental activity or potency inferred from docking",
+        "exact candidate coordinates inferred from a webpage or screenshot",
+        "precise candidate RMSD or interaction geometry from external text",
+        "a literature-reported interaction treated as verified for the current pose"
+      ]
+    },
+    "identifiers": {
+      "pdb_id": "1H1Q",
+      "ligand_id": "2A6"
+    },
+    "calls": [
+      {
+        "tool": "browser_navigate",
+        "arguments": {
+          "url": "https://www.rcsb.org/structure/1H1Q"
+        }
+      },
+      {
+        "tool": "browser_snapshot",
+        "arguments": {}
+      },
+      {
+        "tool": "browser_take_screenshot",
+        "arguments": {
+          "fullPage": true
+        }
+      },
+      {
+        "tool": "browser_navigate",
+        "arguments": {
+          "url": "https://data.rcsb.org/rest/v1/core/entry/1H1Q"
+        }
+      },
+      {
+        "tool": "browser_snapshot",
+        "arguments": {}
+      },
+      {
+        "tool": "browser_navigate",
+        "arguments": {
+          "url": "https://data.rcsb.org/rest/v1/core/chemcomp/2A6"
+        }
+      },
+      {
+        "tool": "browser_snapshot",
+        "arguments": {}
+      }
+    ]
+  },
+  "receptor_preparation": {
+    "retain_hetero_residue_names": ["TPO", "SEP", "PTR", "MSE"]
+  },
+  "pose_retention": {
+    "enabled": true,
+    "core_atom_indices": [0, 1, 13, 14, 16, 17, 18, 19, 20, 21],
+    "top_n": 20,
+    "reference_native_rmsd": 2.0,
+    "candidate_reference_rmsd": 2.0,
+    "max_core_displacement": 3.0,
+    "family_rmsd": 2.0,
+    "minimum_passing_seeds": 2,
+    "missing_seed_penalty": 1.0,
+    "anchors": [
+      {
+        "type": "hydrogen_bond",
+        "method": "explicit_atom_geometry",
+        "protein_role": "backbone_carbonyl_acceptor",
+        "max_hydrogen_distance": 2.7,
+        "ligand_atom_index": 21,
+        "ligand_role": "donor",
+        "protein_residue": "LEU:A:83",
+        "protein_atom_name": "O",
+        "max_distance": 3.5,
+        "min_donor_angle": 100.0
+      }
+    ]
+  },
+  "docking_optimization": {
+    "primary_metric": "minimizedAffinity",
+    "minimum_improvement": 0.25,
+    "seed_stddev_penalty": 0.25,
+    "minimum_seed_win_fraction": 0.6666666667,
+    "hard_max_attempts": 30
+  },
+  "search_policy": {
+    "mode": "adaptive",
+    "site_lock_enabled": false,
+    "site_strategy_required": false,
+    "minimum_prioritized_sites": 1,
+    "local_patience": 5
+  },
+  "fragment_replacement": {
+    "max_removed_heavy_atom_fraction": 0.4,
+    "protected_core_atom_indices": []
+  }
+}

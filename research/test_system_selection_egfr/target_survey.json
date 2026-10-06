@@ -1,0 +1,172 @@
+{
+  "CDK2": {
+    "target_chembl_id": "CHEMBL301",
+    "uniprot": "P24941",
+    "potency_records": 3556,
+    "unique_molecules": 2753,
+    "unique_documents": 342,
+    "unique_assays": 455,
+    "pchembl_records": 3443,
+    "types": {
+      "IC50": 2826,
+      "Ki": 611,
+      "Kd": 119
+    },
+    "rcsb_entries_with_nonpolymer": 488,
+    "epmc_sar_query_hits": 49,
+    "epmc_query": "TITLE_ABS:CDK2 AND TITLE_ABS:inhibitor AND (TITLE_ABS:\"structure-activity relationship\" OR TITLE_ABS:SAR)"
+  },
+  "EGFR": {
+    "target_chembl_id": "CHEMBL203",
+    "uniprot": "P00533",
+    "potency_records": 21315,
+    "unique_molecules": 11318,
+    "unique_documents": 1093,
+    "unique_assays": 2278,
+    "pchembl_records": 20949,
+    "types": {
+      "IC50": 19719,
+      "Ki": 686,
+      "Kd": 910
+    },
+    "rcsb_entries_with_nonpolymer": 352,
+    "epmc_sar_query_hits": 100,
+    "epmc_query": "TITLE_ABS:EGFR AND TITLE_ABS:inhibitor AND (TITLE_ABS:\"structure-activity relationship\" OR TITLE_ABS:SAR)"
+  },
+  "HIV1_PROTEASE": {
+    "target_chembl_id": "CHEMBL243",
+    "uniprot": "P03366",
+    "potency_records": 6718,
+    "unique_molecules": 4936,
+    "unique_documents": 346,
+    "unique_assays": 603,
+    "pchembl_records": 6377,
+    "types": {
+      "IC50": 3171,
+      "Ki": 3476,
+      "Kd": 71
+    },
+    "rcsb_entries_with_nonpolymer": 425,
+    "epmc_sar_query_hits": 41,
+    "epmc_query": "TITLE_ABS:\"HIV-1 protease\" AND TITLE_ABS:inhibitor AND (TITLE_ABS:\"structure-activity relationship\" OR TITLE_ABS:SAR)"
+  },
+  "BACE1": {
+    "target_chembl_id": "CHEMBL4822",
+    "uniprot": "P56817",
+    "potency_records": 15543,
+    "unique_molecules": 10183,
+    "unique_documents": 511,
+    "unique_assays": 827,
+    "pchembl_records": 15327,
+    "types": {
+      "IC50": 12913,
+      "Ki": 2555,
+      "Kd": 75
+    },
+    "rcsb_entries_with_nonpolymer": 411,
+    "epmc_sar_query_hits": 31,
+    "epmc_query": "TITLE_ABS:BACE1 AND TITLE_ABS:inhibitor AND (TITLE_ABS:\"structure-activity relationship\" OR TITLE_ABS:SAR)"
+  },
+  "FACTOR_XA": {
+    "target_chembl_id": "CHEMBL244",
+    "uniprot": "P00742",
+    "potency_records": 7694,
+    "unique_molecules": 6087,
+    "unique_documents": 381,
+    "unique_assays": 486,
+    "pchembl_records": 7525,
+    "types": {
+      "IC50": 3356,
+      "Ki": 4235,
+      "Kd": 103
+    },
+    "rcsb_entries_with_nonpolymer": 188,
+    "epmc_sar_query_hits": 49,
+    "epmc_query": "TITLE_ABS:\"factor Xa\" AND TITLE_ABS:inhibitor AND (TITLE_ABS:\"structure-activity relationship\" OR TITLE_ABS:SAR)"
+  },
+  "THROMBIN": {
+    "target_chembl_id": "CHEMBL204",
+    "uniprot": "P00734",
+    "potency_records": 6906,
+    "unique_molecules": 5929,
+    "unique_documents": 510,
+    "unique_assays": 650,
+    "pchembl_records": 6484,
+    "types": {
+      "IC50": 2617,
+      "Ki": 4232,
+      "Kd": 57
+    },
+    "rcsb_entries_with_nonpolymer": 437,
+    "epmc_sar_query_hits": 56,
+    "epmc_query": "TITLE_ABS:thrombin AND TITLE_ABS:inhibitor AND (TITLE_ABS:\"structure-activity relationship\" OR TITLE_ABS:SAR)"
+  },
+  "DHFR": {
+    "target_chembl_id": "CHEMBL202",
+    "uniprot": "P00374",
+    "potency_records": 1903,
+    "unique_molecules": 1301,
+    "unique_documents": 173,
+    "unique_assays": 252,
+    "pchembl_records": 1792,
+    "types": {
+      "Ki": 489,
+      "IC50": 1328,
+      "Kd": 86
+    },
+    "rcsb_entries_with_nonpolymer": 88,
+    "epmc_sar_query_hits": 16,
+    "epmc_query": "TITLE_ABS:\"dihydrofolate reductase\" AND TITLE_ABS:inhibitor AND (TITLE_ABS:\"structure-activity relationship\" OR TITLE_ABS:SAR)"
+  },
+  "HSP90A": {
+    "target_chembl_id": "CHEMBL3880",
+    "uniprot": "P07900",
+    "potency_records": 2198,
+    "unique_molecules": 1690,
+    "unique_documents": 126,
+    "unique_assays": 179,
+    "pchembl_records": 2175,
+    "types": {
+      "Kd": 484,
+      "IC50": 1589,
+      "Ki": 125
+    },
+    "rcsb_entries_with_nonpolymer": 423,
+    "epmc_sar_query_hits": 52,
+    "epmc_query": "TITLE_ABS:HSP90 AND TITLE_ABS:inhibitor AND (TITLE_ABS:\"structure-activity relationship\" OR TITLE_ABS:SAR)"
+  },
+  "BRD4": {
+    "target_chembl_id": "CHEMBL1163125",
+    "uniprot": "O60885",
+    "potency_records": 16198,
+    "unique_molecules": 9377,
+    "unique_documents": 446,
+    "unique_assays": 1228,
+    "pchembl_records": 16133,
+    "types": {
+      "IC50": 12057,
+      "Kd": 836,
+      "Ki": 3305
+    },
+    "rcsb_entries_with_nonpolymer": 603,
+    "epmc_sar_query_hits": 33,
+    "epmc_query": "TITLE_ABS:BRD4 AND TITLE_ABS:inhibitor AND (TITLE_ABS:\"structure-activity relationship\" OR TITLE_ABS:SAR)"
+  },
+  "ABL1": {
+    "target_chembl_id": "CHEMBL1862",
+    "uniprot": "P00519",
+    "potency_records": 6290,
+    "unique_molecules": 3127,
+    "unique_documents": 339,
+    "unique_assays": 610,
+    "pchembl_records": 6266,
+    "types": {
+      "IC50": 4182,
+      "Kd": 962,
+      "Ki": 1146
+    },
+    "rcsb_entries_with_nonpolymer": 69,
+    "epmc_sar_query_hits": 3,
+    "epmc_query": "TITLE_ABS:ABL1 AND TITLE_ABS:inhibitor AND (TITLE_ABS:\"structure-activity relationship\" OR TITLE_ABS:SAR)"
+  }
+}

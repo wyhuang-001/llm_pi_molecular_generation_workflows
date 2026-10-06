@@ -1,0 +1,24 @@
+{
+  "retrieved_utc": "2026-09-27T08:31:52.440386+00:00",
+  "purpose": "Host structure topology and prepared-versus-deposited coordinate audit; no SAR retrieval",
+  "artifacts": [
+    {
+      "path": "4WKQ/raw/IRE.cif",
+      "url": "https://files.rcsb.org/ligands/download/IRE.cif",
+      "sha256": "b179923a096d1c15f22884a4c1d3713ee3ac67a1cae30c1ca43782ccf4bb2443",
+      "bytes": 11315
+    },
+    {
+      "path": "4WKQ/raw/CSX.cif",
+      "url": "https://files.rcsb.org/ligands/download/CSX.cif",
+      "sha256": "56ea908aa8a08747ea156c7608013ea398d3c084f916db0f308212c9cd220a44",
+      "bytes": 6321
+    },
+    {
+      "path": "4WKQ/raw/4WKQ.original.pdb",
+      "url": "https://files.rcsb.org/download/4WKQ.pdb",
+      "sha256": "e1cfac5caee7a9a97ba78f4adde2cf8657f5949505c34a96cdda9cfd32cf8063",
+      "bytes": 442908
+    }
+  ]
+}

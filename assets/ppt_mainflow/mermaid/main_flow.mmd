@@ -1,0 +1,35 @@
+flowchart TB
+  subgraph P2["② 设计、计算与输出"]
+    direction LR
+    L("LLM 提出改造思路") --> B("构建候选 · 几何校验") --> D("分子对接
+screening · 多 seed") --> R("RBFE 计算") --> O("输出
+最佳候选 + 审计")
+  end
+  subgraph P1["① 输入与上下文"]
+    direction LR
+    P("共晶复合物 PDB") --> M("配体分子图 · 口袋信息")
+    T("任务 / 优化目标")
+    W("Playwright MCP
+外部检索")
+    M --> CTX("结构化上下文")
+    T --> CTX
+    W --> CTX
+  end
+  P1 --> P2
+  P2 -. "结果回写
+更新上下文" .-> P1
+
+  classDef io fill:#F5F7F9,stroke:#9AAAB6,color:#2A4051,stroke-width:1.5px;
+  classDef sys fill:#EDF5FB,stroke:#89B4CF,color:#244C68,stroke-width:1.6px;
+  classDef ctx fill:#ECEFFA,stroke:#8A99CE,color:#333F73,stroke-width:1.9px;
+  classDef llm fill:#E8F6F4,stroke:#5EA9A6,color:#176D70,stroke-width:1.8px;
+  classDef calc fill:#FFF4E2,stroke:#DCA95F,color:#92611F,stroke-width:1.6px;
+  class P,T,W,M io;
+  class B sys;
+  class CTX ctx;
+  class L llm;
+  class D,R calc;
+  class O io;
+  style P1 fill:#F8FBFD,stroke:#DCE8EE,color:#5B7484,stroke-width:1.2px;
+  style P2 fill:#F8FBFD,stroke:#DCE8EE,color:#5B7484,stroke-width:1.2px;
+  linkStyle default stroke:#749BAC,stroke-width:1.7px;

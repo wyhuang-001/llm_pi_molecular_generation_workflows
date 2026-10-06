@@ -10,6 +10,8 @@ from pathlib import Path
 from statistics import mean, stdev
 from typing import Any, Callable
 
+from .plip_adapter import PLIPAdapter, compare_plip
+
 
 class NotConfiguredAdapter:
     def __init__(self, stage: str, reason: str | None = None):
@@ -293,7 +295,7 @@ class DockingAdapter(CommandAdapter):
         return comparison
 
     @staticmethod
-    def _receptor_preflight(path: Path) -> tuple[bool, str]:
+    def _receptor_preflight(path: Path, allowed_hetero: tuple | list = ("TPO", "SEP", "PTR", "MSE")) -> tuple[bool, str]:
         if not path.is_file():
             return False, f"receptor PDB does not exist: {path}"
         try:
@@ -304,8 +306,9 @@ class DockingAdapter(CommandAdapter):
         hetero_lines = [line for line in lines if line[:6].strip() == "HETATM"]
         if not atom_lines:
             return False, "receptor PDB contains no ATOM records"
-        if hetero_lines:
-            return False, "receptor PDB contains HETATM records; use protein-only receptor output"
+        unexpected = sorted({line[17:20].strip() for line in hetero_lines} - set(allowed_hetero))
+        if unexpected:
+            return False, f"receptor PDB contains unreviewed HETATM residues: {unexpected}"
         return True, "ok"
 
     def _preflight(
@@ -322,7 +325,9 @@ class DockingAdapter(CommandAdapter):
             if reference_path
             else (False, "reference ligand is required for autobox docking")
         )
-        checks["receptor_pdb"] = self._receptor_preflight(receptor_path)
+        checks["receptor_pdb"] = self._receptor_preflight(
+            receptor_path, self.config.get("retained_hetero_residue_names", ["TPO", "SEP", "PTR", "MSE"])
+        )
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
             probe = output_dir / ".write-test"
@@ -385,7 +390,7 @@ class DockingAdapter(CommandAdapter):
                     poses.append({"rank": rank, "properties": properties})
                 result["pose_path"] = str(output_path)
                 result["pose_count"] = len(poses)
-                result["poses"] = poses[:20]
+                result["poses"] = poses
                 result["pose_selection"] = self._pose_selection_summary(poses)
                 if not poses:
                     result["status"] = "failed"
@@ -396,6 +401,11 @@ class DockingAdapter(CommandAdapter):
         elif result.get("status") == "complete":
             result["status"] = "failed"
             result["error"] = f"Docking completed without output pose file: {output_path}"
+        if (result.get("status") == "complete" and (self.config.get("plip") or {}).get("enabled")
+                and not (self.config.get("pose_retention") or {}).get("enabled")):
+            result["plip"] = PLIPAdapter(self.config["plip"]).run(
+                receptor_path, output_path, output_dir / "plip"
+            )
         if result.get("status") != "not_configured":
             self._write_audit(output_dir, result)
         return result
@@ -651,6 +661,14 @@ class DockingAdapter(CommandAdapter):
             )
         return result
 
+    def prepare_reference(self, reference_path: Path, receptor_path: Path, output_dir: Path) -> dict[str, Any]:
+        from .pose_retention import PoseRetention
+
+        try:
+            return PoseRetention(self).prepare(reference_path, receptor_path, output_dir)
+        except (ValueError, OSError, RuntimeError) as exc:
+            return {"status": "calibration_failed", "failure_class": "reference_calibration", "error": str(exc)}
+
     def run_with_reference_baseline(
         self,
         candidate_path: Path,
@@ -669,6 +687,18 @@ class DockingAdapter(CommandAdapter):
                 reference_path=reference_path,
                 output_dir=output_dir,
             )
+
+        if (self.config.get("pose_retention") or {}).get("enabled"):
+            from .pose_retention import PoseRetention
+
+            if seeds_override is not None and self._seeds(seeds_override) != self._seeds():
+                return {"status": "calibration_failed", "error": "Cannot change seeds of a frozen reference protocol"}
+            # Always verify the disk manifest and hashes, including on resume. Never trust an
+            # unversioned in-memory/legacy rank-1 baseline supplied by a caller.
+            baseline = self.prepare_reference(reference_path, receptor_path, reference_output_dir)
+            if baseline.get("status") != "complete":
+                return {"status": "calibration_failed", "reference_baseline": baseline, "error": baseline.get("error")}
+            return PoseRetention(self).run_candidate(candidate_path, reference_path, receptor_path, output_dir, baseline)
 
         seeds = self._seeds(seeds_override)
         reference_results: dict[int, dict[str, Any]] = {}
@@ -750,6 +780,7 @@ class DockingAdapter(CommandAdapter):
                 str(seed): {
                     "status": reference_results[seed].get("status"),
                     "pose_path": reference_results[seed].get("pose_path"),
+                    "plip": reference_results[seed].get("plip"),
                     "pose_count": reference_results[seed].get("pose_count"),
                     "top_pose": (reference_results[seed].get("poses") or [None])[0],
                     "pose_selection": reference_results[seed].get("pose_selection"),
@@ -765,6 +796,7 @@ class DockingAdapter(CommandAdapter):
             str(seed): {
                 "status": candidate_results[seed].get("status"),
                 "pose_path": candidate_results[seed].get("pose_path"),
+                "plip": candidate_results[seed].get("plip"),
                 "pose_count": candidate_results[seed].get("pose_count"),
                 "top_pose": (candidate_results[seed].get("poses") or [None])[0],
                 "pose_selection": candidate_results[seed].get("pose_selection"),
@@ -775,6 +807,12 @@ class DockingAdapter(CommandAdapter):
             }
             for seed in candidate_results
         }
+        if (self.config.get("plip") or {}).get("enabled"):
+            result["plip_comparison"] = {
+                str(seed): compare_plip(candidate_results.get(seed, {}).get("plip") or {},
+                                       reference_results.get(seed, {}).get("plip") or {})
+                for seed in seeds
+            }
         result["comparison"] = aggregate
         result["pose_consensus"] = self._top_pose_consensus(
             candidate_results,
@@ -786,6 +824,24 @@ class DockingAdapter(CommandAdapter):
             receptor_path,
             cutoff=float(self.config.get("interaction_contact_cutoff", 4.0)),
         )
+        result["pose_evidence"] = {
+            "status": "partial",
+            "native_like": None,
+            "rmsd": {
+                "status": "unavailable",
+                "reason": "pose_retention is disabled; rank-1 cross-seed RMSD is not a native-pose gate",
+            },
+            "pose": result.get("pose_consensus"),
+            "interactions": {
+                "status": "complete" if result.get("interaction_consensus", {}).get("status") == "complete" else "unavailable",
+                "residue_contact_consensus": result.get("interaction_consensus"),
+                "plip_per_seed": result.get("plip_comparison"),
+            },
+            "interpretation": (
+                "Enable pose_retention for native-like RMSD and anchor-gated pose eligibility. "
+                "This legacy summary is ranking evidence only."
+            ),
+        }
         if failed_candidate:
             result["failure_class"] = "candidate_docking"
         elif failed_reference:
@@ -862,7 +918,9 @@ def configured_adapters(
     progress: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> tuple[CommandAdapter, CommandAdapter]:
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    docking_config = config.get("docking") or {}
+    docking_config = dict(config.get("docking") or {})
+    if docking_config and config.get("plip"):
+        docking_config["plip"] = config["plip"]
     rbfe_config = config.get("rbfe") or {}
     docking = (
         DockingAdapter(docking_config, run_dir, progress=progress)

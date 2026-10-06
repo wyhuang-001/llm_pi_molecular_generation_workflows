@@ -1,0 +1,13 @@
+flowchart LR
+    A("4WKQ") --> B("Design")
+    B --> C("Evaluate")
+    C --> D("Rank")
+    D --> E("Candidates")
+    D -. "Feedback" .-> B
+    classDef structure fill:#F0F7FB,stroke:#8EB7CE,color:#244C68,stroke-width:1.5px;
+    classDef design fill:#EAF7F6,stroke:#62ABA8,color:#176D70,stroke-width:1.7px;
+    classDef output fill:#FFF5E5,stroke:#DCAC67,color:#92611F,stroke-width:1.5px;
+    class A,C,D structure;
+    class B design;
+    class E output;
+    linkStyle default stroke:#749BAC,stroke-width:1.7px;

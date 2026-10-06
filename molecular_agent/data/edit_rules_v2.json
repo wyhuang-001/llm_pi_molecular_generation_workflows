@@ -1,0 +1,476 @@
+{
+  "schema_version": 2,
+  "layer": "T1_small_edits",
+  "description": "Small edits are compiled as a minimal edit on the parent. They must not be executed as a whole-fragment replacement even when the catalog also lists an equivalent assembled structure.",
+  "tier_rule": {
+    "t1": "one or two heavy-atom changes, no ring-size change and no ring-skeleton substitution",
+    "t2": "three or more heavy-atom changes, or any ring framework change",
+    "ring_rule_precedence": "A ring-size change or a ring-skeleton atom substitution is T2 even when only one heavy atom differs."
+  },
+  "element_whitelist": [
+    "Br",
+    "C",
+    "Cl",
+    "F",
+    "I",
+    "N",
+    "O",
+    "P",
+    "S"
+  ],
+  "rare_elements": [
+    "B",
+    "P",
+    "Se",
+    "Si"
+  ],
+  "substituent_attach": {
+    "one_atom_groups": [
+      {
+        "name": "methyl",
+        "smiles": "[*:1]C",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "C"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      },
+      {
+        "name": "hydroxyl",
+        "smiles": "[*:1]O",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "O"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      },
+      {
+        "name": "amino",
+        "smiles": "[*:1]N",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "N"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      },
+      {
+        "name": "thiol",
+        "smiles": "[*:1]S",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "S"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      },
+      {
+        "name": "fluoro",
+        "smiles": "[*:1]F",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "F"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      },
+      {
+        "name": "chloro",
+        "smiles": "[*:1]Cl",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "Cl"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      },
+      {
+        "name": "bromo",
+        "smiles": "[*:1]Br",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "Br"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      },
+      {
+        "name": "iodo",
+        "smiles": "[*:1]I",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "I"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      },
+      {
+        "name": "methylene",
+        "smiles": "[*:1]=C",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "C"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      },
+      {
+        "name": "boryl",
+        "smiles": "[*:1]B",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "B"
+        ],
+        "rare_elements": [
+          "B"
+        ],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      },
+      {
+        "name": "silyl",
+        "smiles": "[*:1][Si]",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "Si"
+        ],
+        "rare_elements": [
+          "Si"
+        ],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      },
+      {
+        "name": "phosphanyl",
+        "smiles": "[*:1]P",
+        "attachment_count": 1,
+        "heavy_atoms": 1,
+        "elements": [
+          "P"
+        ],
+        "rare_elements": [
+          "P"
+        ],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_1"
+      }
+    ],
+    "two_atom_groups": [
+      {
+        "name": "methoxy",
+        "smiles": "[*:1]OC",
+        "attachment_count": 1,
+        "heavy_atoms": 2,
+        "elements": [
+          "C",
+          "O"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_2"
+      },
+      {
+        "name": "methylamino",
+        "smiles": "[*:1]NC",
+        "attachment_count": 1,
+        "heavy_atoms": 2,
+        "elements": [
+          "C",
+          "N"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_2"
+      },
+      {
+        "name": "cyano",
+        "smiles": "[*:1]C#N",
+        "attachment_count": 1,
+        "heavy_atoms": 2,
+        "elements": [
+          "C",
+          "N"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_2"
+      },
+      {
+        "name": "ethynyl",
+        "smiles": "[*:1]C#C",
+        "attachment_count": 1,
+        "heavy_atoms": 2,
+        "elements": [
+          "C"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_2"
+      },
+      {
+        "name": "vinyl",
+        "smiles": "[*:1]C=C",
+        "attachment_count": 1,
+        "heavy_atoms": 2,
+        "elements": [
+          "C"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_2"
+      },
+      {
+        "name": "formyl",
+        "smiles": "[*:1]C=O",
+        "attachment_count": 1,
+        "heavy_atoms": 2,
+        "elements": [
+          "C",
+          "O"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_2"
+      },
+      {
+        "name": "hydroxymethyl",
+        "smiles": "[*:1]CO",
+        "attachment_count": 1,
+        "heavy_atoms": 2,
+        "elements": [
+          "C",
+          "O"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_2"
+      },
+      {
+        "name": "aminomethyl",
+        "smiles": "[*:1]CN",
+        "attachment_count": 1,
+        "heavy_atoms": 2,
+        "elements": [
+          "C",
+          "N"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_2"
+      },
+      {
+        "name": "chloromethyl",
+        "smiles": "[*:1]CCl",
+        "attachment_count": 1,
+        "heavy_atoms": 2,
+        "elements": [
+          "C",
+          "Cl"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_2"
+      },
+      {
+        "name": "methylthio",
+        "smiles": "[*:1]SC",
+        "attachment_count": 1,
+        "heavy_atoms": 2,
+        "elements": [
+          "C",
+          "S"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_2"
+      },
+      {
+        "name": "nitroso",
+        "smiles": "[*:1]N=O",
+        "attachment_count": 1,
+        "heavy_atoms": 2,
+        "elements": [
+          "N",
+          "O"
+        ],
+        "rare_elements": [],
+        "allowed_operations": [
+          "replace_hydrogen"
+        ],
+        "rule_family": "substituent_attach_2"
+      }
+    ]
+  },
+  "element_swap": {
+    "scope": [
+      "chain_atom",
+      "ring_substituent_atom"
+    ],
+    "forbidden_scope": [
+      "ring_skeleton_atom"
+    ],
+    "swaps": [
+      {
+        "name": "carbon_to_nitrogen",
+        "from": "C",
+        "to": "N",
+        "tier": "T1",
+        "note": "a ring-skeleton swap is T2 and must be routed to whole-ring replacement"
+      },
+      {
+        "name": "nitrogen_to_carbon",
+        "from": "N",
+        "to": "C",
+        "tier": "T1",
+        "note": "a ring-skeleton swap is T2 and must be routed to whole-ring replacement"
+      },
+      {
+        "name": "carbon_to_oxygen",
+        "from": "C",
+        "to": "O",
+        "tier": "T1",
+        "note": "a ring-skeleton swap is T2 and must be routed to whole-ring replacement"
+      },
+      {
+        "name": "oxygen_to_carbon",
+        "from": "O",
+        "to": "C",
+        "tier": "T1",
+        "note": "a ring-skeleton swap is T2 and must be routed to whole-ring replacement"
+      },
+      {
+        "name": "nitrogen_to_oxygen",
+        "from": "N",
+        "to": "O",
+        "tier": "T1",
+        "note": "a ring-skeleton swap is T2 and must be routed to whole-ring replacement"
+      },
+      {
+        "name": "oxygen_to_nitrogen",
+        "from": "O",
+        "to": "N",
+        "tier": "T1",
+        "note": "a ring-skeleton swap is T2 and must be routed to whole-ring replacement"
+      },
+      {
+        "name": "carbon_to_sulfur",
+        "from": "C",
+        "to": "S",
+        "tier": "T1",
+        "note": "a ring-skeleton swap is T2 and must be routed to whole-ring replacement"
+      },
+      {
+        "name": "sulfur_to_carbon",
+        "from": "S",
+        "to": "C",
+        "tier": "T1",
+        "note": "a ring-skeleton swap is T2 and must be routed to whole-ring replacement"
+      },
+      {
+        "name": "oxygen_to_sulfur",
+        "from": "O",
+        "to": "S",
+        "tier": "T1",
+        "note": "a ring-skeleton swap is T2 and must be routed to whole-ring replacement"
+      },
+      {
+        "name": "sulfur_to_oxygen",
+        "from": "S",
+        "to": "O",
+        "tier": "T1",
+        "note": "a ring-skeleton swap is T2 and must be routed to whole-ring replacement"
+      }
+    ]
+  },
+  "chain_length_edit": {
+    "deltas": [
+      -2,
+      -1,
+      1,
+      2
+    ],
+    "tier": "T1",
+    "note": "applies to a linker between two retained attachment points"
+  },
+  "substituent_delete": {
+    "heavy_atoms_max": 2,
+    "tier": "T1",
+    "allowed_operations": [
+      "delete_substituent"
+    ]
+  },
+  "terminal_substituent_swap": {
+    "heavy_atoms_max": 2,
+    "tier": "T1",
+    "allowed_operations": [
+      "terminal_substituent_swap"
+    ],
+    "note": "Exchanges a terminal substituent for another small group, for example methyl for ethyl, or chlorine for bromine. It never touches ring-skeleton atoms."
+  }
+}

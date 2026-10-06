@@ -1,6 +1,6 @@
 # `molecular_agent/workflow.py` 代码说明
 
-> 本文根据当前工作区中的 `molecular_agent/workflow.py` 编写。文件同时保留旧的 QUERY/READY 兼容路径和默认的 portfolio batch 路径；批量多位点方案见 `LLM_BATCHED_MULTISITE_OPTIMIZATION.md`。代码行号会随后续修改变化。
+> 本文根据当前工作区中的 `molecular_agent/workflow.py` 编写。当前只保留顺序式 QUERY/READY/site-lock 路径；每次设计决策只提交一个候选。代码行号会随后续修改变化。
 >
 > 本文件只解释 `workflow.py` 的职责、状态流转、证据门、候选生成、docking 反馈、恢复和持久化逻辑，不重复粘贴完整源代码。完整工具的具体化学实现主要位于 `molecular_agent/tools.py`、`editing.py`、`structure.py` 和 `fragment_library.py`。
 
@@ -311,7 +311,7 @@ LLM 有时会把有效决策包在 `answer`、`decision` 或 `response` 字段�
 3. `tool + arguments` 的 SHA-256 签名不能已经执行过。
 4. `assess_edit_sites` 必须在 `get_edit_site_candidates` 之后执行。
 5. design 阶段不能重新调用 `assess_edit_sites` 试图重排已经开始的 active target。
-6. design 阶段的 `generate_site_candidate_batch` 只能针对当前 active target。
+6. design 阶段每次只提交一个具体 transformation；需要比较片段时，应先查询片段信息，再逐个提交候选。
 
 执行成功后：
 
@@ -346,7 +346,7 @@ tool 名称 + 完整 arguments 的规范化 JSON
 - 检查剩余上下文预算；
 - 按顺序执行可执行查询。
 
-依赖前一个工具结果的查询不应放在同一个 batch 中，而应分多轮执行。
+依赖前一个工具结果的查询必须分多轮执行；`QUERY_BATCH` 只允许并行执行彼此独立的证据查询。
 
 ---
 
@@ -354,16 +354,17 @@ tool 名称 + 完整 arguments 的规范化 JSON
 
 位置：约第 1099–1157 行。
 
-READY 决策经过 `_transformation()` 后，转换为 Host 内部统一结构。支持两类操作：
+READY 决策经过 `_transformation()` 后，转换为 Host 内部统一结构。当前用**两条正交轴**描述编辑：`site_type`（atom / bond / linker / ring）和 `change_type`（addition / deletion / replacement），操作标签为 `site_type:change_type`。分类和向后兼容映射集中在 `molecular_agent/edit_taxonomy.py`。
 
-### 9.1 `replace_hydrogen`
+### 9.1 `atom:addition`
 
 示例：
 
 ```json
 {
   "action": "READY",
-  "operation": "replace_hydrogen",
+  "site_type": "atom",
+  "change_type": "addition",
   "edit_atom_index": 10,
   "fragment_id": "fluoro",
   "fragment_smiles": "[*:1]F",
@@ -374,15 +375,16 @@ READY 决策经过 `_transformation()` 后，转换为 Host 内部统一结构�
 
 要求最终编辑原子是可支持的带氢重原子。芳香 `[nH]` 由于当前单键编辑器没有显式互变异构/质子化处理，被视为 Host 不支持的位点。
 
-### 9.2 `replace_fragment`
+### 9.2 `bond:deletion` 和 `bond:replacement`
 
 示例：
 
 ```json
 {
   "action": "READY",
-  "operation": "replace_fragment",
-  "replacement_site_id": "replacement-site-005",
+  "site_type": "bond",
+  "change_type": "replacement",
+  "bond_site_id": "bond-site-005",
   "fragment_id": "fluoro",
   "fragment_smiles": "[*:1]F",
   "understanding": "该侧链位于可切割的非环单键外侧。",
@@ -390,7 +392,9 @@ READY 决策经过 `_transformation()` 后，转换为 Host 内部统一结构�
 }
 ```
 
-LLM 不能直接提交任意 `cut_bond` 或删除原子集合。它必须先调用 `list_fragment_replacement_sites`，再使用 Host 产生的 `replacement_site_id`。Host 根据 site ID 恢复：
+`bond:deletion` 使用同一个 `bond_site_id`，但不带片段；Host 删除该侧并让锚点补氢。该位点同时给出 `removed_reference_interactions`，即会消失的参考接触，作为确定性后果反馈给 LLM。
+
+LLM 不能直接提交任意 `cut_bond` 或删除原子集合。它必须先调用 `list_bond_sites`，再使用 Host 产生的 `bond_site_id`。Host 根据 site ID 恢复：
 
 - 切割键；
 - 保留原子；
@@ -411,7 +415,7 @@ LLM 不能直接提交任意 `cut_bond` 或删除原子集合。它必须先调�
 4. 如果两者都提供，则使用 RDKit 判断结构等价；
 5. 保存完整 `library_record` 供后续验证和审计。
 
-`replace_hydrogen` 在片段库权限中对应 `substitute`；`replace_fragment` 则必须明确允许 `replace_fragment`。这避免把只允许氢取代的片段误用于片段替换。
+片段库内部仍用历史名 `substitute` / `replace_fragment`，边界由 `LIBRARY_OPERATION_FOR_CHANGE_TYPE` 映射：`addition` → `substitute`，`replacement` → `replace_fragment`。这避免把只允许接入的片段误用于整段替换。
 
 ### 9.4 parent 和 generation
 
@@ -465,10 +469,10 @@ READY 必须包含：
 
 方法检查：
 
-- operation 必须是 `replace_hydrogen` 或 `replace_fragment`；
+- 必须有合法的 `site_type` 和 `change_type` 组合（见 `edit_taxonomy.SITE_ALLOWED_CHANGE_TYPES`）；
 - edit atom index 必须在 parent 分子范围内；
-- `replace_hydrogen` 的原子必须有可替换氢，除非这是带 parent 的替换已有取代基场景；
-- `replace_fragment` 必须有 Host 枚举的 `replacement_site_id`；
+- `atom:addition` 的原子必须有可替换氢，除非这是带 parent 的替换已有取代基场景；
+- bond 位点必须有 Host 枚举的 `bond_site_id`（本地 child 除外，它按 parent 锚点解析）；
 - 片段 SMILES 必须存在且有效。
 
 ### 11.3 位点环境证据
@@ -483,17 +487,17 @@ READY 必须包含：
 
 ### 11.4 增长空间证据
 
-`replace_hydrogen` 还要求相同位点存在 `check_growth_space` 观察。`replace_fragment` 不要求氢增长探针，因为它使用 Host 给出的 replacement site 和 attachment vector。
+`atom:addition` 还要求相同位点存在 `check_growth_space` 观察。bond 位点不要求氢增长探针，因为它使用 Host 给出的切割键和 attachment vector。
 
 ### 11.5 replacement site 证据
 
-`replace_fragment` 必须至少执行过一次 `list_fragment_replacement_sites`。最终 site ID 仍会通过 `resolve_replacement_site()` 再解析，LLM 不能只凭文本猜测切割键。
+bond 位点必须至少执行过一次 `list_bond_sites`。最终 site ID 仍会通过 `resolve_bond_site()` 再解析，LLM 不能只凭文本猜测切割键。
 
 ### 11.6 自适应模式中的片段知识证据
 
 当 `search_policy.mode == "adaptive"` 时，最终片段还需要与下列观察关联：
 
-- 选中的片段库记录，尤其是 `replace_fragment`；
+- 选中的片段库记录，尤其是 `bond:replacement`；
 - 选中的片段性质；
 - 选中的片段空间 profile；
 - 完整 transformation 的 accepted `validate_candidate_geometry` 结果。
@@ -548,7 +552,7 @@ LLM 先通过：
 - 不改善次数；
 - `local_patience` 是否达到。
 
-其中 attempt count 是唯一 Host 记录的 transformation 数，包含 batch 几何预筛选和几何拒绝，不等于 docking 次数。
+其中 attempt count 是唯一 Host 记录的 transformation 数，包含几何接受和几何拒绝，不等于 docking 次数。
 
 优先级最高的 pending site 会成为 active target。
 
@@ -567,7 +571,7 @@ LLM 先通过：
 
 `_record_unmodifiable()` 验证：
 
-- `target_type` 为 `atom` 或 `replacement_site`；
+- `target_type` 为 `atom` 或 `bond_site`；
 - atom target 必须是 Host 支持的带氢重原子；
 - replacement site 必须由 Host 枚举；
 - `scope` 为 `site` 或 `family`；
@@ -598,11 +602,11 @@ LLM 先通过：
 
 ### 13.2 replacement sites
 
-方法会通过 `list_fragment_replacement_sites(limit=100)` 获得 Host 支持的 replacement site ID，并统计每个位点的尝试记录。
+方法会通过 `list_bond_sites(limit=100)` 获得 Host 支持的 replacement site ID，并统计每个位点的尝试记录。
 
 ### 13.3 化学家族覆盖
 
-对于 `replace_hydrogen`，家族大致包括：
+对于 `atom:addition`，家族大致包括：
 
 - `halogen`；
 - `alkyl`；
@@ -999,7 +1003,7 @@ RBFE 当前明确返回：
 3. 查询 atom 10 的 `get_atom_environment`；
 4. 查询 atom 10 的 `check_growth_space`；
 5. 查询 `[*:1]F` 在 atom 10 的 exact `validate_candidate_geometry`；
-6. 提交 `replace_hydrogen` 的 READY。
+6. 提交 `atom:addition` 的 READY。
 
 它的作用是测试状态机、证据门、候选构造和文件输出，而不是证明真实化学设计结论。
 
@@ -1318,19 +1322,8 @@ decision-02.json
 
 - `assess_edit_sites` 完成后更新 site strategy、active target 和 `site-strategy.json`；
 - `validate_candidate_geometry` 后写一条 exploration attempt；
-- `generate_site_candidate_batch` 后把批量接受/拒绝的 transformation 加入探索账本。
+- `validate_candidate_geometry` 的接受或拒绝结果加入探索账本。
 
-### 29.3 `_record_candidate_batch_exploration()`
-
-批量工具只做 Host 确定性预筛选，不做 docking。这个方法把批量结果转成 exploration records：
-
-- candidates 记为 `batch_geometry_accepted`；
-- rejected 记为 `geometry_rejected`；
-- 如果结果没有完整 transformation，则根据 target type、fragment ID/SMILES 自动补上最小记录。
-
-后续 `_geometry_feasible_not_docked()` 会根据这些记录找出“已经几何可行、但还没有进入 docking”的候选，反馈给 LLM。它们不会被错误地算作 docking hit。
-
----
 
 ## 30. READY 处理的完整路径
 
@@ -1389,7 +1382,7 @@ docking_history
 
 ### 31.1 可能只有 exploration，没有 candidate history
 
-例如 `generate_site_candidate_batch` 产生了一个几何可行候选，但 LLM 暂时没有选择它进入正式 design。此时它可以存在于 exploration ledger 和 `geometry_feasible_not_docked`，但不应出现在 docking history。
+几何检查通过但尚未进入 docking 的候选不会被自动当作 docking hit；只有 LLM 明确提交 READY 后才进入正式候选流程。
 
 ### 31.2 可能有 candidate history，但没有 docking history
 
@@ -1482,7 +1475,7 @@ strategy ready
      ▼
 active target
      │
-     ├── QUERY / batch / READY：继续积累局部证据
+     ├── QUERY / READY：继续积累局部证据
      │
      ├── LLM STOP：通常被 global search gate 拒绝
      │

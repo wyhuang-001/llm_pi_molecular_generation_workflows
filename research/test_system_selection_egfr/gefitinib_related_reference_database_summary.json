@@ -1,0 +1,67 @@
+{
+  "generated_at_query_date": "2026-09-27",
+  "normalization_warning": "Fold changes are calculated only against gefitinib measured in the same assay. Values from different document/assay IDs must not be pooled as a single quantitative scale.",
+  "reference_structure": {
+    "pdb_id": "4WKQ",
+    "ligand": "gefitinib",
+    "ligand_chembl_id": "CHEMBL939"
+  },
+  "activity_record_count": 120,
+  "compound_source_record_count": 77,
+  "unique_molecule_count": 75,
+  "unique_analogue_count_excluding_gefitinib_and_erlotinib": 73,
+  "series": [
+    {
+      "document_chembl_id": "CHEMBL1134804",
+      "series_name": "gefitinib discovery series",
+      "doi": "10.1016/S0960-894X(01)00344-4",
+      "year": 2001,
+      "title": "Studies leading to the identification of ZD1839 (IRESSA): an orally active, selective epidermal growth factor receptor tyrosine kinase inhibitor targeted to the treatment of cancer.",
+      "reference_values": {
+        "CHEMBL677210": 23.0
+      },
+      "priority": "primary_strict",
+      "compound_count": 28,
+      "activity_record_count": 28,
+      "assay_ids": [
+        "CHEMBL677210"
+      ]
+    },
+    {
+      "document_chembl_id": "CHEMBL1147701",
+      "series_name": "C6 carbon-linked 4-anilinoquinazolines",
+      "doi": "10.1016/j.bmcl.2006.02.025",
+      "year": 2006,
+      "title": "Novel 4-anilinoquinazolines with C-6 carbon-linked side chains: synthesis and structure-activity relationship of a series of potent, orally active, EGF receptor tyrosine kinase inhibitors.",
+      "reference_values": {
+        "CHEMBL853149": 33.0,
+        "CHEMBL853150": 54.0
+      },
+      "priority": "high_priority_add_on",
+      "compound_count": 35,
+      "activity_record_count": 69,
+      "assay_ids": [
+        "CHEMBL853149",
+        "CHEMBL853150"
+      ]
+    },
+    {
+      "document_chembl_id": "CHEMBL4431348",
+      "series_name": "tricyclic oxazine/oxazepine-fused gefitinib analogues",
+      "doi": "10.1016/j.bmcl.2016.08.007",
+      "year": 2016,
+      "title": "Synthesis and biological evaluation of novel tricyclic oxazine and oxazepine fused quinazolines. Part 2: Gefitinib analogs.",
+      "reference_values": {
+        "CHEMBL4432452": 25.0,
+        "CHEMBL4432463": 1.0
+      },
+      "priority": "secondary_add_on",
+      "compound_count": 14,
+      "activity_record_count": 23,
+      "assay_ids": [
+        "CHEMBL4432452",
+        "CHEMBL4432463"
+      ]
+    }
+  ]
+}

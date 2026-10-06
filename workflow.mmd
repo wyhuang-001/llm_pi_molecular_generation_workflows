@@ -39,8 +39,8 @@ flowchart TD
 
     A --> D[LLM 选择当前局部搜索方案]
     D --> D1[选择编辑操作]
-    D1 --> D11[replace_hydrogen：在可替换氢上接入取代基]
-    D1 --> D12[replace_fragment：按 Host 定义的切割键替换一侧片段]
+    D1 --> D11[atom:addition：在可替换氢位点接入取代基]
+    D1 --> D12[bond:deletion / bond:replacement：按 Host 切割键删除或替换一侧]
     D --> D2[选择片段]
     D2 --> D21[考虑尺寸：minimal、small、medium、large]
     D2 --> D22[考虑化学家族与标签]

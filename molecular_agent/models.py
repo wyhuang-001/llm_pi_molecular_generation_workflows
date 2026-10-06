@@ -39,11 +39,14 @@ class AgentState:
     fragment_memory: dict[str, Any] = field(default_factory=dict)
     candidate_memory: dict[str, Any] = field(default_factory=dict)
     elite_archive: list[dict[str, Any]] = field(default_factory=list)
-    # Portfolio/batch optimization state. The full event history remains authoritative.
+    # Structured local SAR memory rebuilt/updated from every evaluated candidate.
+    # It stores bounded, auditable contrasts rather than free-form model claims.
+    sar_memory: list[dict[str, Any]] = field(default_factory=list)
     design_dossier: dict[str, Any] | None = None
-    batch_history: list[dict[str, Any]] = field(default_factory=list)
-    site_board: dict[str, dict[str, Any]] = field(default_factory=dict)
-    batch_round: int = 0
+    # One-shot external research bundle collected before the first LLM decision.
+    # It is immutable input evidence for the design loop; later turns only receive
+    # the persisted bundle and docking feedback.
+    external_research: dict[str, Any] | None = None
     memory_schema_version: int = 2
     convergence: dict[str, Any] = field(default_factory=lambda: {
         "status": "not_started",
@@ -90,10 +93,9 @@ class AgentState:
             "fragment_memory": self.fragment_memory,
             "candidate_memory": self.candidate_memory,
             "elite_archive": self.elite_archive,
+            "sar_memory": self.sar_memory,
             "design_dossier": self.design_dossier,
-            "batch_history": self.batch_history,
-            "site_board": self.site_board,
-            "batch_round": self.batch_round,
+            "external_research": self.external_research,
             "memory_schema_version": self.memory_schema_version,
             "site_strategy": self.site_strategy,
             "active_target": self.active_target,

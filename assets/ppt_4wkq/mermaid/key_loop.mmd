@@ -1,0 +1,15 @@
+flowchart LR
+    A("侧链编辑") --> B("计算验证")
+    B --> C("验证筛选")
+    C -- "通过" --> D("候选排序")
+    C -. "否：调整方案" .-> A
+
+    classDef edit fill:#EAF7F6,stroke:#62ABA8,color:#176D70,stroke-width:1.6px;
+    classDef compute fill:#F0F7FB,stroke:#8EB7CE,color:#244C68,stroke-width:1.5px;
+    classDef gate fill:#FFFFFF,stroke:#86AABA,color:#244C68,stroke-width:1.7px;
+    classDef output fill:#FFF5E5,stroke:#DCAC67,color:#92611F,stroke-width:1.5px;
+    class A edit;
+    class B compute;
+    class C gate;
+    class D output;
+    linkStyle default stroke:#749BAC,stroke-width:1.7px;

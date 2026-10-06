@@ -7,7 +7,7 @@ import pytest
 from rdkit import Chem
 
 from molecular_agent.adapters import DockingAdapter, NotConfiguredAdapter
-from molecular_agent.editing import apply_transformation, write_sdf
+from molecular_agent.editing import apply_transformation, transformation_product_smiles, write_sdf
 from molecular_agent.llm import ResponsesClient
 from molecular_agent.models import AgentState, REQUIRED_EVIDENCE, ToolObservation
 from molecular_agent.structure import ComplexContext
@@ -90,55 +90,8 @@ def test_llm_assessed_edit_site_strategy_is_host_validated():
         }])
 
 
-def test_site_candidate_batch_is_operation_specific_and_geometry_screened():
-    tools = ToolRegistry(ComplexContext(TASK))
-    result, evidence = tools.execute(
-        "generate_site_candidate_batch",
-        {"target_type": "atom", "target_id": 10, "query": "fluoro", "limit": 3},
-    )
-    assert result["status"] == "complete"
-    assert result["target_type"] == "atom"
-    assert result["operation"] == "substitute"
-    assert result["accepted_count"] >= 1
-    assert all(item["transformation"]["edit_atom_index"] == 10 for item in result["candidates"])
-    assert evidence == {"candidate_batch"}
 
 
-def test_candidate_batch_results_count_as_site_exploration_for_closure(tmp_path):
-    workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
-    workflow._execute_query({
-        "action": "QUERY",
-        "tool": "get_edit_site_candidates",
-        "arguments": {},
-    })
-    workflow._execute_query({
-        "action": "QUERY",
-        "tool": "assess_edit_sites",
-        "arguments": {
-            "sites": [{
-                "target_type": "atom",
-                "target_id": 2,
-                "priority": 1,
-                "site_type": "linker_or_sidechain",
-                "rationale": "Explore the tight linker-adjacent site.",
-            }],
-        },
-    })
-    workflow._design_phase = True
-    workflow._refresh_site_search()
-    workflow._execute_query({
-        "action": "QUERY",
-        "tool": "generate_site_candidate_batch",
-        "arguments": {"target_type": "atom", "target_id": 2, "query": "fluoro", "limit": 8},
-    })
-    workflow._execute_query({
-        "action": "QUERY",
-        "tool": "generate_site_candidate_batch",
-        "arguments": {"target_type": "atom", "target_id": 2, "query": "methyl", "limit": 8},
-    })
-    coverage = workflow._global_search_coverage()
-    assert len(workflow._distinct_target_transformations("atom", 2)) >= 2
-    assert coverage["attempted_atoms"]["2"]
 
 
 def test_ligand_fragment_returns_connected_atom_and_bond_subgraph():
@@ -161,12 +114,14 @@ def test_ablation_tool_catalog_keeps_candidate_geometry_final_only():
 def test_candidate_geometry_evidence_records_exact_candidate_check():
     tools = ToolRegistry(ComplexContext(TASK))
     rejected, evidence = tools.execute(
-        "validate_candidate_geometry", {"atom_index": 1, "fragment_smiles": "[*:1]C"}
+        "validate_candidate_geometry",
+        {"site_type": "atom", "change_type": "addition", "atom_index": 1, "fragment_smiles": "[*:1]C"},
     )
     assert rejected["status"] == "rejected"
     assert evidence == {"candidate_geometry"}
     accepted, evidence = tools.execute(
-        "validate_candidate_geometry", {"atom_index": 9, "fragment_smiles": "[*:1]F"}
+        "validate_candidate_geometry",
+        {"site_type": "atom", "change_type": "addition", "atom_index": 9, "fragment_smiles": "[*:1]F"},
     )
     assert accepted["status"] == "accepted"
     assert evidence == {"candidate_geometry"}
@@ -190,7 +145,7 @@ def test_fragment_tools_accept_equivalent_library_smiles():
     rejected, _evidence = tools.execute(
         "validate_candidate_geometry",
         {
-            "operation": "replace_hydrogen",
+            "site_type": "atom", "change_type": "addition",
             "edit_atom_index": 1,
             "fragment_id": "curated-ethyl",
             "fragment_smiles": "CC[*:1]",
@@ -207,7 +162,7 @@ def test_ready_gate_accepts_get_fragment_record_as_library_evidence(tmp_path):
     fragment_smiles = "Brc1c[nH]c([*:1])n1"
     for tool, arguments in (
         ("get_atom_environment", {"atom_index": 21, "radius": 4.0}),
-        ("list_fragment_replacement_sites", {"limit": 100}),
+        ("list_bond_sites", {"limit": 100}),
         ("get_fragment_record", {"fragment_id": fragment_id}),
         ("get_fragment_properties", {"smiles": fragment_smiles}),
         ("get_fragment_spatial_profile", {
@@ -215,8 +170,8 @@ def test_ready_gate_accepts_get_fragment_record_as_library_evidence(tmp_path):
             "fragment_smiles": fragment_smiles,
         }),
         ("validate_candidate_geometry", {
-            "operation": "replace_fragment",
-            "replacement_site_id": "replacement-site-002",
+            "site_type": "bond", "change_type": "replacement",
+            "bond_site_id": "bond-site-002",
             "fragment_id": fragment_id,
             "fragment_smiles": fragment_smiles,
         }),
@@ -227,8 +182,8 @@ def test_ready_gate_accepts_get_fragment_record_as_library_evidence(tmp_path):
         "action": "READY",
         "understanding": "The selected replacement passed the required host checks.",
         "edit_hypothesis": "Test a compact heteroaryl replacement.",
-        "operation": "replace_fragment",
-        "replacement_site_id": "replacement-site-002",
+        "site_type": "bond", "change_type": "replacement",
+        "bond_site_id": "bond-site-002",
         "fragment_id": fragment_id,
         "fragment_smiles": fragment_smiles,
     })
@@ -269,7 +224,11 @@ def test_design_dossier_contains_all_sites_and_fragment_panels():
     assert result["status"] == "complete"
     assert result["site_count"] == 19
     assert all(len(site["fragment_panel"]) <= 4 for site in result["sites"])
-    assert all(site["supported_operation"] in {"replace_hydrogen", "replace_fragment"} for site in result["sites"])
+    assert all(
+        set(site["allowed_change_types"]) <= {"addition", "deletion", "replacement"}
+        and site["allowed_change_types"]
+        for site in result["sites"]
+    )
     assert evidence == {"design_dossier"}
 
 
@@ -305,7 +264,7 @@ def test_local_parent_child_replaces_the_existing_substituent(tmp_path):
     parent_result = apply_transformation(
         workflow.context.ligand,
         {
-            "operation": "replace_hydrogen",
+            "site_type": "atom", "change_type": "addition",
             "edit_atom_index": 10,
             "fragment_smiles": "[*:1]F",
         },
@@ -321,7 +280,7 @@ def test_local_parent_child_replaces_the_existing_substituent(tmp_path):
     result, evidence = workflow.tools.execute(
         "validate_candidate_geometry",
         {
-            "operation": "replace_hydrogen",
+            "site_type": "bond", "change_type": "replacement",
             "edit_atom_index": 10,
             "fragment_smiles": "[*:1]C",
             "parent_attempt": 1,
@@ -334,43 +293,6 @@ def test_local_parent_child_replaces_the_existing_substituent(tmp_path):
     assert evidence == {"candidate_geometry"}
 
 
-def test_local_parent_candidate_batch_replaces_existing_substituent(tmp_path):
-    workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
-    parent_result = apply_transformation(
-        workflow.context.ligand,
-        {
-            "operation": "replace_hydrogen",
-            "edit_atom_index": 9,
-            "fragment_smiles": "[*:1]F",
-        },
-        workflow.context.protein_atoms,
-    )
-    workflow.parent_candidates[1] = parent_result.molecule
-    workflow.parent_metadata[1] = {
-        "attempt": 1,
-        "generation": 1,
-        "target_type": "atom",
-        "target_id": 9,
-    }
-    result, evidence = workflow.tools.execute(
-        "generate_site_candidate_batch",
-        {
-            "target_type": "atom",
-            "target_id": 9,
-            "query": "methyl",
-            "limit": 3,
-            "parent_attempt": 1,
-        },
-    )
-    assert result["status"] == "complete"
-    assert result["parent_attempt"] == 1
-    assert result["accepted_count"] >= 1
-    assert all(
-        item["transformation"]["parent_attempt"] == 1
-        and item["transformation"]["replace_existing_substituent"] is True
-        for item in result["candidates"]
-    )
-    assert evidence == {"candidate_batch"}
 
 
 def test_resume_restores_same_run_history_and_stable_parents(tmp_path, monkeypatch):
@@ -380,7 +302,7 @@ def test_resume_restores_same_run_history_and_stable_parents(tmp_path, monkeypat
     parent_result = apply_transformation(
         workflow.context.ligand,
         {
-            "operation": "replace_hydrogen",
+            "site_type": "atom", "change_type": "addition",
             "edit_atom_index": 9,
             "fragment_smiles": "[*:1]F",
         },
@@ -389,7 +311,7 @@ def test_resume_restores_same_run_history_and_stable_parents(tmp_path, monkeypat
     candidate_path = run_dir / "candidate-01.sdf"
     write_sdf(parent_result, candidate_path, name="candidate-01")
     transformation = {
-        "operation": "replace_hydrogen",
+        "site_type": "atom", "change_type": "addition",
         "edit_atom_index": 9,
         "fragment_smiles": "[*:1]F",
         "generation": 1,
@@ -463,7 +385,7 @@ def test_fragment_smiles_matching_uses_structure_equivalence(tmp_path):
 
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     transformation = workflow._transformation({
-        "operation": "replace_hydrogen",
+        "site_type": "atom", "change_type": "addition",
         "edit_atom_index": 1,
         "fragment_id": "curated-ethyl",
         "fragment_smiles": "CC[*:1]",
@@ -477,7 +399,7 @@ def test_fragment_library_rejects_natural_language_query_and_suggests_terms():
         "search_fragment_library",
         {
             "query": "small polar heterocycle hydrogen bond donor acceptor",
-            "operation": "replace_fragment",
+            "site_type": "bond", "change_type": "replacement",
             "max_heavy_atoms": 10,
             "limit": 20,
         },
@@ -503,20 +425,20 @@ def test_fragment_library_strictly_filters_requested_operation(tmp_path):
         "allowed_operations": ["substitute"],
         "fragments": [
             {"fragment_id": "sub-only", "name": "pyridyl", "smiles": "[*:1]c1ccncc1", "operation": "legacy-value"},
-            {"fragment_id": "replace-ok", "name": "pyridyl replacement", "smiles": "[*:1]c1ccncc1", "allowed_operations": ["replace_fragment"]},
+            {"fragment_id": "replace-ok", "name": "pyridyl replacement", "smiles": "[*:1]c1ccncc1", "allowed_operations": ["bond:replacement"]},
         ],
     }), encoding="utf-8")
     from molecular_agent.fragment_library import FragmentLibrary
 
     library = FragmentLibrary(library_path)
     substitute = library.search("pyridine", operation="substitute")
-    replacement = library.search("pyridine", operation="replace_fragment")
+    replacement = library.search("pyridine", operation="bond:replacement")
 
     assert substitute["match_mode"] == "chemical_substructure"
     assert [item["fragment_id"] for item in substitute["fragments"]] == ["sub-only"]
     assert [item["fragment_id"] for item in replacement["fragments"]] == ["replace-ok"]
     assert all(
-        "replace_fragment" in item.get("allowed_operations", [])
+        "bond:replacement" in item.get("allowed_operations", [])
         for item in replacement["fragments"]
     )
 
@@ -541,52 +463,29 @@ def test_unified_library_is_used_by_the_configured_task(tmp_path):
     }
 
 
-def test_unified_minimal_candidate_batch_is_geometry_screened():
-    from molecular_agent.fragment_library import FragmentLibrary
-
-    tools = ToolRegistry(
-        ComplexContext(TASK),
-        FragmentLibrary(ROOT / "molecular_agent/data/fragments_unified.json"),
-    )
-    result, evidence = tools.execute(
-        "generate_site_candidate_batch",
-        {
-            "target_type": "atom",
-            "target_id": 9,
-            "size_class": "minimal",
-            "limit": 10,
-        },
-    )
-    assert evidence == {"candidate_batch"}
-    assert result["size_class"] == "minimal"
-    assert result["accepted_count"] >= 5
-    assert all(
-        item["fragment_properties"]["size_class"] == "minimal"
-        for item in result["candidates"]
-    )
 
 
 def test_fragment_library_does_not_relabel_substituents_as_replacements():
     tools = ToolRegistry(ComplexContext(TASK))
     result, _evidence = tools.execute(
         "search_fragment_library",
-        {"query": "phenyl", "operation": "replace_fragment", "limit": 5},
+        {"query": "phenyl", "site_type": "bond", "change_type": "replacement", "limit": 5},
     )
     assert result["operation_compatible_records"] == 0
     assert result["fragments"] == []
 
-    site = tools.list_fragment_replacement_sites(limit=1)["sites"][0]
+    site = tools.list_bond_sites(limit=1)["sites"][0]
     rejected, _evidence = tools.execute(
         "validate_candidate_geometry",
         {
-            "operation": "replace_fragment",
-            "replacement_site_id": site["replacement_site_id"],
+            "site_type": "bond", "change_type": "replacement",
+            "bond_site_id": site["bond_site_id"],
             "fragment_id": "phenyl",
             "fragment_smiles": "[*:1]c1ccccc1",
         },
     )
     assert rejected["status"] == "rejected"
-    assert "does not allow operation replace_fragment" in rejected["error"]
+    assert "does not allow a replacement edit" in rejected["error"]
 
 
 def test_polar_contacts_report_donor_acceptor_compatibility():
@@ -602,27 +501,27 @@ def test_polar_contacts_report_donor_acceptor_compatibility():
     assert all(item["role_warning"] for item in incompatible)
 
 
-def test_fragment_replacement_sites_preserve_the_larger_ring_rich_scaffold():
+def test_fragment_bond_sites_preserve_the_larger_ring_rich_scaffold():
     tools = ToolRegistry(ComplexContext(TASK))
-    result, evidence = tools.execute("list_fragment_replacement_sites", {"limit": 20})
-    assert evidence == {"replacement_sites"}
+    result, evidence = tools.execute("list_bond_sites", {"limit": 20})
+    assert evidence == {"bond_sites"}
     assert result["count"] > 0
     assert all(site["retained_heavy_atoms"] > site["removed_heavy_atoms"] for site in result["sites"])
     assert all(site["retained_ring_atoms"] >= site["removed_ring_atoms"] for site in result["sites"])
     assert all(site["removed_fraction"] <= 0.4 for site in result["sites"])
-    assert all(site["replacement_site_id"].startswith("replacement-site-") for site in result["sites"])
+    assert all(site["bond_site_id"].startswith("bond-site-") for site in result["sites"])
 
 
-def test_replacement_site_spatial_profile_returns_directional_facts():
+def test_bond_site_spatial_profile_returns_directional_facts():
     tools = ToolRegistry(ComplexContext(TASK))
-    site = tools.list_fragment_replacement_sites(limit=1)["sites"][0]
+    site = tools.list_bond_sites(limit=1)["sites"][0]
     result, evidence = tools.execute(
-        "get_replacement_site_spatial_profile",
-        {"replacement_site_id": site["replacement_site_id"]},
+        "get_bond_site_spatial_profile",
+        {"bond_site_id": site["bond_site_id"]},
     )
     assert result["status"] == "complete"
-    assert evidence == {"replacement_site_spatial_profile"}
-    assert result["replacement_site_id"] == site["replacement_site_id"]
+    assert evidence == {"bond_site_spatial_profile"}
+    assert result["bond_site_id"] == site["bond_site_id"]
     assert len(result["attachment_unit_vector"]) == 3
     assert result["direction_profiles"]
     assert all(
@@ -649,21 +548,21 @@ def test_fragment_spatial_profile_returns_attachment_centered_facts():
     assert "limitation" in result
 
 
-def test_fragment_replacement_site_id_resolves_cut_direction():
+def test_fragment_bond_site_id_resolves_cut_direction():
     tools = ToolRegistry(ComplexContext(TASK))
-    site = tools.list_fragment_replacement_sites(limit=1)["sites"][0]
+    site = tools.list_bond_sites(limit=1)["sites"][0]
     result, evidence = tools.execute(
         "validate_candidate_geometry",
         {
-            "operation": "replace_fragment",
-            "replacement_site_id": site["replacement_site_id"],
+            "site_type": "bond", "change_type": "replacement",
+            "bond_site_id": site["bond_site_id"],
             "fragment_smiles": "[*:1]F",
         },
     )
     assert evidence == {"candidate_geometry"}
     assert result["transformation"]["cut_bond"] == site["cut_bond"]
     assert result["transformation"]["edit_atom_index"] == site["retained_atom_index"]
-    assert result["transformation"]["replacement_site"]["removed_atom_indices"] == site["removed_atom_indices"]
+    assert result["transformation"]["bond"]["removed_atom_indices"] == site["removed_atom_indices"]
 
 
 def test_fragment_replacement_rejects_direct_cut_bond_guessing():
@@ -671,30 +570,30 @@ def test_fragment_replacement_rejects_direct_cut_bond_guessing():
     result, _evidence = tools.execute(
         "validate_candidate_geometry",
         {
-            "operation": "replace_fragment",
+            "site_type": "bond", "change_type": "replacement",
             "cut_bond": [14, 15],
             "fragment_smiles": "[*:1]F",
         },
     )
     assert result["status"] == "rejected"
-    assert "replacement_site_id" in result["error"]
+    assert "bond_site_id" in result["error"]
 
 
-def test_replace_fragment_does_not_require_hydrogen_on_retained_atom():
+def test_bond_replacement_does_not_require_hydrogen_on_retained_atom():
     context = ComplexContext(TASK)
     # Bond 14-15 connects the heteroaromatic scaffold to an O-cyclohexyl side chain.
     assert context.ligand.GetAtomWithIdx(14).GetTotalNumHs() == 0
     result = apply_transformation(
         context.ligand,
         {
-            "operation": "replace_fragment",
+            "site_type": "bond", "change_type": "replacement",
             "edit_atom_index": 14,
             "cut_bond": [14, 15],
             "fragment_smiles": "[*:1]F",
         },
         context.protein_atoms,
     )
-    assert result.report["operation"] == "replace_fragment"
+    assert result.report["operation"] == "bond:replacement"
     assert result.report["structure_change"]["cut_bond"] == [14, 15]
     assert 15 in result.report["structure_change"]["removed_atom_indices"]
     assert Chem.GetFormalCharge(result.molecule) == Chem.GetFormalCharge(context.ligand)
@@ -727,8 +626,8 @@ def test_llm_state_view_uses_bounded_design_observation_window(tmp_path):
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     workflow._design_phase = True
     workflow.state.active_target = {
-        "target_type": "replacement_site",
-        "target_id": "replacement-site-001",
+        "target_type": "bond",
+        "target_id": "bond-site-001",
     }
     for index in range(50):
         workflow.state.observations.append(ToolObservation(
@@ -771,7 +670,7 @@ def test_working_memory_keeps_full_history_outside_compact_archive(tmp_path):
     for attempt in range(1, 25):
         workflow._update_working_memory(
             transformation={
-                "operation": "replace_hydrogen",
+                "site_type": "atom", "change_type": "addition",
                 "edit_atom_index": 9,
                 "fragment_smiles": f"[*:1]C{attempt}",
             },
@@ -791,16 +690,16 @@ def test_working_memory_keeps_full_history_outside_compact_archive(tmp_path):
 def test_geometry_feasible_not_docked_excludes_docked_transformations(tmp_path):
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     pending = {
-        "operation": "replace_fragment",
-        "replacement_site_id": "replacement-site-001",
+        "site_type": "bond", "change_type": "replacement",
+        "bond_site_id": "bond-site-001",
         "edit_atom_index": 2,
         "fragment_id": "pending",
         "fragment_smiles": "N1=NC1[*:1]",
         "cut_bond": [2, 3],
     }
     docked = {
-        "operation": "replace_fragment",
-        "replacement_site_id": "replacement-site-001",
+        "site_type": "bond", "change_type": "replacement",
+        "bond_site_id": "bond-site-001",
         "edit_atom_index": 2,
         "fragment_id": "docked",
         "fragment_smiles": "C1OCN1[*:1]",
@@ -808,22 +707,22 @@ def test_geometry_feasible_not_docked_excludes_docked_transformations(tmp_path):
     }
     workflow.state.exploration_attempts.extend([
         {
-            "target_type": "replacement_site",
-            "target_id": "replacement-site-001",
-            "status": "batch_geometry_accepted",
+            "target_type": "bond",
+            "target_id": "bond-site-001",
+            "status": "geometry_accepted",
             "transformation": pending,
         },
         {
-            "target_type": "replacement_site",
-            "target_id": "replacement-site-001",
-            "status": "batch_geometry_accepted",
+            "target_type": "bond",
+            "target_id": "bond-site-001",
+            "status": "geometry_accepted",
             "transformation": docked,
         },
     ])
     workflow.state.docking_history.append({"transformation": docked})
 
     remaining = workflow._geometry_feasible_not_docked(
-        "replacement_site", "replacement-site-001"
+        "bond", "bond-site-001"
     )
 
     assert remaining == [pending]
@@ -881,7 +780,7 @@ def test_query_batch_skips_internal_duplicate_and_executes_once(tmp_path):
 def test_placeholder_fragment_id_is_treated_as_omitted(tmp_path):
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     transformation = workflow._transformation({
-        "operation": "replace_hydrogen",
+        "site_type": "atom", "change_type": "addition",
         "edit_atom_index": 9,
         "fragment_id": "optional",
         "fragment_smiles": "[*:1]F",
@@ -894,14 +793,14 @@ def test_transformation_identity_normalizes_cut_bond_order(tmp_path):
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     workflow.state.candidate_history.append({
         "transformation": {
-            "operation": "replace_fragment",
+            "site_type": "bond", "change_type": "replacement",
             "edit_atom_index": 14,
             "cut_bond": [15, 14],
             "fragment_smiles": "[*:1]F",
         }
     })
     assert workflow._transformation_was_attempted({
-        "operation": "replace_fragment",
+        "site_type": "bond", "change_type": "replacement",
         "edit_atom_index": 14,
         "cut_bond": [14, 15],
         "fragment_smiles": "[*:1]F",
@@ -942,19 +841,13 @@ def test_site_lock_blocks_jump_until_active_target_local_search_completes(tmp_pa
 
     assert workflow.state.active_target["target_id"] == 10
     rejection = workflow._site_lock_rejection({
-        "operation": "replace_hydrogen",
+        "site_type": "atom", "change_type": "addition",
         "edit_atom_index": 9,
         "fragment_smiles": "[*:1]F",
     })
     assert rejection is not None
     assert rejection["failure_class"] == "site_lock_violation"
     assert rejection["active_target"]["target_id"] == 10
-    with pytest.raises(RuntimeError, match="current active prioritized site"):
-        workflow._execute_query({
-            "action": "QUERY",
-            "tool": "generate_site_candidate_batch",
-            "arguments": {"target_type": "atom", "target_id": 9, "query": "fluoro"},
-        })
 
 
 def _prepare_locked_site_strategy(workflow, sites):
@@ -975,11 +868,11 @@ def _prepare_locked_site_strategy(workflow, sites):
 
 def test_local_fragment_replacement_families_keep_chemical_diversity():
     assert Workflow._local_modification_family({
-        "operation": "replace_fragment",
+        "site_type": "bond", "change_type": "replacement",
         "fragment_smiles": "[*:1]CC",
     }) == "fragment_replacement:alkyl"
     assert Workflow._local_modification_family({
-        "operation": "replace_fragment",
+        "site_type": "bond", "change_type": "replacement",
         "fragment_smiles": "[*:1]C(=O)N",
     }) == "fragment_replacement:polar"
 
@@ -997,7 +890,7 @@ def test_mark_unmodifiable_uses_llm_evidence_without_fixed_attempt_gate(tmp_path
     for attempt, fragment in enumerate(fragments, start=1):
         workflow._record_exploration_attempt(
             {
-                "operation": "replace_hydrogen",
+                "site_type": "atom", "change_type": "addition",
                 "edit_atom_index": 10,
                 "fragment_smiles": fragment,
             },
@@ -1011,6 +904,7 @@ def test_mark_unmodifiable_uses_llm_evidence_without_fixed_attempt_gate(tmp_path
         "target_type": "atom",
         "target_id": 10,
         "scope": "site",
+        "completion_reason": "no_promising_edit",
         "reason": "No remaining evidence-backed local hypothesis.",
     }
     assert workflow._record_unmodifiable(decision) is True
@@ -1042,7 +936,7 @@ def test_local_patience_requests_review_without_advancing_target(tmp_path):
     ):
         workflow._record_exploration_attempt(
             {
-                "operation": "replace_hydrogen",
+                "site_type": "atom", "change_type": "addition",
                 "edit_atom_index": 10,
                 "fragment_smiles": fragment,
             },
@@ -1083,7 +977,7 @@ def test_duplicate_mark_unmodifiable_is_idempotent_after_target_advances(tmp_pat
     ):
         workflow._record_exploration_attempt(
             {
-                "operation": "replace_hydrogen",
+                "site_type": "atom", "change_type": "addition",
                 "edit_atom_index": 10,
                 "fragment_smiles": fragment,
             },
@@ -1097,6 +991,7 @@ def test_duplicate_mark_unmodifiable_is_idempotent_after_target_advances(tmp_pat
         "target_type": "atom",
         "target_id": 10,
         "scope": "site",
+        "completion_reason": "sufficient_evidence",
         "reason": "The completed local search supports closing this target.",
     }
     assert workflow._handle_decision(decision) == "MARK_UNMODIFIABLE"
@@ -1125,7 +1020,6 @@ class CorrectInvalidClosureClient:
 
 def test_wrong_target_mark_unmodifiable_recovers_instead_of_crashing(tmp_path):
     workflow = Workflow(TASK, CorrectInvalidClosureClient(), tmp_path)
-    workflow.context.task["batch_optimization"]["enabled"] = False
     _prepare_locked_site_strategy(workflow, [
         {
             "target_type": "atom",
@@ -1149,6 +1043,7 @@ def test_wrong_target_mark_unmodifiable_recovers_instead_of_crashing(tmp_path):
             "target_type": "atom",
             "target_id": 9,
             "scope": "site",
+            "completion_reason": "no_promising_edit",
             "reason": "Incorrect stale target closure.",
         },
         payload,
@@ -1184,7 +1079,7 @@ def test_docking_trend_preserves_best_attempt_without_auto_convergence(tmp_path)
     for attempt, quality in enumerate(qualities, start=1):
         entries.append(workflow._record_docking_result(
             attempt,
-            {"operation": "replace_hydrogen", "edit_atom_index": 10, "fragment_smiles": f"f{attempt}"},
+            {"site_type": "atom", "change_type": "addition", "edit_atom_index": 10, "fragment_smiles": f"f{attempt}"},
             tmp_path / f"candidate-{attempt}.sdf",
             {
                 "status": "complete",
@@ -1208,7 +1103,7 @@ def test_design_regions_are_descriptive_only(tmp_path):
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     workflow._record_docking_result(
         1,
-        {"operation": "replace_hydrogen", "edit_atom_index": 9, "fragment_smiles": "[*:1]F"},
+        {"site_type": "atom", "change_type": "addition", "edit_atom_index": 9, "fragment_smiles": "[*:1]F"},
         tmp_path / "candidate-1.sdf",
         {
             "status": "complete",
@@ -1221,7 +1116,7 @@ def test_design_regions_are_descriptive_only(tmp_path):
     )
     workflow._record_docking_result(
         2,
-        {"operation": "replace_hydrogen", "edit_atom_index": 10, "fragment_smiles": "[*:1]Cl"},
+        {"site_type": "atom", "change_type": "addition", "edit_atom_index": 10, "fragment_smiles": "[*:1]Cl"},
         tmp_path / "candidate-2.sdf",
         {
             "status": "complete",
@@ -1234,7 +1129,7 @@ def test_design_regions_are_descriptive_only(tmp_path):
     )
     convergence = workflow.state.convergence
     assert convergence["validated_design_regions"] == []
-    assert convergence["docked_design_regions"] == ["atom:10", "atom:9"]
+    assert convergence["docked_design_regions"] == ["atom:10:addition", "atom:9:addition"]
     assert convergence["design_region_count_is_descriptive_only"] is True
     assert convergence["converged"] is False
 
@@ -1255,7 +1150,7 @@ def test_global_stop_gate_requires_non_halogen_followup_after_halogen_hit(tmp_pa
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     workflow._record_docking_result(
         1,
-        {"operation": "replace_hydrogen", "edit_atom_index": 9, "fragment_smiles": "[*:1]F"},
+        {"site_type": "atom", "change_type": "addition", "edit_atom_index": 9, "fragment_smiles": "[*:1]F"},
         tmp_path / "candidate-1.sdf",
         {
             "status": "complete",
@@ -1280,7 +1175,7 @@ def test_global_search_counts_geometry_rejection_as_exploration(tmp_path):
         "action": "QUERY",
         "tool": "validate_candidate_geometry",
         "arguments": {
-            "operation": "replace_hydrogen",
+            "site_type": "atom", "change_type": "addition",
             "edit_atom_index": 17,
             "fragment_smiles": "[*:1]F",
         },
@@ -1306,7 +1201,7 @@ def test_mark_unmodifiable_closes_site_coverage(tmp_path):
     for fragment in ("[*:1]F", "[*:1]C"):
         workflow._record_exploration_attempt(
             {
-                "operation": "replace_hydrogen",
+                "site_type": "atom", "change_type": "addition",
                 "edit_atom_index": 9,
                 "fragment_smiles": fragment,
             },
@@ -1318,6 +1213,7 @@ def test_mark_unmodifiable_closes_site_coverage(tmp_path):
         "target_type": "atom",
         "target_id": 9,
         "scope": "site",
+        "completion_reason": "no_promising_edit",
         "reason": "The accumulated pocket evidence does not support a credible edit at this site.",
     })
     coverage = workflow._global_search_coverage()
@@ -1333,7 +1229,7 @@ def test_rejected_geometry_satisfies_its_family_for_editable_atom(tmp_path):
         "action": "QUERY",
         "tool": "validate_candidate_geometry",
         "arguments": {
-            "operation": "replace_hydrogen",
+            "site_type": "atom", "change_type": "addition",
             "edit_atom_index": 1,
             "fragment_smiles": "[*:1]F",
         },
@@ -1342,7 +1238,7 @@ def test_rejected_geometry_satisfies_its_family_for_editable_atom(tmp_path):
     atom = next(item for item in coverage["missing_atom_coverage"] if item["atom_index"] == 1)
     assert "halogen" not in atom["missing_families"]
     assert workflow._transformation_was_attempted({
-        "operation": "replace_hydrogen",
+        "site_type": "atom", "change_type": "addition",
         "edit_atom_index": 1,
         "fragment_smiles": "[*:1]F",
     })
@@ -1360,7 +1256,7 @@ def test_site_search_counts_geometry_rejections_for_local_closure(tmp_path):
     for fragment in ("[*:1]F", "[*:1]Cl", "[*:1]C", "[*:1]O", "[*:1]N", "[*:1]S"):
         workflow._record_exploration_attempt(
             {
-                "operation": "replace_hydrogen",
+                "site_type": "atom", "change_type": "addition",
                 "edit_atom_index": 1,
                 "fragment_smiles": fragment,
             },
@@ -1381,47 +1277,19 @@ def test_site_search_counts_geometry_rejections_for_local_closure(tmp_path):
         "target_type": "atom",
         "target_id": 1,
         "scope": "site",
+        "completion_reason": "no_promising_edit",
         "reason": "Six distinct probe families were rejected by deterministic geometry checks.",
     }
     assert workflow._record_unmodifiable(decision) is True
     assert workflow.state.site_search["atom:1"]["status"] == "closed"
 
 
-def test_site_search_deduplicates_batch_and_design_records(tmp_path):
-    workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
-    workflow.state.site_strategy = {"sites": [{
-        "target_type": "atom",
-        "target_id": 10,
-        "priority": 1,
-        "site_type": "uncertain",
-        "rationale": "Test one chemical edit across host stages.",
-    }]}
-    transformation = {
-        "operation": "replace_hydrogen",
-        "edit_atom_index": 10,
-        "fragment_id": "library-record",
-        "fragment_smiles": "[*:1]F",
-    }
-    workflow._record_exploration_attempt(
-        transformation, "batch_geometry_accepted", "candidate_batch"
-    )
-    workflow._record_exploration_attempt(
-        {**transformation, "fragment_id": "same-chemistry-different-id"},
-        "docked", "design", attempt=1
-    )
-    workflow._design_phase = True
-    workflow._refresh_site_search()
-
-    local = workflow.state.site_search["atom:10"]
-    assert local["attempt_count"] == 1
-    assert local["geometry_accepted"] == 1
-    assert local["docking_count"] == 0
 
 
 def test_candidate_history_distinguishes_exploration_from_docking(tmp_path):
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     transformation = {
-        "operation": "replace_hydrogen",
+        "site_type": "atom", "change_type": "addition",
         "edit_atom_index": 1,
         "fragment_smiles": "[*:1]C",
     }
@@ -1454,7 +1322,7 @@ def test_global_stop_gate_requires_all_sites_and_modification_families(tmp_path)
         workflow.state.candidate_history.append({
             "attempt": len(workflow.state.candidate_history) + 1,
             "transformation": {
-                "operation": "replace_hydrogen",
+                "site_type": "atom", "change_type": "addition",
                 "edit_atom_index": index,
                 "fragment_smiles": "[*:1]F",
             },
@@ -1465,20 +1333,20 @@ def test_global_stop_gate_requires_all_sites_and_modification_families(tmp_path)
             workflow.state.candidate_history.append({
                 "attempt": len(workflow.state.candidate_history) + 1,
                 "transformation": {
-                    "operation": "replace_hydrogen",
+                    "site_type": "atom", "change_type": "addition",
                     "edit_atom_index": index,
                     "fragment_smiles": "[*:1]C",
                 },
                 "validation": {"status": "accepted"},
                 "docking": {"status": "complete"},
             })
-    for site_id in coverage["replacement_sites"]:
+    for site_id in coverage["bond_sites"]:
         for fragment in ("[*:1]C", "[*:1]N"):
             workflow.state.candidate_history.append({
                 "attempt": len(workflow.state.candidate_history) + 1,
                 "transformation": {
-                    "operation": "replace_fragment",
-                    "replacement_site_id": site_id,
+                    "site_type": "bond", "change_type": "replacement",
+                    "bond_site_id": site_id,
                     "fragment_smiles": fragment,
                 },
                 "validation": {"status": "rejected"},
@@ -1492,7 +1360,7 @@ def test_seed_stability_penalizes_noisy_candidate(tmp_path):
     workflow = Workflow(TASK, ScriptedDemoClient(), tmp_path)
     stable = workflow._record_docking_result(
         1,
-        {"operation": "replace_hydrogen", "edit_atom_index": 9, "fragment_smiles": "stable"},
+        {"site_type": "atom", "change_type": "addition", "edit_atom_index": 9, "fragment_smiles": "stable"},
         tmp_path / "stable.sdf",
         {
             "status": "complete",
@@ -1505,7 +1373,7 @@ def test_seed_stability_penalizes_noisy_candidate(tmp_path):
     )
     noisy = workflow._record_docking_result(
         2,
-        {"operation": "replace_hydrogen", "edit_atom_index": 10, "fragment_smiles": "noisy"},
+        {"site_type": "atom", "change_type": "addition", "edit_atom_index": 10, "fragment_smiles": "noisy"},
         tmp_path / "noisy.sdf",
         {
             "status": "complete",
@@ -1526,7 +1394,10 @@ def test_receptor_export_excludes_co_crystal_hetero_atoms(tmp_path):
     path = context.write_receptor_pdb(tmp_path / "receptor.pdb")
     text = path.read_text(encoding="utf-8")
     assert "ATOM" in text
-    assert "HETATM" not in text
+    hetero = [line for line in text.splitlines() if line.startswith("HETATM")]
+    assert len(hetero) == 22  # Preserve both phospho-Thr160 residues, not the free ligand.
+    assert {line[17:20].strip() for line in hetero} == {"TPO"}
+    assert "2A6" not in text
     assert "2A6" not in text
 
 
@@ -2085,73 +1956,30 @@ def test_api_non_object_response_is_diagnosed(tmp_path, monkeypatch):
     assert report["assistant_content"] == "[1,2]"
 
 
-class PortfolioPlanningClient:
-    def __init__(self):
-        self.calls = 0
-
-    def complete_json(self, payload):
-        assert payload["mode"] == "portfolio_planning"
-        self.calls += 1
-        if self.calls == 1:
-            assert payload["design_dossier"]["site_count"] == 19
-            return {
-                "action": "QUERY",
-                "question": "Refresh one compact polar fragment panel for atom 9.",
-                "tool": "get_fragment_panel",
-                "arguments": {
-                    "target_type": "atom",
-                    "target_id": 9,
-                    "size_classes": ["minimal", "small"],
-                    "chemical_tags": ["polar"],
-                    "limit": 4,
-                },
-                "why_needed": "Compare a focused polar direction with the initial diverse panel.",
-                "decision_impact": "Choose the first multi-site screening batch.",
-            }
-        if self.calls == 2:
-            assert payload["state"]["recent_tool_results"][0]["tool"] == "get_fragment_panel"
-            hypothesis = {
-                "site_evidence": "The host dossier reports an editable atom and measured local clearance.",
-                "intended_change": "Test a minimal local substituent.",
-                "expected_effect": "Probe pocket occupancy while preserving the co-crystal scaffold.",
-                "risk": "The edit may be neutral or geometrically rejected.",
-                "success_criterion": "Pass host geometry and enter screening docking.",
-            }
-            return {
-                "action": "PLAN_BATCH",
-                "rationale": "Compare two host-listed phenyl positions in one batch.",
-                "site_updates": [
-                    {"target_type": "atom", "target_id": 9, "status": "screening", "reason": "Good measured clearance."},
-                    {"target_type": "atom", "target_id": 10, "status": "screening", "reason": "Independent nearby vector."},
-                ],
-                "candidates": [
-                    {"target_type": "atom", "target_id": 9, "operation": "replace_hydrogen", "fragment_id": "curated-chloro", "hypothesis": hypothesis},
-                    {"target_type": "atom", "target_id": 10, "operation": "replace_hydrogen", "fragment_id": "curated-methyl", "hypothesis": hypothesis},
-                ],
-            }
-        return {
-            "action": "STOP",
-            "reason": "The bounded portfolio smoke batch is complete.",
-            "evidence": "Two independent two host-grounded candidates were screened.",
-        }
 
 
-def test_portfolio_workflow_keeps_optional_tools_and_batches_multiple_sites(tmp_path):
-    events = []
-    result = Workflow(
-        TASK,
-        PortfolioPlanningClient(),
-        tmp_path,
-        progress=lambda event, details: events.append((event, details)),
-    ).run()
 
-    assert result["result"]["status"] == "candidate_accepted"
-    assert len(result["result"]["attempts"]) == 2
-    assert result["state"]["batch_round"] == 1
-    assert result["state"]["site_board"]["atom:9"]["attempts"] == 1
-    assert result["state"]["site_board"]["atom:10"]["attempts"] == 1
-    assert any(item["tool"] == "get_fragment_panel" for item in result["state"]["observations"])
-    assert "candidate_geometry_accepted" in [event for event, _details in events]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def test_scripted_workflow_produces_valid_local_candidate(tmp_path):
@@ -2339,20 +2167,20 @@ class MissingReplacementEnvironmentClient:
     def complete_json(self, payload):
         observations = payload["state"]["observations"]
         sites = next(
-            (item["result"]["sites"] for item in observations if item["tool"] == "list_fragment_replacement_sites"),
+            (item["result"]["sites"] for item in observations if item["tool"] == "list_bond_sites"),
             None,
         )
         if sites is None:
             return {
                 "action": "QUERY",
                 "question": "Enumerate replacement sites.",
-                "tool": "list_fragment_replacement_sites",
+                "tool": "list_bond_sites",
                 "arguments": {"limit": 50},
             }
         site = sites[-1]
         transformation = {
-            "operation": "replace_fragment",
-            "replacement_site_id": site["replacement_site_id"],
+            "site_type": "bond", "change_type": "replacement",
+            "bond_site_id": site["bond_site_id"],
             "fragment_smiles": "[*:1]C1COC1",
         }
         if not any(item["tool"] == "validate_candidate_geometry" for item in observations):
@@ -2392,7 +2220,7 @@ def test_missing_ready_evidence_is_recoverable_for_fragment_replacement(tmp_path
     workflow = Workflow(TASK, client, tmp_path)
     workflow.context.task["search_policy"] = {"mode": "family_coverage"}
     decision = workflow.collect_context()
-    site = workflow.tools.resolve_replacement_site(decision["replacement_site_id"])
+    site = workflow.tools.resolve_bond_site(decision["bond_site_id"])
 
     assert client.ready_attempts == 1
     assert any(
@@ -2441,7 +2269,7 @@ def test_wrapped_llm_decision_is_unwrapped_without_repair(tmp_path, envelope):
             "question": "Validate the nitrile candidate geometry.",
             "tool": "validate_candidate_geometry",
             "arguments": {
-                "operation": "replace_hydrogen",
+                "site_type": "atom", "change_type": "addition",
                 "edit_atom_index": 2,
                 "fragment_smiles": "[*:1]C#N",
             },
@@ -2458,19 +2286,19 @@ def test_transformation_field_detector_does_not_require_completeness():
     contains = Workflow._contains_transformation_fields
     # The exact failure from runs/docking-loop-real-agent-20260814-192916.
     assert contains({
-        "operation": "replace_fragment",
-        "replacement_site_id": "replacement-site-001",
+        "site_type": "bond", "change_type": "replacement",
+        "bond_site_id": "bond-site-001",
         "fragment_smiles": "[*:1]C#N",
     })
     # Partial transformation responses still need targeted READY repair.
-    assert contains({"operation": "replace_fragment"})
+    assert contains({"site_type": "bond", "change_type": "replacement"})
     assert contains({
-        "replacement_site_id": "replacement-site-001",
+        "bond_site_id": "bond-site-001",
         "fragment_smiles": "[*:1]C#N",
     })
     # Action validity is a separate concern from transformation detection.
-    assert contains({"action": "READY", "operation": "replace_fragment"})
-    assert contains({"action": "INVALID", "operation": "replace_fragment"})
+    assert contains({"action": "READY", "site_type": "bond", "change_type": "replacement"})
+    assert contains({"action": "INVALID", "site_type": "bond", "change_type": "replacement"})
     # Unrelated invalid decisions and non-dict inputs are not transformations.
     assert not contains({"cutoff": 4.0})
     assert not contains(None)
@@ -2488,8 +2316,8 @@ class PersistentBareTransformationClient:
         self.calls += 1
         self.repair_modes.append(payload.get("mode"))
         return {
-            "operation": "replace_fragment",
-            "replacement_site_id": "replacement-site-001",
+            "site_type": "bond", "change_type": "replacement",
+            "bond_site_id": "bond-site-001",
             "fragment_smiles": "[*:1]C#N",
         }
 
@@ -2594,8 +2422,8 @@ def test_bare_transformation_only_normalizes_action_after_repair_fails(tmp_path)
     client = PersistentBareTransformationClient()
     workflow = Workflow(TASK, client, tmp_path)
     bare = {
-        "operation": "replace_fragment",
-        "replacement_site_id": "replacement-site-001",
+        "site_type": "bond", "change_type": "replacement",
+        "bond_site_id": "bond-site-001",
         "fragment_smiles": "[*:1]C#N",
     }
     decision = workflow._repair_decision(bare, workflow._query_payload(), "edit_retry")
@@ -2636,16 +2464,16 @@ class BareThenReadyClient:
         if payload.get("mode") == "ready_schema_repair":
             return {
                 "action": "READY",
-                "operation": "replace_fragment",
-                "replacement_site_id": "replacement-site-001",
+                "site_type": "bond", "change_type": "replacement",
+                "bond_site_id": "bond-site-001",
                 "fragment_smiles": "[*:1]C#N",
                 "understanding": "The pocket tolerates a nitrile at this vector.",
                 "edit_hypothesis": "Install a nitrile via host-enumerated site.",
                 "knowledge_gaps": [],
             }
         return {
-            "operation": "replace_fragment",
-            "replacement_site_id": "replacement-site-001",
+            "site_type": "bond", "change_type": "replacement",
+            "bond_site_id": "bond-site-001",
             "fragment_smiles": "[*:1]C#N",
         }
 
@@ -2654,8 +2482,8 @@ def test_bare_transformation_repair_recovers_when_model_wraps_ready(tmp_path):
     client = BareThenReadyClient()
     workflow = Workflow(TASK, client, tmp_path)
     bare = {
-        "operation": "replace_fragment",
-        "replacement_site_id": "replacement-site-001",
+        "site_type": "bond", "change_type": "replacement",
+        "bond_site_id": "bond-site-001",
         "fragment_smiles": "[*:1]C#N",
     }
     decision = workflow._repair_decision(bare, workflow._query_payload(), "edit_retry")
@@ -2758,7 +2586,6 @@ class RetryQueryClient:
 
 def test_rejected_candidate_geometry_cannot_satisfy_ready_gate(tmp_path):
     workflow = Workflow(TASK, RetryQueryClient(), tmp_path)
-    workflow.context.task["batch_optimization"]["enabled"] = False
     workflow.context.task["search_policy"] = {"mode": "family_coverage"}
     workflow.docking_adapter = NeverCalledDockingAdapter()
     with pytest.raises(RuntimeError, match="invalid READY decisions"):

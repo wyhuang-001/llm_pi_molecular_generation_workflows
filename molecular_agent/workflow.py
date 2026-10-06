@@ -5,14 +5,28 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from rdkit import Chem
+from rdkit import Chem, DataStructs
+from rdkit.Chem import rdFingerprintGenerator
 
 from .adapters import NotConfiguredAdapter, configured_adapters
-from .editing import EditResult, apply_transformation, write_sdf
+from .edit_taxonomy import (
+    CHANGE_TYPES,
+    EditTaxonomyError,
+    normalize_transformation,
+    operation_label,
+)
+from .editing import EditResult, apply_transformation, transformation_product_smiles, write_sdf
 from .fragment_library import FragmentLibrary
 from .models import AgentState, ToolObservation
+from .research import ExternalResearchError, PlaywrightResearchAdapter
+from .research_memory import (
+    PROMPT as RESEARCH_MEMORY_PROMPT,
+    STAGE1_RESEARCH_SCOPE,
+    evidence_projection,
+    validate_memory,
+)
 from .structure import ComplexContext
-from .tools import ToolRegistry
+from .tools import LIBRARY_OPERATION_FOR_CHANGE_TYPE, ToolRegistry, apply_site_canonicalization
 
 
 class DecisionClient(Protocol):
@@ -42,6 +56,8 @@ class DuplicateToolCallError(RuntimeError):
     def __init__(self, rejection: dict[str, Any]):
         self.rejection = rejection
         super().__init__(rejection["error"])
+
+
 
 
 class ReadyEvidenceError(ReadyDecisionError):
@@ -76,6 +92,15 @@ class ReadyEvidenceError(ReadyDecisionError):
 
 
 class Workflow:
+    #: Docking statuses that mean "this candidate could not be pose-gated", which is a
+    #: candidate-level outcome to learn from, not a reason to stop the search.
+    POSE_GATE_FAILURE_STATUSES = frozenset({"no_eligible_pose", "evaluation_failed"})
+
+    #: Two-level close vocabulary. A site is closed with MARK_UNMODIFIABLE and a
+    #: completion_reason; the whole task is stopped with STOP and a stop_reason.
+    SITE_COMPLETION_REASONS = ("sufficient_evidence", "no_promising_edit", "site_complete")
+    STOP_REASONS = ("no_promising_edit", "insufficient_evidence", "unable_to_repair")
+
     def __init__(
         self,
         task_path: Path,
@@ -85,6 +110,16 @@ class Workflow:
         progress: Callable[[str, dict[str, Any]], None] | None = None,
     ):
         self.context = ComplexContext(task_path)
+        retention = self.context.task.get("pose_retention") or {}
+        # Only fold the pose-retention comparison core into the protected-core list when
+        # the task has no explicit edit-site table.  With a site table the table is the
+        # single authority on what may be edited, and the pose core is a post-docking
+        # comparison set rather than an edit prohibition.
+        if retention.get("enabled") and not self.context.task.get("edit_site_table_path"):
+            protected = self.context.task.setdefault("fragment_replacement", {})
+            protected["protected_core_atom_indices"] = sorted(set(
+                protected.get("protected_core_atom_indices", []) + retention.get("core_atom_indices", [])
+            ))
         self.client = client
         self.run_dir = run_dir.resolve()
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -93,7 +128,14 @@ class Workflow:
             0: Chem.Mol(self.context.ligand)
         }
         self.parent_metadata: dict[int, dict[str, Any]] = {
-            0: {"attempt": 0, "generation": 0, "target_type": None, "target_id": None}
+            0: {
+                "attempt": 0,
+                "generation": 0,
+                "target_type": None,
+                "target_id": None,
+                "modified_targets": [],
+                "lineage": [],
+            }
         }
         library_path = self.context.task.get("fragment_library_path")
         if library_path:
@@ -110,12 +152,28 @@ class Workflow:
         else:
             self.docking_adapter = NotConfiguredAdapter("docking")
             self.rbfe_adapter = NotConfiguredAdapter("rbfe")
+        if hasattr(self.docking_adapter, "config"):
+            if retention.get("enabled"):
+                self.docking_adapter.config["structure_source_identity"] = self.context.preparation_identity()
+                self.docking_adapter.config["pose_retention"] = {
+                    **retention, "primary_metric": self.context.task.get("docking_optimization", {}).get(
+                        "primary_metric", "minimizedAffinity")}
+            self.docking_adapter.config["retained_hetero_residue_names"] = sorted(self.context.retained_hetero_residues)
         self.state = AgentState(
             task=self.context.task["task"],
             max_context_rounds=int(self.context.task.get("max_context_rounds", 8)),
         )
         self.reference_docking_result: dict[str, Any] | None = None
         self._design_phase = False
+        self._direct_edit_mode = False
+        self._initial_context_prepared = False
+        self.closed_pool = None
+        if (self.context.task.get("closed_pool") or {}).get("enabled"):
+            from .closed_pool import ClosedPool
+            if not self._single_edit_enabled():
+                raise ValueError("Closed-pool evaluation requires a real single-edit client, not scripted demo mode")
+            self.closed_pool = ClosedPool(self.context, self.tools)
+            self.closed_pool.bind_run(self.run_dir, self.context, getattr(self.docking_adapter, "config", {}))
 
     def _restore_run_state(self) -> tuple[list[dict[str, Any]], dict[str, int]]:
         """Restore only persisted state and candidate files from this run directory."""
@@ -168,9 +226,7 @@ class Workflow:
         self.state.active_target = saved.get("active_target")
         self.state.site_search = dict(saved.get("site_search", {}))
         self.state.design_dossier = saved.get("design_dossier")
-        self.state.batch_history = list(saved.get("batch_history", []))
-        self.state.site_board = dict(saved.get("site_board", {}))
-        self.state.batch_round = int(saved.get("batch_round", 0))
+        self.state.external_research = saved.get("external_research")
         self.state.convergence = dict(saved.get("convergence", self.state.convergence))
         # Rebuild derived memory from authoritative persisted observations/events.
         self.state.global_memory = {}
@@ -178,6 +234,7 @@ class Workflow:
         self.state.fragment_memory = {}
         self.state.candidate_memory = {}
         self.state.elite_archive = []
+        self.state.sar_memory = list(saved.get("sar_memory", []))
         for observation in self.state.observations:
             self._update_working_memory(
                 tool=observation.tool,
@@ -215,7 +272,14 @@ class Workflow:
 
         self.parent_candidates = {0: Chem.Mol(self.context.ligand)}
         self.parent_metadata = {
-            0: {"attempt": 0, "generation": 0, "target_type": None, "target_id": None}
+            0: {
+                "attempt": 0,
+                "generation": 0,
+                "target_type": None,
+                "target_id": None,
+                "modified_targets": [],
+                "lineage": [],
+            }
         }
         eligible_attempts = {
             item.get("attempt")
@@ -247,12 +311,22 @@ class Workflow:
             )
             transformation = report.get("transformation") or docking_entry.get("transformation") or {}
             target = self._transformation_target(transformation)
+            parent_attempt = transformation.get("parent_attempt")
+            parent_metadata = self.parent_metadata.get(parent_attempt or 0, {})
+            target_key = self._target_key(target["target_type"], target["target_id"])
+            modified_targets = list(parent_metadata.get("modified_targets") or [])
+            if target_key not in modified_targets:
+                modified_targets.append(target_key)
+            lineage = list(parent_metadata.get("lineage") or []) + [attempt]
             self.parent_candidates[attempt] = molecule
             self.parent_metadata[attempt] = {
                 "attempt": attempt,
+                "parent_attempt": parent_attempt,
                 "generation": report.get("generation", transformation.get("generation", 1)),
                 "target_type": target["target_type"],
                 "target_id": target["target_id"],
+                "modified_targets": modified_targets,
+                "lineage": lineage,
                 "quality": docking_entry.get("quality"),
                 "canonical_smiles": (report.get("validation") or {}).get("candidate", {}).get("canonical_smiles"),
                 "candidate_path": str(candidate_path),
@@ -323,13 +397,33 @@ class Workflow:
             self.progress(event, details or {})
 
     @staticmethod
+    def _edit_axes(transformation: dict[str, Any] | None) -> tuple[str, str]:
+        """Return the canonical ``(site_type, change_type)`` for one edit request."""
+        return Workflow._edit_site_type(transformation), Workflow._edit_change_type(transformation)
+
+    @staticmethod
+    def _edit_site_type(transformation: dict[str, Any] | None) -> str:
+        try:
+            return normalize_transformation(dict(transformation or {}))["site_type"]
+        except (EditTaxonomyError, TypeError):
+            return "atom"
+
+    @staticmethod
+    def _edit_change_type(transformation: dict[str, Any] | None) -> str:
+        try:
+            return normalize_transformation(dict(transformation or {}))["change_type"]
+        except (EditTaxonomyError, TypeError):
+            return "addition"
+
+    @staticmethod
     def _memory_target_key(transformation: dict[str, Any] | None) -> str | None:
         transformation = transformation or {}
-        if transformation.get("operation") == "replace_fragment":
-            site_id = transformation.get("replacement_site_id")
-            return f"replacement_site:{site_id}" if site_id is not None else None
+        site_type = Workflow._edit_site_type(transformation)
+        if site_type in {"bond", "linker"}:
+            site_id = transformation.get("bond_site_id") or transformation.get("linker_site_id")
+            return f"{site_type}:{site_id}" if site_id is not None else None
         atom_index = transformation.get("edit_atom_index")
-        return f"atom:{atom_index}" if atom_index is not None else None
+        return f"{site_type}:{atom_index}" if atom_index is not None else None
 
     def _update_working_memory(
         self,
@@ -352,13 +446,14 @@ class Workflow:
             target_key = self._memory_target_key(result.get("transformation"))
         if target_key is None:
             result_target = {
-                "operation": result.get("operation"),
+                "site_type": result.get("site_type"),
+                "change_type": result.get("change_type"),
                 "edit_atom_index": result.get("edit_atom_index", result.get("atom_index")),
-                "replacement_site_id": result.get("replacement_site_id"),
+                "bond_site_id": result.get("bond_site_id"),
             }
-            if result.get("target_type") == "replacement_site":
-                result_target["operation"] = "replace_fragment"
-                result_target["replacement_site_id"] = result.get("target_id", result.get("replacement_site_id"))
+            if result.get("target_type") in {"bond", "linker"}:
+                result_target["site_type"] = result["target_type"]
+                result_target["bond_site_id"] = result.get("target_id", result.get("bond_site_id"))
             target_key = self._memory_target_key(result_target)
         if target_key:
             site = self.state.site_memory.setdefault(target_key, {
@@ -396,6 +491,7 @@ class Workflow:
                         "seed_win_fraction": docking_entry.get("seed_win_fraction"),
                         "seed_stddev": docking_entry.get("seed_stddev"),
                         "pose_stable": (docking_entry.get("pose_consensus") or {}).get("stable"),
+                        "native_like": (docking_entry.get("pose_evidence") or {}).get("native_like"),
                         "interaction_loss": (docking_entry.get("interaction_consensus") or {}).get("lost_consensus_residues", []),
                     })
                     context["events"] = context["events"][-6:]
@@ -421,14 +517,23 @@ class Workflow:
                     "seed_win_fraction": docking_entry.get("seed_win_fraction"),
                     "seed_stddev": docking_entry.get("seed_stddev"),
                     "pose_consensus": docking_entry.get("pose_consensus"),
+                    "pose_evidence": docking_entry.get("pose_evidence"),
                     "interaction_consensus": docking_entry.get("interaction_consensus"),
                 }
                 self.state.candidate_memory = dict(
                     list(sorted(self.state.candidate_memory.items(), key=lambda item: int(item[0])))[-32:]
                 )
             if docking_entry.get("quality") is not None:
-                pose_stable = (docking_entry.get("pose_consensus") or {}).get("stable")
-                interaction_loss = (docking_entry.get("interaction_consensus") or {}).get("lost_consensus_residues", [])
+                pose_evidence = docking_entry.get("pose_evidence") or {}
+                pose_stable = (
+                    pose_evidence.get("native_like")
+                    if "native_like" in pose_evidence
+                    else (docking_entry.get("pose_consensus") or {}).get("stable")
+                )
+                interaction_loss = (
+                    (pose_evidence.get("interactions") or {}).get("lost_consensus", [])
+                    or (docking_entry.get("interaction_consensus") or {}).get("lost_consensus_residues", [])
+                )
                 seed_win_fraction = docking_entry.get("seed_win_fraction")
                 if pose_stable and not interaction_loss and isinstance(seed_win_fraction, (int, float)) and seed_win_fraction >= 2 / 3:
                     archive_class = "stable_candidate"
@@ -465,7 +570,14 @@ class Workflow:
                 if item_key not in omitted_keys
             }
         if isinstance(value, list):
-            limit = 20 if key == "fragments" else 50
+            if key in {"atoms", "bonds"}:
+                return [Workflow._llm_safe_value(item) for item in value]
+            if key in {
+                "attempted_transformations", "docking_history_all"
+            }:
+                limit = 500
+            else:
+                limit = 20 if key == "fragments" else 50
             return [Workflow._llm_safe_value(item) for item in value[:limit]]
         if isinstance(value, str) and len(value) > 4000:
             return value[:4000] + "... [truncated for LLM context]"
@@ -475,9 +587,9 @@ class Workflow:
     def _compact_transformation(transformation: dict[str, Any] | None) -> dict[str, Any]:
         transformation = transformation or {}
         fields = (
-            "operation", "edit_atom_index", "replacement_site_id", "fragment_id",
-            "fragment_smiles", "cut_bond", "parent_attempt", "generation",
-            "replace_existing_substituent",
+            "site_type", "change_type", "operation", "edit_atom_index", "bond_site_id",
+            "fragment_id", "fragment_smiles", "element", "cut_bond", "parent_attempt",
+            "generation", "replace_existing_substituent",
         )
         return {
             key: transformation[key]
@@ -492,6 +604,13 @@ class Workflow:
         # a distinct transformation. Match duplicate-protection semantics.
         normalized.pop("fragment_id", None)
         normalized.pop("generation", None)
+        fragment_smiles = normalized.get("fragment_smiles")
+        if isinstance(fragment_smiles, str):
+            molecule = Chem.MolFromSmiles(fragment_smiles)
+            if molecule is not None:
+                normalized["fragment_smiles"] = Chem.MolToSmiles(
+                    molecule, isomericSmiles=True
+                )
         cut_bond = cls._normalize_cut_bond(normalized.get("cut_bond"))
         if cut_bond is not None:
             normalized["cut_bond"] = list(cut_bond)
@@ -504,7 +623,7 @@ class Workflow:
             "sites", "fragments", "candidates", "rejected", "residues", "contacts",
             "direction_profiles", "representative_conformer_atoms", "properties",
             "transformation", "candidate", "parent", "property_delta",
-            "replacement_site", "recommended_queries",
+            "bond", "recommended_queries",
         ):
             if key not in result:
                 continue
@@ -524,7 +643,7 @@ class Workflow:
         else:
             baseline_tools = {
                 "get_ligand_info", "get_pocket_residues", "detect_basic_interactions",
-                "get_edit_site_candidates", "list_fragment_replacement_sites",
+                "get_edit_site_candidates", "list_bond_sites",
                 "assess_edit_sites",
             }
             active = self.state.active_target or {}
@@ -541,10 +660,10 @@ class Workflow:
                         arguments.get("atom_index"), arguments.get("edit_atom_index"),
                         arguments.get("target_id"), result.get("atom_index"), result.get("target_id"),
                     }
-                if active_type == "replacement_site":
+                if active_type == "bond":
                     return active_id in {
-                        arguments.get("replacement_site_id"), arguments.get("target_id"),
-                        result.get("replacement_site_id"), result.get("target_id"),
+                        arguments.get("bond_site_id"), arguments.get("target_id"),
+                        result.get("bond_site_id"), result.get("target_id"),
                     }
                 return False
 
@@ -601,6 +720,7 @@ class Workflow:
                 "is_new_best": item.get("is_new_best"),
                 "best_quality_so_far": item.get("best_quality_so_far"),
                 "comparison": {"status": comparison.get("status"), "metrics": compact_metrics},
+                "plip_comparison": item.get("plip_comparison"),
                 "pose_consensus": {
                     "stable": pose.get("stable"),
                     "mean_pairwise_rmsd": pose.get("mean_pairwise_rmsd"),
@@ -611,6 +731,7 @@ class Workflow:
                     "gained_consensus_residues": interactions.get("gained_consensus_residues", []),
                     "lost_consensus_residues": interactions.get("lost_consensus_residues", []),
                 },
+                "pose_evidence": self._llm_safe_value(item.get("pose_evidence")),
             })
         return compact
 
@@ -631,7 +752,7 @@ class Workflow:
                     key: validation.get(key)
                     for key in (
                         "status", "failure_class", "canonical_smiles", "property_delta",
-                        "severe_clash_count", "formal_charge", "heavy_atoms", "molecular_weight",
+                        "severe_clash_count", "initial_receptor_clash_check", "formal_charge", "heavy_atoms", "molecular_weight",
                     )
                     if key in validation
                 },
@@ -650,6 +771,7 @@ class Workflow:
                         key: (docking.get("interaction_consensus") or {}).get(key, [])
                         for key in ("gained_consensus_residues", "lost_consensus_residues")
                     },
+                    "pose_evidence": self._llm_safe_value(docking.get("pose_evidence")),
                 },
             })
         return compact
@@ -663,6 +785,212 @@ class Workflow:
             )
             if key in self.state.convergence
         }
+
+    def _closed_pool_history_view(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Bounded, label-blind cumulative learning, rebuilt from Host observations.
+
+        Keep all (at most 20) distinct outcomes without repeating bulky PLIP reports
+        or dropping the incumbent when a recency window rolls over.
+        """
+        if getattr(self.closed_pool, "mode", "frozen_cut") == "multisite":
+            return self._closed_pool_multisite_history_view()
+        catalog = {row["fragment_id"]: row for row in self.closed_pool.catalog}
+        rows = []
+        for entry in self.state.docking_history:
+            transformation = entry.get("transformation") or {}
+            fragment_id = transformation.get("fragment_id")
+            fragment = catalog.get(fragment_id)
+            if fragment is None:
+                continue
+            rows.append({
+                "attempt": entry.get("attempt"),
+                "status": entry.get("status"),
+                "transformation": {"fragment_id": fragment_id, "fragment_smiles": fragment["smiles"]},
+                "raw_quality_from_mean": entry.get("raw_quality_from_mean"),
+                "delta_candidate_minus_reference": entry.get("delta_candidate_minus_reference"),
+                "seed_win_fraction": entry.get("seed_win_fraction"),
+                "seed_stddev": entry.get("seed_stddev"),
+                "pose_status": (entry.get("pose_retention") or {}).get("status"),
+                "quality": entry.get("quality"),
+                "is_new_best": entry.get("is_new_best"),
+            })
+        ranked = sorted((r for r in rows if r["quality"] is not None),
+                        key=lambda r: (-r["quality"], r["attempt"]))
+        best = ranked[0] if ranked else None
+        generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=1024)
+        fingerprints = {r["fragment_id"]: generator.GetFingerprint(Chem.MolFromSmiles(r["smiles"]))
+                        for r in self.closed_pool.catalog}
+        comparisons = []
+        # Contrast close chemical neighbors instead of asserting that a descriptor causes affinity.
+        for row in rows:
+            previous = [p for p in rows if p["attempt"] < row["attempt"]
+                        and p["quality"] is not None and row["quality"] is not None]
+            if not previous:
+                continue
+            closest = max(previous, key=lambda p: (
+                DataStructs.TanimotoSimilarity(fingerprints[row["transformation"]["fragment_id"]],
+                                                fingerprints[p["transformation"]["fragment_id"]]),
+                -p["attempt"]))
+            similarity = DataStructs.TanimotoSimilarity(
+                fingerprints[row["transformation"]["fragment_id"]],
+                fingerprints[closest["transformation"]["fragment_id"]])
+            if similarity >= 0.5:
+                comparisons.append({"earlier_attempt": closest["attempt"],
+                                    "later_attempt": row["attempt"],
+                                    "earlier_fragment_id": closest["transformation"]["fragment_id"],
+                                    "later_fragment_id": row["transformation"]["fragment_id"],
+                                    "fingerprint_similarity": round(similarity, 3),
+                                    "quality_change": round(row["quality"] - closest["quality"], 4)})
+        # Always retain the closest contrasts to the best and the most recent tests.
+        informative = sorted(comparisons, key=lambda c: (
+            c["earlier_attempt"] == (best or {}).get("attempt") or
+            c["later_attempt"] == (best or {}).get("attempt"),
+            c["later_attempt"] >= len(rows) - 2,
+            c["fingerprint_similarity"]), reverse=True)[:6]
+        summary = {"scope": "public_structures_and_observed_docking_only",
+                   "interpretation": "Correlations are descriptive, not causal or experimental activity evidence.",
+                   "tested_count": len(rows), "incumbent": best,
+                   "top_alternatives": ranked[1:4],
+                   "recent_outcomes": rows[-3:],
+                   "nearest_structural_contrasts": informative,
+                   "no_incumbent_improvement_count": sum(
+                       r["attempt"] > best["attempt"] for r in rows) if best else 0}
+        return rows, summary
+
+    def _closed_pool_multisite_history_view(self) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Product-keyed cumulative learning for the cut-point-free pool.
+
+        A deletion carries no fragment id and a fragment can be used at more than one
+        site, so neither the fragment id nor the site can be the candidate key.  The
+        key is the product molecule.
+        """
+        catalog = {row["fragment_id"]: row for row in self.closed_pool.catalog}
+        rows: list[dict[str, Any]] = []
+        for entry in self.state.docking_history:
+            transformation = entry.get("transformation") or {}
+            try:
+                product = self.closed_pool.product_smiles(transformation)
+            except Exception:
+                continue
+            fragment_id = transformation.get("fragment_id")
+            rows.append({
+                "attempt": entry.get("attempt"),
+                "status": entry.get("status"),
+                "product_smiles": product,
+                "site_type": transformation.get("site_type"),
+                "change_type": transformation.get("change_type"),
+                "site_id": transformation.get("bond_site_id", transformation.get("edit_atom_index")),
+                "fragment_id": fragment_id,
+                "fragment_smiles": (catalog.get(fragment_id) or {}).get("smiles"),
+                "raw_quality_from_mean": entry.get("raw_quality_from_mean"),
+                "delta_candidate_minus_reference": entry.get("delta_candidate_minus_reference"),
+                "seed_win_fraction": entry.get("seed_win_fraction"),
+                "seed_stddev": entry.get("seed_stddev"),
+                "pose_status": (entry.get("pose_retention") or {}).get("status"),
+                "quality": entry.get("quality"),
+                "is_new_best": entry.get("is_new_best"),
+            })
+        ranked = sorted(
+            (row for row in rows if row["quality"] is not None),
+            key=lambda row: (-float(row["quality"]), row["attempt"]),
+        )
+        incumbent = ranked[0] if ranked else None
+
+        # Structural contrast is computed on the product molecule, which is the
+        # candidate identity here; the fragment is only one part of the edit.
+        generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=1024)
+        fingerprints: dict[str, Any] = {}
+        for row in rows:
+            molecule = Chem.MolFromSmiles(row["product_smiles"])
+            if molecule is not None:
+                fingerprints[row["product_smiles"]] = generator.GetFingerprint(molecule)
+        comparisons = []
+        for row in rows:
+            if row["quality"] is None or row["product_smiles"] not in fingerprints:
+                continue
+            previous = [
+                item for item in rows
+                if item["attempt"] < row["attempt"]
+                and item["quality"] is not None
+                and item["product_smiles"] in fingerprints
+            ]
+            if not previous:
+                continue
+            closest = max(previous, key=lambda item: (
+                DataStructs.TanimotoSimilarity(fingerprints[row["product_smiles"]],
+                                               fingerprints[item["product_smiles"]]),
+                -item["attempt"]))
+            similarity = DataStructs.TanimotoSimilarity(
+                fingerprints[row["product_smiles"]], fingerprints[closest["product_smiles"]])
+            if similarity >= 0.5:
+                comparisons.append({
+                    "earlier_attempt": closest["attempt"],
+                    "later_attempt": row["attempt"],
+                    "earlier_change": f"{closest['change_type']}@{closest['site_id']}",
+                    "later_change": f"{row['change_type']}@{row['site_id']}",
+                    "product_similarity": round(similarity, 3),
+                    "quality_change": round(float(row["quality"]) - float(closest["quality"]), 4),
+                })
+        informative = sorted(comparisons, key=lambda item: (
+            item["later_attempt"] >= len(rows) - 2, item["product_similarity"]), reverse=True)[:6]
+        attempted = [
+            {"attempt": row["attempt"], "change_type": row["change_type"],
+             "site_id": row["site_id"], "fragment_id": row["fragment_id"],
+             "product_smiles": row["product_smiles"]}
+            for row in rows
+        ]
+        summary = {
+            "scope": "public_structures_and_observed_docking_only",
+            "interpretation": (
+                "Candidates are keyed by product molecule, so one compound reached through "
+                "different sites or fragments is one candidate. Correlations are descriptive, "
+                "not causal or experimental activity evidence."),
+            "tested_count": len(rows),
+            "attempted_candidates": attempted,
+            "incumbent": incumbent,
+            "top_alternatives": ranked[1:4],
+            "recent_outcomes": rows[-8:],
+            "nearest_structural_contrasts": informative,
+            "no_incumbent_improvement_count": (
+                sum(row["attempt"] > incumbent["attempt"] for row in rows) if incumbent else 0),
+        }
+        return rows, summary
+
+    @staticmethod
+    def _direct_feedback_without_tool_suggestions(value: Any) -> Any:
+        if isinstance(value, list):
+            return [Workflow._direct_feedback_without_tool_suggestions(item) for item in value]
+        if isinstance(value, dict):
+            return {key: Workflow._direct_feedback_without_tool_suggestions(item)
+                    for key, item in value.items() if key != "recommended_next_queries"}
+        return value
+
+    @staticmethod
+    def _closed_pool_feedback(rejection: dict[str, Any]) -> dict[str, Any]:
+        """Show actionable latest outcome once; avoid duplicating full Host state/PLIP paths."""
+        if rejection.get("failure_class") not in {"docking_evaluation", "pose_retention"}:
+            return Workflow._direct_feedback_without_tool_suggestions(rejection)
+        docking = rejection.get("latest_docking") or rejection.get("docking", {}).get("result") or {}
+        trend = rejection.get("latest_trend_entry") or {}
+        per_seed = {}
+        for seed, item in (docking.get("candidate_per_seed") or {}).items():
+            selection = item.get("pose_selection") or {}
+            per_seed[seed] = {"status": item.get("status"),
+                              "rank": selection.get("rank"),
+                              "reference_core_rmsd": selection.get("reference_core_rmsd"),
+                              "crystal_core_rmsd": selection.get("crystal_core_rmsd")}
+        interactions = {seed: {key: report.get(key, []) for key in ("gained", "lost", "retained")}
+                        for seed, report in (docking.get("plip_comparison") or {}).items()
+                        if report.get("status") == "complete"}
+        return {"failure_class": rejection["failure_class"],
+                "latest_outcome": {key: trend.get(key) for key in (
+                    "attempt", "delta_candidate_minus_reference", "seed_stddev",
+                    "seed_win_fraction", "stability_eligible", "quality", "is_new_best")},
+                "docking_status": docking.get("status"),
+                "pose_status": (docking.get("pose_retention") or {}).get("status"),
+                "per_seed_pose": per_seed,
+                "per_seed_interaction_changes": interactions,
+                "error": docking.get("error")}
 
     def _llm_state_view(self) -> dict[str, Any]:
         return {
@@ -687,7 +1015,7 @@ class Workflow:
                 "status", "count", "radius", "cutoff", "atom_index", "element",
                 "replaceable_hydrogens", "minimum_clearance", "severe_clash_count",
                 "failure_class", "error", "canonical_smiles", "heavy_atoms",
-                "molecular_weight", "formal_charge", "replacement_site_id",
+                "molecular_weight", "formal_charge", "bond_site_id",
                 "max_probe_distance", "probe_count", "fragment_id", "fragment_smiles",
                 "size_class", "chemical_tag", "chemical_tags", "allowed_operations",
                 "conformer_count", "max_attachment_distance", "maximum_forward_extent",
@@ -710,9 +1038,15 @@ class Workflow:
     def _signature(self, tool: str, arguments: dict[str, Any]) -> str:
         normalized_arguments = dict(arguments)
         if tool == "validate_candidate_geometry":
-            normalized_arguments.setdefault("operation", "replace_hydrogen")
             if "atom_index" in normalized_arguments and "edit_atom_index" not in normalized_arguments:
                 normalized_arguments["edit_atom_index"] = normalized_arguments.pop("atom_index")
+            try:
+                axes = normalize_transformation(dict(normalized_arguments))
+                normalized_arguments["site_type"] = axes["site_type"]
+                normalized_arguments["change_type"] = axes["change_type"]
+            except EditTaxonomyError:
+                pass
+            normalized_arguments.pop("operation", None)
         data = json.dumps(
             {"tool": tool, "arguments": normalized_arguments},
             sort_keys=True,
@@ -722,31 +1056,41 @@ class Workflow:
 
     @staticmethod
     def _exploration_transformation(transformation: dict[str, Any]) -> dict[str, Any]:
-        operation = transformation.get("operation", "replace_hydrogen")
-        normalized = {
-            "operation": operation,
-            "fragment_smiles": transformation.get("fragment_smiles"),
+        source = dict(transformation or {})
+        try:
+            axes = normalize_transformation(source)
+            site_type, change_type = axes["site_type"], axes["change_type"]
+        except (EditTaxonomyError, TypeError):
+            site_type, change_type = "atom", "addition"
+        normalized: dict[str, Any] = {
+            "site_type": site_type,
+            "change_type": change_type,
+            "operation": operation_label(site_type, change_type),
+            "fragment_smiles": source.get("fragment_smiles"),
         }
-        parent_attempt = transformation.get("parent_attempt")
+        parent_attempt = source.get("parent_attempt")
         if isinstance(parent_attempt, int) and parent_attempt > 0:
             normalized["parent_attempt"] = parent_attempt
-        generation = transformation.get("generation")
+        generation = source.get("generation")
         if isinstance(generation, int) and generation >= 0:
             normalized["generation"] = generation
-        fragment_id = transformation.get("fragment_id")
+        fragment_id = source.get("fragment_id")
         if isinstance(fragment_id, str) and fragment_id:
             normalized["fragment_id"] = fragment_id
-        if operation == "replace_fragment":
-            normalized["replacement_site_id"] = transformation.get("replacement_site_id")
-            cut_bond = transformation.get("cut_bond")
+        element = source.get("element")
+        if isinstance(element, str) and element:
+            normalized["element"] = element
+        if site_type in {"bond", "linker"}:
+            normalized["bond_site_id"] = source.get("bond_site_id") or source.get("linker_site_id")
+            cut_bond = source.get("cut_bond")
             if isinstance(cut_bond, (list, tuple)) and len(cut_bond) == 2:
                 normalized["cut_bond"] = list(cut_bond)
-            edit_index = transformation.get("edit_atom_index")
+            edit_index = source.get("edit_atom_index")
             if isinstance(edit_index, int):
                 normalized["edit_atom_index"] = edit_index
         else:
-            normalized["edit_atom_index"] = transformation.get(
-                "edit_atom_index", transformation.get("atom_index")
+            normalized["edit_atom_index"] = source.get(
+                "edit_atom_index", source.get("atom_index")
             )
         return normalized
 
@@ -758,13 +1102,14 @@ class Workflow:
         *,
         attempt: int | None = None,
         reason: str | None = None,
+        details: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         normalized = self._exploration_transformation(transformation)
-        operation = normalized.get("operation", "replace_hydrogen")
-        target_type = "replacement_site" if operation == "replace_fragment" else "atom"
+        site_type = normalized.get("site_type", "atom")
+        target_type = "bond" if site_type in {"bond", "linker"} else "atom"
         target_id = (
-            normalized.get("replacement_site_id")
-            if target_type == "replacement_site"
+            normalized.get("bond_site_id")
+            if target_type == "bond"
             else normalized.get("edit_atom_index")
         )
         record = {
@@ -784,6 +1129,8 @@ class Workflow:
             record["generation"] = normalized.get("generation", 1)
         if reason:
             record["reason"] = reason
+        if details:
+            record["details"] = details
         self.state.exploration_attempts.append(record)
         return record
 
@@ -801,238 +1148,102 @@ class Workflow:
         if details:
             record["details"] = details
 
-    def _batch_settings(self) -> dict[str, Any]:
-        configured = self.context.task.get("batch_optimization") or {}
-        return {
-            "enabled": bool(configured.get("enabled", False)),
-            "panel_size": int(configured.get("panel_size", 6)),
-            "batch_size": int(configured.get("batch_size", 8)),
-            "max_batches": int(configured.get("max_batches", 3)),
-            "max_screening_candidates": int(configured.get("max_screening_candidates", 12)),
-            "max_confirmation_candidates": int(configured.get("max_confirmation_candidates", 2)),
-            "screening_seeds": [int(seed) for seed in configured.get("screening_seeds", [17])],
-            "confirmation_seeds": [int(seed) for seed in configured.get("confirmation_seeds", [17, 29, 43])],
-            "max_llm_decisions": int(configured.get("max_llm_decisions", 8)),
-            "max_query_only_rounds": int(configured.get("max_query_only_rounds", 2)),
-            "stagnation_batches": int(configured.get("stagnation_batches", 2)),
-        }
 
-    def _batch_enabled(self) -> bool:
-        # Scripted clients intentionally keep the legacy deterministic smoke path;
-        # real clients use the bounded portfolio path configured for the task.
-        return bool(
-            (self.context.task.get("batch_optimization") or {}).get("enabled", False)
-            and not isinstance(self.client, ScriptedDemoClient)
+
+    def _single_edit_enabled(self) -> bool:
+        """Return whether the new one-decision, context-only loop is enabled."""
+        configured = self.context.task.get("single_edit_mode") or {}
+        return bool(configured.get("enabled", False)) and not isinstance(
+            self.client, ScriptedDemoClient
         )
 
-    def _batch_state_view(self) -> dict[str, Any]:
-        settings = self._batch_settings()
-        return {
-            "task": self.state.task,
-            "mode": "portfolio_batch_optimization",
-            "round": self.state.batch_round,
-            "budget": {
-                "max_batches": settings["max_batches"],
-                "max_screening_candidates": settings["max_screening_candidates"],
-                "max_confirmation_candidates": settings["max_confirmation_candidates"],
-                "max_llm_decisions": settings["max_llm_decisions"],
-            },
-            "site_board": self._llm_safe_value(self.state.site_board),
-            "latest_batch": self._llm_safe_value(self.state.batch_history[-1:]),
-            "best_candidates": self._llm_safe_value(self.state.elite_archive[:6]),
-            "available_parents": [
-                self._llm_safe_value(metadata)
-                for attempt, metadata in sorted(self.parent_metadata.items())
-                if attempt > 0
-            ],
-            "docking_history": self._compact_docking_history()[-10:],
-            "attempted_transformations": [
-                self._compact_transformation(item.get("transformation"))
-                for item in self.state.exploration_attempts
-                if item.get("source") in {"batch_plan", "design"}
-            ][-30:],
-            "recent_tool_results": [
-                {
-                    "tool": item.tool,
-                    "arguments": item.arguments,
-                    "result": self._compact_observation_result(item.result),
-                }
-                for item in self.state.observations[-6:]
-                if item.tool != "get_design_dossier"
-            ],
-        }
+    def _multisite_enabled(self) -> bool:
+        """True when the host supplies an edit-site table instead of a closed pool."""
+        return bool(self.context.task.get("edit_site_table_path")) and self.closed_pool is None
 
-    def _batch_payload(self, instruction: str, feedback: dict[str, Any] | None = None) -> dict[str, Any]:
-        settings = self._batch_settings()
-        payload = {
-            "mode": "portfolio_planning",
-            "state": self._batch_state_view(),
-            "objective": {
-                "task": self.state.task,
-                "reference": "original co-crystal ligand",
-                "primary_metric": self._optimization_settings()["primary_metric"],
-                "constraint": "single-site, host-validated transformation; docking ranks candidates but does not prove activity",
-            },
-            "design_dossier": self._llm_safe_value(self.state.design_dossier),
-            "instruction": instruction,
-            "tool_catalog": {
-                name: details
-                for name, details in self.tools.catalog().items()
-                if name in {
-                    "get_fragment_panel", "get_atom_environment", "check_growth_space",
-                    "get_replacement_site_spatial_profile", "get_fragment_spatial_profile",
-                    "detect_basic_interactions", "get_ligand_fragment",
-                }
-            },
-            "limits": {
-                "batch_size": settings["batch_size"],
-                "max_llm_decisions": settings["max_llm_decisions"],
-            },
-        }
-        if feedback is not None:
-            payload["latest_feedback"] = self._llm_safe_value(feedback)
-        return payload
-
-    def _validate_portfolio_query(self, decision: dict[str, Any]) -> None:
-        allowed = {
-            "get_fragment_panel", "get_atom_environment", "check_growth_space",
-            "get_replacement_site_spatial_profile", "get_fragment_spatial_profile",
-            "detect_basic_interactions", "get_ligand_fragment",
-        }
-        queries = [decision] if decision.get("action") == "QUERY" else decision.get("queries")
-        if not isinstance(queries, list) or not queries:
-            raise RuntimeError("Portfolio QUERY_BATCH requires queries")
-        for query in queries:
-            if not isinstance(query, dict) or query.get("tool") not in allowed:
-                raise RuntimeError(
-                    "Portfolio tools are limited to uncertainty resolution and refreshed fragment panels; "
-                    "basic supplied facts and per-fragment property queries are not allowed"
-                )
-            if not isinstance(query.get("why_needed"), str) or not query["why_needed"].strip():
-                raise RuntimeError("Each portfolio tool query requires why_needed")
-            if not isinstance(query.get("decision_impact"), str) or not query["decision_impact"].strip():
-                raise RuntimeError("Each portfolio tool query requires decision_impact")
-
-    def _batch_target_exists(self, target_type: str, target_id: Any) -> bool:
-        return any(
-            item.get("target_type") == target_type and item.get("target_id") == target_id
-            for item in (self.state.design_dossier or {}).get("sites", [])
+    def _multisite_site_projection(self) -> dict[str, Any]:
+        """Compact site list for the designer: identity, chemistry, and permission."""
+        sites = self.tools.list_edit_sites()
+        atom_fields = (
+            "site_id", "region", "atom_index", "element", "pdb_atom_name", "hydrogen_count",
+            "is_ring_atom", "is_aromatic", "probe_clearance", "probe_verdict",
+            "outward_probe_nearest_atom", "allowed_operations", "protection",
         )
-
-    def _batch_record_site_updates(self, updates: Any) -> None:
-        if not isinstance(updates, list):
-            return
-        allowed = {"screening", "promoted", "active", "deprioritized", "discarded"}
-        for item in updates:
-            if not isinstance(item, dict):
-                raise RuntimeError("PLAN_BATCH site_updates must contain objects")
-            target_type, target_id = item.get("target_type"), item.get("target_id")
-            if target_type not in {"atom", "replacement_site"} or not self._batch_target_exists(target_type, target_id):
-                raise RuntimeError(f"PLAN_BATCH references unknown target: {target_type}:{target_id}")
-            status = item.get("status", "active")
-            reason = item.get("reason")
-            if status not in allowed or not isinstance(reason, str) or not reason.strip():
-                raise RuntimeError("PLAN_BATCH site update requires a valid status and reason")
-            key = self._target_key(target_type, target_id)
-            current = dict(self.state.site_board.get(key) or {})
-            current.update({"target_type": target_type, "target_id": target_id, "status": status, "reason": reason.strip()})
-            self.state.site_board[key] = current
-
-    def _batch_available_fragment_ids(self, target_type: str, target_id: Any) -> set[str]:
-        available: set[str] = set()
-        site = next(
-            (
-                item for item in (self.state.design_dossier or {}).get("sites", [])
-                if item.get("target_type") == target_type and item.get("target_id") == target_id
+        cut_fields = (
+            "site_id", "region", "label", "cut_bond", "retained_atom_index",
+            "removed_side_atom_index", "removed_heavy_atoms", "removed_fraction",
+            "removed_fragment_smiles", "attachment_vector", "allowed_operations", "protection",
+        )
+        return {
+            "status": "complete",
+            "source": sites.get("source"),
+            "site_table_sha256": sites.get("site_table_sha256"),
+            "protected_atom_indices": sites.get("protected_atom_indices", []),
+            "atom_sites": [
+                {key: item.get(key) for key in atom_fields}
+                for item in sites.get("atom_sites", [])
+                if item.get("allowed_operations")
+            ],
+            "cut_sites": [
+                {key: item.get(key) for key in cut_fields}
+                for item in sites.get("cut_sites", [])
+                if item.get("allowed_operations")
+            ],
+            "contract": (
+                "The host fixed these sites. Choose one site, one operation that the site allows, and "
+                "one fragment from the catalog. The host builds the product and reports whether the "
+                "change is a minimal edit (T1) or a whole-fragment replacement (T2). Protected sites "
+                "are listed for audit and reject every operation."
             ),
-            None,
-        )
-        for record in (site or {}).get("fragment_panel", []):
-            if isinstance(record.get("fragment_id"), str):
-                available.add(record["fragment_id"])
-        for observation in self.state.observations:
-            if observation.tool != "get_fragment_panel":
-                continue
-            result = observation.result or {}
-            if result.get("target_type") != target_type or result.get("target_id") != target_id:
-                continue
-            for record in result.get("fragments", []):
-                if isinstance(record.get("fragment_id"), str):
-                    available.add(record["fragment_id"])
-        return available
-
-    def _batch_transformation(self, candidate: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(candidate, dict):
-            raise RuntimeError("Each PLAN_BATCH candidate must be an object")
-        target_type, target_id = candidate.get("target_type"), candidate.get("target_id")
-        if not self._batch_target_exists(target_type, target_id):
-            raise RuntimeError(f"PLAN_BATCH references unknown target: {target_type}:{target_id}")
-        if candidate.get("operation") not in {"replace_hydrogen", "replace_fragment"}:
-            raise RuntimeError("PLAN_BATCH candidate has unsupported operation")
-        fragment_id = candidate.get("fragment_id")
-        if not isinstance(fragment_id, str):
-            raise RuntimeError("PLAN_BATCH requires a library fragment_id")
-        if fragment_id not in self._batch_available_fragment_ids(target_type, target_id):
-            raise RuntimeError(
-                f"Fragment {fragment_id} was not supplied for target {target_type}:{target_id}; "
-                "request a refreshed target-specific panel before using it"
-            )
-        parent_attempt = candidate.get("parent_attempt")
-        # Some models use 1 as an informal first-parent marker. During the
-        # initial batch only parent 0 exists, so normalize that marker safely.
-        if parent_attempt == 1 and len(self.parent_candidates) == 1 and 0 in self.parent_candidates:
-            parent_attempt = None
-        if parent_attempt is not None and parent_attempt not in self.parent_candidates:
-            raise RuntimeError(
-                f"Unknown parent_attempt {parent_attempt}; omit it for the original ligand or choose an available parent"
-            )
-        decision = {
-            "action": "READY",
-            "understanding": str((candidate.get("hypothesis") or {}).get("site_evidence", "batch site evidence")),
-            "edit_hypothesis": str((candidate.get("hypothesis") or {}).get("intended_change", "batch transformation")),
-            "operation": candidate.get("operation"),
-            "fragment_id": candidate.get("fragment_id"),
-            "parent_attempt": parent_attempt,
         }
-        if target_type == "atom":
-            decision["edit_atom_index"] = target_id
-        else:
-            decision["replacement_site_id"] = target_id
-        return self._transformation(decision)
 
-    def _validate_batch_plan(self, decision: dict[str, Any]) -> list[dict[str, Any]]:
-        candidates = decision.get("candidates")
-        if not isinstance(candidates, list) or not candidates:
-            raise RuntimeError("PLAN_BATCH requires a non-empty candidates array")
-        settings = self._batch_settings()
-        if len(candidates) > settings["batch_size"]:
-            raise RuntimeError(f"PLAN_BATCH exceeds batch_size={settings['batch_size']}")
-        self._batch_record_site_updates(decision.get("site_updates", []))
-        normalized = []
-        seen = set()
-        for candidate in candidates:
-            transformation = self._batch_transformation(candidate)
-            key = self._transformation_key(transformation)
-            if key in seen or self._transformation_was_attempted(transformation):
-                raise RuntimeError("PLAN_BATCH contains a duplicate or already attempted transformation")
-            seen.add(key)
-            hypothesis = candidate.get("hypothesis")
-            if not isinstance(hypothesis, dict) or any(
-                not isinstance(hypothesis.get(key), str) or not hypothesis.get(key).strip()
-                for key in ("site_evidence", "intended_change", "expected_effect", "risk", "success_criterion")
-            ):
-                raise RuntimeError("Each PLAN_BATCH candidate requires a complete evidence-backed hypothesis")
-            normalized.append({"candidate": candidate, "transformation": transformation})
-        return normalized
+    def _multisite_catalog_projection(self) -> dict[str, Any]:
+        """Compact whole-library view: every id visible, no site or provenance.
 
-    def _record_batch_observation(self, batch: dict[str, Any]) -> None:
-        self.state.batch_history.append(batch)
-        self.state.batch_history = self.state.batch_history[-8:]
-        self._write_json(f"batch-{self.state.batch_round:02d}.json", batch)
-        self._write_json("state-checkpoint.json", self.state.compact_view())
+        The catalog is small enough to show in full, so nothing is silently hidden
+        from the designer. Uniform fields are lifted to the header to keep the
+        payload inside a sane token budget.
+        """
+        records = [
+            record for record in self.tools.fragment_library.records
+            if isinstance(record, dict) and isinstance(record.get("smiles"), str)
+        ]
+        default_change_types = ["addition", "replacement"]
+        entries = []
+        exceptions = {}
+        for record in records:
+            fragment_id = record.get("fragment_id")
+            entries.append({
+                "fragment_id": fragment_id,
+                "smiles": record.get("smiles"),
+                "size_class": record.get("size_class"),
+            })
+            change_types = self.tools._site_change_types(record)
+            if change_types != default_change_types:
+                exceptions[fragment_id] = change_types
+        return {
+            "status": "complete",
+            "count": len(entries),
+            "default_change_types": default_change_types,
+            "change_type_exceptions": exceptions,
+            "size_class_ranges": {
+                "minimal": "1 heavy atom",
+                "small": "2-4 heavy atoms",
+                "medium": "5-8 heavy atoms",
+                "large": "9-12 heavy atoms",
+            },
+            "attachment_convention": (
+                "[*:1] marks the attachment atom. A record means: bond the chosen site atom to this "
+                "fragment's attachment atom. Records carry no site and no reference-ligand position."
+            ),
+            "fragments": entries,
+        }
 
-    def _batch_dossier(self) -> None:
-        arguments = {"panel_size": self._batch_settings()["panel_size"]}
+    def _prepare_design_dossier(self, panel_size: int = 6) -> None:
+        """Build the deterministic host dossier once for a direct design loop."""
+        if self.state.design_dossier is not None:
+            return
+        arguments = {"panel_size": int(panel_size)}
         self._emit("tool_started", {"tool": "get_design_dossier", "arguments": arguments})
         result, evidence = self.tools.execute("get_design_dossier", arguments)
         observation = ToolObservation("get_design_dossier", arguments, result, evidence)
@@ -1040,19 +1251,576 @@ class Workflow:
         self.state.evidence.update(evidence | {"edit_site_environment", "edit_site_geometry"})
         self.state.call_signatures.add(self._signature(observation.tool, observation.arguments))
         self.state.design_dossier = result
-        for site in result.get("sites", []):
-            key = self._target_key(site["target_type"], site["target_id"])
-            self.state.site_board.setdefault(key, {
-                "target_type": site["target_type"], "target_id": site["target_id"],
-                "status": "unexplored", "attempts": 0, "best_quality": None,
-            })
         self._write_json("design-dossier.json", result)
-        self._write_json("observation-01.json", self.state.compact_view())
         self._emit("tool_completed", {
             "tool": "get_design_dossier",
             "evidence": sorted(evidence),
             "result": {"status": result.get("status"), "site_count": result.get("site_count")},
         })
+
+    def _prepare_initial_context(self) -> None:
+        """Prepare the one-shot host context and external research bundle.
+
+        This is intentionally host-side. The LLM receives the resulting dossier
+        and evidence bundle but does not get the local ToolRegistry catalog and
+        cannot issue local chemistry queries during later iterations.
+        """
+        if self._initial_context_prepared:
+            return
+        self._direct_edit_mode = self._single_edit_enabled()
+        if self.closed_pool:
+            # Do not load a persisted web/SAR memory, and never construct the six-item
+            # heuristic panels for a full-visibility, single-site benchmark.
+            self.state.design_dossier = self.closed_pool.dossier(self.tools)
+            self.state.external_research = {"status": "disabled", "reason": "Closed-pool structure-only input"}
+            self._write_json("design-dossier.json", self.state.design_dossier)
+            self._write_json("initial-context.json", {"design_dossier": self.state.design_dossier,
+                                                      "external_research": self.state.external_research})
+            self._initial_context_prepared = True
+            return
+        self._prepare_design_dossier()
+        saved_research = self.run_dir / "external-research.json"
+        if self.state.external_research is None and saved_research.is_file():
+            self.state.external_research = json.loads(saved_research.read_text())
+        research_config = self.context.task.get("external_research") or {}
+        research_scope = research_config.get("scope") or STAGE1_RESEARCH_SCOPE
+        if self.state.external_research is None:
+            adapter = PlaywrightResearchAdapter(research_config)
+            if not adapter.enabled:
+                # Short-circuit before building the request: a disabled research pass
+                # must not write the whole structure dossier to disk, and must not
+                # start the MCP/browser subprocess.
+                result = {
+                    "status": "disabled",
+                    "source": "playwright_mcp",
+                    "enabled": False,
+                    "reason": "external_research.enabled is false; no request was built and no browser was started",
+                    "query_executed": False,
+                }
+                self.state.external_research = result
+                self._write_json("external-research.json", result)
+                self._emit("external_research_completed", {
+                    "status": result["status"], "source": result["source"],
+                })
+            else:
+                request = {
+                    "schema_version": "simple-molecular-agent.external-research-request.v1",
+                    "task": self.state.task,
+                    "smiles": self.tools.get_ligand_info().get("canonical_smiles"),
+                    "pdb_path": str(self.context.complex_path),
+                    "ligand_selector": self.context.ligand_selector,
+                    "ligand_source": self.context.ligand_source,
+                    "structure_dossier": self._research_structure_summary(),
+                    "research_scope": research_scope,
+                    "query_policy": research_config.get("query_policy", "configured_one_shot"),
+                }
+                self._emit("external_research_started", {
+                    "enabled": adapter.enabled,
+                    "required": adapter.required,
+                    "request_bytes": len(json.dumps(request, ensure_ascii=False)),
+                })
+                try:
+                    result = adapter.collect(request, self.run_dir / "external-research")
+                except ExternalResearchError as error:
+                    failure = {
+                        "status": "failed",
+                        "source": "playwright_mcp",
+                        "error": str(error),
+                        "query_executed": False,
+                        "research_stage": research_scope.get("stage"),
+                        "scope": research_scope,
+                    }
+                    self.state.external_research = failure
+                    self._write_json("external-research.json", failure)
+                    self._emit("external_research_failed", failure)
+                    if adapter.required:
+                        raise
+                    result = failure
+                if isinstance(result, dict):
+                    result.setdefault("research_stage", research_scope.get("stage"))
+                    result.setdefault("scope", research_scope)
+                self.state.external_research = result
+                self._write_json("external-research.json", result)
+                self._emit("external_research_completed", {
+                    "status": result.get("status"),
+                    "source": result.get("source"),
+                })
+        # The first LLM call reads browser evidence; later calls only see this
+        # persisted interpretation. Raw artifacts remain available for audit.
+        bundle = self.state.external_research or {}
+        if (self.context.task.get("external_research") or {}).get("required") and bundle.get("status") != "complete":
+            raise ExternalResearchError("Required initial research is not complete; inspect saved evidence")
+        if bundle.get("status") == "complete" and "structure_memory" not in bundle:
+            memory_path = self.run_dir / "research-memory.json"
+            evidence = evidence_projection(bundle)
+            if memory_path.is_file():
+                memory = validate_memory(
+                    json.loads(memory_path.read_text()), evidence, research_scope
+                )
+            else:
+                response = self.client.complete_json({
+                    "mode": "initial_research_analysis", "evidence": evidence,
+                    "research_scope": research_scope,
+                    "visual_input_enabled": bool(getattr(self.client, "send_images", False)),
+                    "host_ligand": self.tools.get_ligand_info(),
+                    "instruction": RESEARCH_MEMORY_PROMPT,
+                })
+                memory = validate_memory(response, evidence, research_scope)
+                self._write_json("research-memory.json", memory)
+            bundle["structure_memory"] = memory
+            self._write_json("external-research.json", bundle)
+            self._write_json("state-checkpoint.json", self.state.compact_view())
+        self._write_json("initial-context.json", {
+            "design_dossier": self.state.design_dossier,
+            "external_research": self.state.external_research,
+        })
+        self._initial_context_prepared = True
+
+    def _research_structure_summary(self) -> dict[str, Any]:
+        """Compact structure summary for an external-research request.
+
+        The full design dossier is for the designer, not for a browsing step.  Sending
+        it wrote a multi-hundred-kilobyte request that mostly duplicated what the agent
+        already had, so only the identify/research-relevant projection is sent.
+        """
+        dossier = self.state.design_dossier or {}
+        ligand = dossier.get("ligand") or {}
+        graph = ligand.get("molecule_graph") or {}
+        summary: dict[str, Any] = {
+            "research_boundary": (
+                "External research supplies structure identity, quality, ligand identity, binding-site, "
+                "construct, and literature context only. Host geometry, RMSD, pose retention, docking, "
+                "and current-pose interactions are authoritative and must not be inferred from webpages."
+            ),
+            "ligand": {
+                "name": ligand.get("name"),
+                "canonical_smiles": graph.get("canonical_smiles"),
+                "heavy_atoms": len(graph.get("atoms") or []),
+                "molecular_properties": ligand.get("molecular_properties"),
+            },
+            "pocket": dossier.get("pocket"),
+            "reference_interactions": dossier.get("reference_interactions"),
+        }
+        if dossier.get("edit_sites"):
+            sites = dossier["edit_sites"]
+            summary["edit_sites"] = {
+                "atom_sites": [
+                    {
+                        "site_id": item.get("site_id"),
+                        "region": item.get("region"),
+                        "atom_index": item.get("atom_index"),
+                        "element": item.get("element"),
+                        "hydrogen_count": item.get("hydrogen_count"),
+                        "probe_verdict": item.get("probe_verdict"),
+                        "allowed_operations": item.get("allowed_operations"),
+                        "protection": item.get("protection"),
+                    }
+                    for item in sites.get("atom_sites", [])
+                ],
+                "cut_sites": [
+                    {
+                        "site_id": item.get("site_id"),
+                        "region": item.get("region"),
+                        "label": item.get("label"),
+                        "cut_bond": item.get("cut_bond"),
+                        "removed_heavy_atoms": item.get("removed_heavy_atoms"),
+                        "removed_fragment_smiles": item.get("removed_fragment_smiles"),
+                        "allowed_operations": item.get("allowed_operations"),
+                        "protection": item.get("protection"),
+                    }
+                    for item in sites.get("cut_sites", [])
+                ],
+            }
+        elif dossier.get("sites"):
+            summary["sites"] = [
+                {
+                    "target_type": item.get("target_type"),
+                    "target_id": item.get("target_id"),
+                    "element": item.get("element"),
+                    "aromatic": item.get("aromatic"),
+                    "supported_operation": item.get("supported_operation"),
+                    "replaceable_hydrogens": item.get("replaceable_hydrogens"),
+                    "growth_clearance": (item.get("growth_probe") or {}).get("minimum_clearance"),
+                    "removed_fragment_smiles": item.get("removed_fragment_smiles"),
+                    "removed_heavy_atoms": item.get("removed_heavy_atoms"),
+                }
+                for item in dossier["sites"]
+            ]
+        summary["omitted"] = (
+            "per-atom ligand graph, fragment catalog, per-site panels, and full interaction "
+            "lists are intentionally not sent; query the workflow outputs directly if needed"
+        )
+        return summary
+
+    def _direct_dossier(self) -> dict[str, Any]:
+        dossier = self._llm_safe_value(self.state.design_dossier) or {}
+        ligand = self.tools.get_ligand_info()
+        dossier["ligand"] = {key: ligand[key] for key in
+                             ("name", "molecule_graph", "molecular_properties")}
+        dossier["tool_policy"] = "No LLM tools. Host validates one edit of the original ligand."
+        if self.closed_pool:
+            # Restore AFTER generic bounded projection: the entire frozen catalog must
+            # be visible on every request, not silently truncated to a short list.
+            dossier["fragment_catalog"] = self.closed_pool.catalog
+        elif self._multisite_enabled():
+            # The site table supersedes the generic enumerated panels: sending both
+            # describes the same sites twice under different IDs and inflates the
+            # request without adding evidence.
+            for superseded in ("sites", "site_count", "panel_size_per_site", "fragment_library", "tool_policy"):
+                dossier.pop(superseded, None)
+            dossier["edit_sites"] = self._multisite_site_projection()
+            dossier["fragment_catalog"] = self._multisite_catalog_projection()
+            dossier["selection_contract"] = {
+                "mode": "multisite_edit",
+                "designer_decides": ["which site", "which operation", "which fragment"],
+                "catalog_carries_no_site": True,
+                "edit_layer_decided_by": "host, from the built product",
+            }
+        if (self.context.task.get("pose_retention") or {}).get("enabled"):
+            baseline = self.reference_docking_result or {}
+            dossier["pose_retention_protocol"] = {
+                **self.context.task["pose_retention"],
+                "calibration_status": baseline.get("status"),
+                "reference_valid_seeds": baseline.get("valid_seeds"),
+                "geometry_reference_path": baseline.get("geometry_reference_path"),
+                "coordinate_policy": "Free docking; fixed atom comparison set, NOT fixed atom positions. No ligand alignment.",
+                "score_policy": "Gate all top-N poses, select primary score among eligible poses, compare paired same-mode reference Evaluation Poses.",
+            }
+        return dossier
+
+    def _direct_payload(
+        self,
+        instruction: str,
+        *,
+        feedback: dict[str, Any] | None = None,
+        previous_design: dict[str, Any] | None = None,
+        rejection: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        multisite = self._multisite_enabled()
+        payload = {
+            "mode": "multisite_edit_design" if multisite else "single_edit_design",
+            "objective": {
+                "task": self.state.task,
+                "reference": "original co-crystal ligand",
+                "primary_metric": self._optimization_settings()["primary_metric"],
+                "constraint": (
+                    "Submit exactly one host-validated transformation per decision. "
+                    "The host performs chemistry, geometry, docking, and duplicate checks."
+                ),
+            },
+            "design_dossier": self._direct_dossier(),
+            "external_research": (self.state.external_research or {}).get(
+                "structure_memory", {"status": "unavailable", "observations": []}
+            ),
+            "edit_base": "original_co_crystal_ligand_only",
+            "comparison_policy": "reference docking is authoritative; best-so-far is comparison only",
+            "state": {
+                "attempted_transformations": [
+                    self._compact_transformation(item.get("transformation"))
+                    for item in self.state.exploration_attempts
+                    if item.get("source") == "design"
+                ][-64:],
+                "candidate_history": self._compact_candidate_history()[-8:],
+                "docking_history": self._compact_docking_history()[-8:],
+                "sar_memory": self._llm_safe_value(self.state.sar_memory[-64:]),
+                "available_parents": [],
+                "convergence": self._compact_convergence(),
+                "budget": {
+                    "remaining_attempts": max(
+                        0,
+                        self._optimization_settings()["hard_max_attempts"]
+                        - len(self.state.candidate_history),
+                    ),
+                    "max_llm_decisions": self.state.max_context_rounds,
+                },
+            },
+            "conformation_policy": self.context.task.get(
+                "conformation_policy",
+                {"mode": "free_docking_with_posthoc_core_gate" if
+                 (self.context.task.get("pose_retention") or {}).get("enabled") else "scaffold_preserving",
+                 "receptor_fixed": True},
+            ),
+            "instruction": instruction,
+            "limits": {"one_transformation_per_decision": True},
+        }
+        stop_hint = (
+            "STOP requires a stop_reason from " + ", ".join(self.STOP_REASONS) + "."
+        )
+        if self.closed_pool:
+            payload["limits"].update(closed_pool_only=True, maximum_unique_candidates=self.closed_pool.budget)
+            payload["state"]["convergence"].pop("global_search", None)
+            history, summary = self._closed_pool_history_view()
+            payload["state"]["docking_history"] = history
+            payload["state"].pop("candidate_history")
+            payload["state"]["learning_summary"] = summary
+            if getattr(self.closed_pool, "mode", "frozen_cut") == "multisite":
+                payload["state"]["convergence"]["next_decision"] = (
+                    "Choose any exposed site and a change_type it allows, or STOP. " + stop_hint)
+                payload["instruction"] = (
+                    "Choose one site from design_dossier.sites, one change_type that site lists in "
+                    "allowed_change_types, and then the payload that change_type needs: a listed "
+                    "fragment_id for addition or bond replacement, an element symbol for an atom or "
+                    "ring replacement, and no fragment at all for a bond deletion. The same compound "
+                    "can be reached through more than one site and fragment; a compound already "
+                    "proposed counts as used however it was reached. Use the cumulative "
+                    "structure/docking summary and latest Host feedback. " + stop_hint +
+                    " Do not request local tools or external research.")
+                payload["state"]["attempted_transformations"] = summary.get(
+                    "attempted_candidates", payload["state"]["attempted_transformations"])
+            else:
+                payload["state"]["convergence"]["next_decision"] = (
+                    "Choose a new catalog fragment at the sole C6 site, or STOP. " + stop_hint)
+                payload["instruction"] = (
+                    "Choose one untried catalog fragment at the sole C6 site, or STOP. "
+                    "Use the cumulative structure/docking summary and latest Host feedback. "
+                    + stop_hint + " Do not request local tools or external research.")
+                payload["state"]["attempted_transformations"] = [
+                    {"fragment_id": item.get("transformation", {}).get("fragment_id")}
+                    for item in payload["state"]["attempted_transformations"]]
+        elif multisite:
+            payload["limits"].update(
+                edit_site_table=True,
+                catalog_size=len(self.tools.fragment_library.records),
+                layer_decision="host_computed",
+            )
+            payload["state"]["convergence"]["next_decision"] = (
+                "Choose one site, one allowed operation, and one catalog fragment, or STOP. "
+                + stop_hint)
+            payload["instruction"] = (
+                "Choose one site from edit_sites, one operation that site allows, and one catalog "
+                "fragment, or STOP. " + stop_hint +
+                " The host builds the product and reports whether the change is a "
+                "minimal edit or a whole-fragment replacement. Do not request local tools or external "
+                "research.")
+        if feedback is not None:
+            payload["latest_feedback"] = self._llm_safe_value(
+                self._direct_feedback_without_tool_suggestions(feedback))
+        if previous_design is not None:
+            payload["previous_design"] = self._llm_safe_value(previous_design)
+        if rejection is not None:
+            payload["rejection"] = self._llm_safe_value(
+                self._closed_pool_feedback(rejection) if self.closed_pool else
+                self._direct_feedback_without_tool_suggestions(rejection))
+        return payload
+
+    def _repair_direct_decision(
+        self, decision: dict[str, Any], payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Repair only READY/STOP responses; no local tool action is legal."""
+        decision = self._unwrap_decision(decision)
+        if isinstance(decision, dict) and decision.get("action") in {"READY", "STOP"}:
+            return decision
+        if self._contains_transformation_fields(decision):
+            return {**decision, "action": "READY"}
+        repair_payload = {
+            **payload,
+            "mode": "multisite_edit_decision_repair" if self._multisite_enabled() else "single_edit_decision_repair",
+            "invalid_decision": decision,
+            "instruction": (
+                "Return exactly one JSON object with action READY or STOP. READY must contain "
+                "understanding, edit_hypothesis, operation, one target_type with target_id (or "
+                "edit_atom_index / bond_site_id), and fragment_smiles or fragment_id; "
+                "an atom/ring replacement needs element instead of a fragment. STOP must include "
+                f"a stop_reason from {', '.join(self.STOP_REASONS)}. Do not call or mention local tools."
+            ),
+        }
+        repaired = self._unwrap_decision(self._complete_direct_json(repair_payload))
+        if isinstance(repaired, dict) and repaired.get("action") in {"READY", "STOP"}:
+            return repaired
+        if self._contains_transformation_fields(repaired):
+            return {**repaired, "action": "READY"}
+        raise RuntimeError("LLM did not return READY or STOP in single_edit_mode")
+
+    def _complete_direct_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response_path = None
+        if self.closed_pool:
+            _, response_path = self.closed_pool.audit_request(self.run_dir, payload)
+        try:
+            response = self.client.complete_json(payload)
+        except Exception as exc:
+            if response_path:
+                self._write_json(response_path.name, {"status": "failed", "error": str(exc)})
+            raise
+        if response_path:
+            self._write_json(response_path.name, {"status": "complete", "decision": response})
+        return response
+
+    def _duplicate_transformation_message(
+        self, transformation: dict[str, Any], details: dict[str, Any] | None
+    ) -> str:
+        """Name the exact already-attempted edit so a weak model can avoid re-proposing it."""
+        transformation = transformation or {}
+        details = details or {}
+        site = transformation.get("bond_site_id", transformation.get("edit_atom_index"))
+        operation = transformation.get("operation") or (
+            f"{transformation.get('site_type', '')}:{transformation.get('change_type', '')}"
+        )
+        edit = (
+            transformation.get("element")
+            or transformation.get("fragment_id")
+            or transformation.get("fragment_smiles")
+        )
+        attempt = details.get("attempt", details.get("exploration_record"))
+        message = "This transformation was already attempted"
+        if attempt is not None:
+            message += f" (attempt {attempt})"
+        message += f": {operation} at site {site}"
+        if edit is not None:
+            message += f" with {edit}"
+        message += (
+            ". Choose a chemically distinct site, change_type, element, or fragment instead."
+        )
+        return message
+
+    def _direct_decision(self, instruction: str) -> dict[str, Any]:
+        payload = self._direct_payload(instruction)
+        retries = 12 if (self.closed_pool or self._multisite_enabled()) else 1
+        for _ in range(retries):
+            decision = self._repair_direct_decision(self._complete_direct_json(payload), payload)
+            if decision.get("action") == "STOP":
+                stop_reason = self._stop_reason_value(decision)
+                if stop_reason is not None:
+                    return {**decision, "stop_reason": stop_reason}
+                payload = self._direct_payload(instruction, previous_design=decision,
+                    rejection={"failure_class": "stop_reason_invalid",
+                               "error": (
+                                   "STOP requires a stop_reason from "
+                                   + ", ".join(self.STOP_REASONS) + "."
+                               ),
+                               "instruction": "Return STOP with a valid stop_reason, or continue with READY."})
+                continue
+            if not self.closed_pool and not self._multisite_enabled():
+                return decision
+            try:
+                self._validate_design(decision)
+                transformation = self._transformation(decision)
+                attempted = self._attempted_transformation_details(transformation)
+                if attempted is not None:
+                    raise RuntimeError(
+                        self._duplicate_transformation_message(transformation, attempted)
+                    )
+                return decision
+            except (ReadyDecisionError, RuntimeError, ValueError) as exc:
+                payload = self._direct_payload(instruction, previous_design=decision,
+                    rejection={"failure_class": "multisite_decision_invalid",
+                               "error": str(exc),
+                               "instruction": "Choose a different valid single-site transformation."})
+        raise RuntimeError("Initial edit-decision retry limit exceeded")
+
+    def _retry_direct_decision(
+        self, previous_design: dict[str, Any], rejection: dict[str, Any]
+    ) -> dict[str, Any]:
+        max_consecutive_invalid = self._termination_settings()["max_consecutive_invalid_edits"]
+        consecutive_rejections = 0
+        for _ in range(12):
+            payload = self._direct_payload(
+                "Review the supplied host validation or docking feedback and propose exactly one "
+                "chemically distinct transformation, or STOP. You may choose any target listed in "
+                "the design dossier; do not assume a fixed edit site. Do not call local tools.",
+                previous_design=previous_design,
+                rejection=rejection,
+            )
+            decision = self._repair_direct_decision(
+                self._complete_direct_json(payload), payload
+            )
+            if decision.get("action") == "STOP":
+                stop_reason = self._stop_reason_value(decision)
+                if stop_reason is not None:
+                    return {**decision, "stop_reason": stop_reason}
+                rejection = {
+                    "status": "rejected",
+                    "failure_class": "stop_reason_invalid",
+                    "error": (
+                        "STOP requires a stop_reason from "
+                        + ", ".join(self.STOP_REASONS) + "."
+                    ),
+                    "instruction": "Return STOP with a valid stop_reason, or continue with READY.",
+                }
+                self.state.tool_rejections.append(rejection)
+                consecutive_rejections += 1
+                if consecutive_rejections >= max_consecutive_invalid:
+                    break
+                continue
+            try:
+                transformation = self._transformation(decision)
+                attempted = self._attempted_transformation_details(transformation)
+                if attempted is not None:
+                    raise RuntimeError(
+                        self._duplicate_transformation_message(transformation, attempted)
+                    )
+                self._validate_design(decision)
+                return decision
+            except (ReadyDecisionError, RuntimeError, ValueError) as error:
+                rejection = {
+                    "status": "rejected",
+                    "failure_class": "single_edit_decision_invalid",
+                    "error": str(error),
+                    "instruction": "Choose a different valid single-site transformation.",
+                }
+                self.state.tool_rejections.append(rejection)
+                consecutive_rejections += 1
+                if consecutive_rejections >= max_consecutive_invalid:
+                    break
+        # Exhausting the rejection budget means the designer could not produce an untried,
+        # valid decision -- not that the run is broken.  Stop gracefully and keep every
+        # already-docked candidate instead of raising and discarding them.
+        return {
+            "action": "STOP",
+            "stop_reason": "repeated_invalid_edit",
+            "reason": (
+                f"The designer produced {consecutive_rejections} consecutive decisions the host "
+                "rejected (already attempted, invalid, symmetry-duplicate, or missing a valid "
+                "stop_reason). Best-so-far is kept."
+            ),
+        }
+
+    @staticmethod
+    def _canonical_fragment_smiles(smiles: Any) -> str | None:
+        if not isinstance(smiles, str):
+            return None
+        molecule = Chem.MolFromSmiles(smiles)
+        return Chem.MolToSmiles(molecule, isomericSmiles=True) if molecule else smiles
+
+
+
+    def _known_candidate_smiles(self) -> dict[str, dict[str, Any]]:
+        known = {
+            Chem.MolToSmiles(Chem.RemoveHs(self.context.ligand), isomericSmiles=True): {
+                "source": "reference_ligand",
+                "attempt": 0,
+            }
+        }
+        for item in self.state.candidate_history:
+            smiles = (item.get("validation") or {}).get("canonical_smiles")
+            if isinstance(smiles, str):
+                known.setdefault(smiles, {
+                    "source": "candidate_history",
+                    "attempt": item.get("attempt"),
+                })
+        for position, item in enumerate(self.state.exploration_attempts, start=1):
+            details = item.get("details") or {}
+            smiles = details.get("canonical_smiles")
+            if isinstance(smiles, str):
+                known.setdefault(smiles, {
+                    "source": "exploration_attempt",
+                    "exploration_record": position,
+                    "status": item.get("status"),
+                })
+        return known
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def _query_payload(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = {
@@ -1073,7 +1841,7 @@ class Workflow:
                 "assess_edit_sites, and sites plus global_rationale must be nested inside arguments. Include an "
                 "evidence-backed priority and site_type for each plausible host target. The host will lock the "
                 "highest-priority open target during design. Use the chemical "
-                "tools to compare replace_hydrogen and replace_fragment, query spatial facts when needed, then "
+                "tools to compare addition, deletion, and replacement, query spatial facts when needed, then "
                 "return READY only when the evidence supports the selected operation and final edit site."
             ),
         }
@@ -1095,19 +1863,13 @@ class Workflow:
             details.update({"tool": decision.get("tool"), "arguments": decision.get("arguments")})
         elif action == "QUERY_BATCH":
             details["queries"] = decision.get("queries")
-        elif action == "PLAN_BATCH":
-            details.update({
-                "candidate_count": len(decision.get("candidates", [])) if isinstance(decision.get("candidates"), list) else None,
-                "site_updates": decision.get("site_updates"),
-            })
-        elif action == "CONFIRM":
-            details.update({"candidate_ids": decision.get("candidate_ids")})
         elif action == "READY":
             details.update({
-                "operation": decision.get("operation", "replace_hydrogen"),
+                "site_type": decision.get("site_type"),
+                "change_type": decision.get("change_type"),
+                "element": decision.get("element"),
                 "edit_atom_index": decision.get("edit_atom_index"),
-                "replacement_site_id": decision.get("replacement_site_id"),
-                "cut_bond": decision.get("cut_bond"),
+                "bond_site_id": decision.get("bond_site_id"),
                 "fragment_id": decision.get("fragment_id"),
                 "fragment_smiles": decision.get("fragment_smiles"),
                 "hypothesis": decision.get("edit_hypothesis"),
@@ -1214,19 +1976,6 @@ class Workflow:
                 "assess_edit_sites is only allowed before design attempts; the active site strategy cannot "
                 "be reordered after local search has started"
             )
-        if tool == "generate_site_candidate_batch" and self._design_phase:
-            active = self.state.active_target
-            proposed = {
-                "target_type": arguments.get("target_type"),
-                "target_id": arguments.get("target_id"),
-            }
-            if active is not None and proposed != {
-                "target_type": active.get("target_type"),
-                "target_id": active.get("target_id"),
-            }:
-                raise RuntimeError(
-                    "generate_site_candidate_batch may only target the current active prioritized site"
-                )
         self._emit("tool_started", {"tool": tool, "arguments": arguments})
         result, evidence = self.tools.execute(tool, arguments)
         self.state.call_signatures.add(signature)
@@ -1254,8 +2003,6 @@ class Workflow:
                 "validate_candidate_geometry",
                 reason=result.get("error") if result.get("status") != "accepted" else None,
             )
-        if tool == "generate_site_candidate_batch" and result.get("status") == "complete":
-            self._record_candidate_batch_exploration(result)
         self._write_json(
             f"observation-{len(self.state.observations):02d}.json",
             self.state.compact_view(),
@@ -1266,45 +2013,6 @@ class Workflow:
             "result": self._tool_result_summary(result),
         })
 
-    def _record_candidate_batch_exploration(self, result: dict[str, Any]) -> None:
-        """Record batch-prescreened transformations without turning them into docking evidence."""
-        target_type = result.get("target_type")
-        target_id = result.get("target_id")
-        for item in (result.get("candidates") or []):
-            transformation = dict(item.get("transformation") or {})
-            if not transformation:
-                transformation = {
-                    "operation": "replace_hydrogen" if target_type == "atom" else "replace_fragment",
-                    "fragment_id": item.get("fragment_id"),
-                    "fragment_smiles": item.get("fragment_smiles"),
-                }
-                if target_type == "atom":
-                    transformation["edit_atom_index"] = target_id
-                else:
-                    transformation["replacement_site_id"] = target_id
-            self._record_exploration_attempt(
-                transformation,
-                "batch_geometry_accepted",
-                "candidate_batch",
-            )
-        for item in (result.get("rejected") or []):
-            transformation = dict(item.get("transformation") or {})
-            if not transformation:
-                transformation = {
-                    "operation": "replace_hydrogen" if target_type == "atom" else "replace_fragment",
-                    "fragment_id": item.get("fragment_id"),
-                    "fragment_smiles": item.get("fragment_smiles"),
-                }
-                if target_type == "atom":
-                    transformation["edit_atom_index"] = target_id
-                else:
-                    transformation["replacement_site_id"] = target_id
-            self._record_exploration_attempt(
-                transformation,
-                "geometry_rejected",
-                "candidate_batch",
-                reason=item.get("error") or item.get("failure_class"),
-            )
 
     @staticmethod
     def _unwrap_decision(decision: Any) -> Any:
@@ -1332,8 +2040,6 @@ class Workflow:
             "QUERY",
             "QUERY_BATCH",
             "READY",
-            "PLAN_BATCH",
-            "CONFIRM",
             "MARK_UNMODIFIABLE",
             "PROPOSE_TOOL",
             "STOP",
@@ -1348,10 +2054,10 @@ class Workflow:
         """
         if not isinstance(decision, dict):
             return False
-        if "operation" in decision:
+        if "operation" in decision or ("site_type" in decision and "change_type" in decision):
             return True
         has_fragment = "fragment_smiles" in decision or "fragment_id" in decision
-        has_anchor = "replacement_site_id" in decision or "edit_atom_index" in decision
+        has_anchor = "bond_site_id" in decision or "edit_atom_index" in decision
         return has_fragment and has_anchor
 
     @staticmethod
@@ -1364,32 +2070,49 @@ class Workflow:
         return normalized
 
     def _transformation(self, decision: dict[str, Any]) -> dict[str, Any]:
-        operation = decision.get("operation", "replace_hydrogen")
+        if self.closed_pool:
+            decision = self.closed_pool.normalize(decision)
+        decision = self._normalize_site_selection(decision)
+        try:
+            axes = normalize_transformation(dict(decision))
+        except EditTaxonomyError as error:
+            raise RuntimeError(str(error)) from error
+        site_type = axes["site_type"]
+        change_type = axes["change_type"]
         fragment_id = self._optional_identifier(decision.get("fragment_id"))
         parent_attempt = decision.get("parent_attempt")
+        if self._single_edit_enabled() and parent_attempt is not None:
+            raise RuntimeError("Single-edit candidates must be built from the original ligand; omit parent_attempt")
         if parent_attempt is not None and (
             not isinstance(parent_attempt, int) or parent_attempt < 1
         ):
             raise RuntimeError("parent_attempt must be a positive attempt number")
         if parent_attempt is not None:
             self._parent_metadata_for(parent_attempt)
-        transformation = {
-            "operation": operation,
+        transformation: dict[str, Any] = {
+            "site_type": site_type,
+            "change_type": change_type,
+            "operation": operation_label(site_type, change_type),
             "fragment_smiles": decision.get("fragment_smiles"),
             "parent_attempt": parent_attempt,
             "generation": (
                 self._parent_metadata_for(parent_attempt).get("generation", 0) + 1
                 if parent_attempt is not None else 1
             ),
-            "replace_existing_substituent": parent_attempt is not None,
         }
+        if parent_attempt is not None:
+            transformation["replace_existing_substituent"] = True
+        needs_fragment = (site_type == "atom" and change_type == "addition") or (
+            site_type == "bond" and change_type == "replacement"
+        )
         if fragment_id:
             transformation["fragment_id"] = fragment_id
             record = self.tools.fragment_library.get(fragment_id)
-            library_operation = "substitute" if operation == "replace_hydrogen" else operation
+            library_operation = LIBRARY_OPERATION_FOR_CHANGE_TYPE.get(change_type, change_type)
             if not self.tools.fragment_library.allows_operation(record, library_operation):
                 raise RuntimeError(
-                    f"Fragment {fragment_id} does not allow operation {library_operation}"
+                    f"Fragment {fragment_id} does not allow a {change_type} edit "
+                    f"(library operation {library_operation})"
                 )
             if not transformation["fragment_smiles"]:
                 transformation["fragment_smiles"] = record["smiles"]
@@ -1402,26 +2125,70 @@ class Workflow:
             else:
                 transformation["fragment_smiles"] = record["smiles"]
             transformation["library_record"] = record
-        if operation == "replace_fragment":
-            site_id = decision.get("replacement_site_id")
+        if site_type in {"bond", "linker"}:
+            site_id = decision.get("bond_site_id") or decision.get("linker_site_id")
             if not isinstance(site_id, str):
-                raise RuntimeError(
-                    "replace_fragment requires replacement_site_id from "
-                    "list_fragment_replacement_sites; direct cut_bond input is not accepted"
-                )
-            site = self.tools.resolve_replacement_site(site_id)
-            transformation["replacement_site_id"] = site_id
-            transformation["replacement_site"] = site
-            transformation["cut_bond"] = site["cut_bond"]
-            transformation["edit_atom_index"] = site["retained_atom_index"]
+                if parent_attempt is None:
+                    raise RuntimeError(
+                        "A bond site requires bond_site_id from list_bond_sites; "
+                        "direct cut_bond input is not accepted"
+                    )
+                # A local child resolves its cut bond from its parent's substituent.
+                transformation["edit_atom_index"] = decision.get("edit_atom_index")
+                if not isinstance(transformation["edit_atom_index"], int):
+                    raise RuntimeError(
+                        "A resolved bond child requires the integer edit_atom_index of its parent anchor"
+                    )
+            else:
+                site = self.tools.resolve_bond_site(site_id)
+                transformation["bond_site_id"] = site_id
+                transformation["bond"] = site
+                transformation["cut_bond"] = site["cut_bond"]
+                transformation["edit_atom_index"] = site["retained_atom_index"]
         else:
-            transformation["edit_atom_index"] = decision.get("edit_atom_index")
+            transformation["edit_atom_index"] = decision.get(
+                "edit_atom_index", decision.get("atom_index")
+            )
+        if change_type == "replacement" and site_type in {"atom", "ring"}:
+            transformation["element"] = decision.get("element")
+            if not isinstance(transformation["element"], str) or not transformation["element"].strip():
+                raise RuntimeError("atom/ring replacement requires an element symbol")
         if parent_attempt is None:
             transformation.pop("parent_attempt", None)
             transformation.pop("replace_existing_substituent", None)
-        if not isinstance(transformation.get("fragment_smiles"), str):
-            raise RuntimeError("READY requires fragment_smiles or a valid fragment_id")
+        if needs_fragment and not isinstance(transformation.get("fragment_smiles"), str):
+            raise RuntimeError("This edit requires fragment_smiles or a valid fragment_id")
+        if self._multisite_enabled():
+            policy = self.tools._site_table_policy(
+                change_type,
+                "bond" if site_type in {"bond", "linker"} else "atom",
+                transformation.get("bond_site_id") if site_type in {"bond", "linker"}
+                else transformation.get("edit_atom_index"),
+            )
+            if not policy.get("allowed"):
+                raise RuntimeError(str(policy.get("reason")))
+            transformation["site_policy"] = {
+                "protection": policy.get("protection"),
+                "probe_verdict": policy.get("probe_verdict"),
+                "source": policy.get("source"),
+            }
+            if policy.get("canonicalization"):
+                transformation["site_canonicalization"] = policy["canonicalization"]
+                apply_site_canonicalization(transformation)
         return transformation
+
+    @staticmethod
+    def _normalize_site_selection(decision: dict[str, Any]) -> dict[str, Any]:
+        """Accept either (target_type, target_id) or the explicit field names."""
+        if not isinstance(decision, dict):
+            return decision
+        target_type = decision.get("target_type")
+        target_id = decision.get("target_id")
+        if target_type == "atom" and decision.get("edit_atom_index") is None:
+            decision = {**decision, "edit_atom_index": target_id}
+        elif target_type == "bond" and decision.get("bond_site_id") is None:
+            decision = {**decision, "bond_site_id": target_id}
+        return decision
 
     @staticmethod
     def _normalize_cut_bond(value: Any) -> tuple[int, int] | None:
@@ -1435,22 +2202,44 @@ class Workflow:
     def _same_transformation(cls, left: dict[str, Any], right: dict[str, Any]) -> bool:
         return cls._transformation_key(left) == cls._transformation_key(right)
 
-    def _transformation_was_attempted(self, transformation: dict[str, Any]) -> bool:
-        return any(
-            self._same_transformation(item.get("transformation", {}), transformation)
-            and (
-                item.get("source") == "design"
-                or item.get("status") in {
-                    "geometry_rejected",
-                    "duplicate_structure",
-                    "docking_failed",
+    def _attempted_transformation_details(
+        self, transformation: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        for item in self.state.candidate_history:
+            if self._same_transformation(item.get("transformation", {}), transformation):
+                return {
+                    "source": "candidate_history",
+                    "attempt": item.get("attempt"),
+                    "status": "docked" if item.get("docking") else "candidate_generated",
+                    "previous_transformation": self._compact_transformation(
+                        item.get("transformation")
+                    ),
                 }
-            )
-            for item in self.state.exploration_attempts
-        ) or any(
-            self._same_transformation(item.get("transformation", {}), transformation)
-            for item in self.state.candidate_history
-        )
+        for position, item in enumerate(self.state.exploration_attempts, start=1):
+            if (
+                (
+                    item.get("source") == "design"
+                    or item.get("status") in {
+                        "geometry_rejected",
+                        "duplicate_structure",
+                        "docking_failed",
+                    }
+                )
+                and self._same_transformation(item.get("transformation", {}), transformation)
+            ):
+                return {
+                    "source": item.get("source"),
+                    "exploration_record": position,
+                    "status": item.get("status"),
+                    "reason": item.get("reason"),
+                    "previous_transformation": self._compact_transformation(
+                        item.get("transformation")
+                    ),
+                }
+        return None
+
+    def _transformation_was_attempted(self, transformation: dict[str, Any]) -> bool:
+        return self._attempted_transformation_details(transformation) is not None
 
     def _unmodifiable_scope(
         self, target_type: str, target_id: Any, family: str | None = None
@@ -1479,14 +2268,14 @@ class Workflow:
             if item.get("source") == "MARK_UNMODIFIABLE":
                 continue
             transformation = item.get("transformation") or {}
-            operation = transformation.get("operation", "replace_hydrogen")
+            site_type = self._edit_site_type(transformation)
             matches = (
                 target_type == "atom"
-                and operation == "replace_hydrogen"
+                and site_type in {"atom", "ring"}
                 and transformation.get("edit_atom_index") == target_id
-                or target_type == "replacement_site"
-                and operation == "replace_fragment"
-                and transformation.get("replacement_site_id") == target_id
+                or target_type == "bond"
+                and site_type in {"bond", "linker"}
+                and transformation.get("bond_site_id") == target_id
             )
             if matches:
                 transformations.add(self._transformation_key(transformation))
@@ -1498,10 +2287,10 @@ class Workflow:
         scope = decision.get("scope")
         family = decision.get("family")
         reason = decision.get("reason")
-        valid_types = {"atom", "replacement_site"}
+        valid_types = {"atom", "bond"}
         valid_families = {"halogen", "non_halogen", "fragment_replacement"}
         if target_type not in valid_types:
-            raise RuntimeError("MARK_UNMODIFIABLE target_type must be atom or replacement_site")
+            raise RuntimeError("MARK_UNMODIFIABLE target_type must be atom or bond_site")
         if target_type == "atom":
             if not isinstance(target_id, int) or target_id not in {
                 atom.GetIdx() for atom in self.context.ligand.GetAtoms()
@@ -1510,17 +2299,21 @@ class Workflow:
                 raise RuntimeError("MARK_UNMODIFIABLE atom target_id must be a heavy atom with hydrogen")
         else:
             known_sites = {
-                site["replacement_site_id"]
-                for site in self.tools.list_fragment_replacement_sites(limit=100).get("sites", [])
+                site["bond_site_id"]
+                for site in self.tools.list_bond_sites(limit=100).get("sites", [])
             }
             if not isinstance(target_id, str) or target_id not in known_sites:
-                raise RuntimeError("MARK_UNMODIFIABLE replacement_site target_id is not host-enumerated")
+                raise RuntimeError("MARK_UNMODIFIABLE bond_site target_id is not host-enumerated")
         if scope not in {"site", "family"}:
             raise RuntimeError("MARK_UNMODIFIABLE scope must be site or family")
         if scope == "family" and family not in valid_families:
             raise RuntimeError("MARK_UNMODIFIABLE family must be halogen, non_halogen, or fragment_replacement")
-        if not isinstance(reason, str) or not reason.strip():
-            raise RuntimeError("MARK_UNMODIFIABLE requires a non-empty reason")
+        completion_reason = self._completion_reason_value(decision)
+        if completion_reason is None:
+            raise RuntimeError(
+                "MARK_UNMODIFIABLE requires a completion_reason from "
+                + ", ".join(self.SITE_COMPLETION_REASONS)
+            )
         existing = next(
             (
                 item for item in self.state.unmodifiable_targets
@@ -1582,13 +2375,19 @@ class Workflow:
             "target_id": target_id,
             "scope": scope,
             "family": family if scope == "family" else None,
-            "reason": reason.strip(),
+            "completion_reason": completion_reason,
+            "reason": (
+                reason.strip()
+                if isinstance(reason, str) and reason.strip()
+                else completion_reason
+            ),
         }
         self.state.unmodifiable_targets.append(record)
         attempt_record = self._record_exploration_attempt(
             {
-                "operation": "replace_fragment" if target_type == "replacement_site" else "replace_hydrogen",
-                "replacement_site_id": target_id if target_type == "replacement_site" else None,
+                "site_type": "bond" if target_type == "bond" else "atom",
+                "change_type": "deletion" if target_type == "bond" else "addition",
+                "bond_site_id": target_id if target_type == "bond" else None,
                 "edit_atom_index": target_id if target_type == "atom" else None,
                 "fragment_smiles": None,
             },
@@ -1612,13 +2411,24 @@ class Workflow:
             "pose_count_per_seed": docking.get("pose_count_per_seed"),
             "total_pose_count": docking.get("total_pose_count"),
             "metrics": comparison.get("metrics"),
+            "pose_retention": docking.get("pose_retention"),
+            "passing_seed_count": docking.get("passing_seed_count"),
+            "paired_seed_count": docking.get("paired_seed_count"),
+            "paired_seed_fraction": docking.get("paired_seed_fraction"),
+            "outlier_or_failed_seeds": docking.get("outlier_or_failed_seeds"),
+            "failure_class": docking.get("failure_class"),
+            "error": docking.get("error"),
             "pose_consensus": docking.get("pose_consensus"),
+            "pose_evidence": docking.get("pose_evidence"),
             "interaction_consensus": docking.get("interaction_consensus"),
+            "plip_comparison": docking.get("plip_comparison"),
             "candidate_per_seed": {
                 seed: {
                     "status": result.get("status"),
                     "top_pose": result.get("top_pose"),
                     "pose_selection": result.get("pose_selection"),
+                    "pose_path": result.get("pose_path"),
+                    "family_member": result.get("family_member"),
                     "audit_path": result.get("audit_path"),
                 }
                 for seed, result in (docking.get("candidate_per_seed") or {}).items()
@@ -1630,7 +2440,10 @@ class Workflow:
                     "pose_selection": result.get("pose_selection"),
                     "audit_path": result.get("audit_path"),
                 }
-                for seed, result in ((docking.get("reference_baseline") or {}).get("per_seed") or {}).items()
+                for seed, result in ((docking.get("reference_baseline") or {}).get("reference_by_seed")
+                                     or ((docking.get("reference_baseline") or {}).get("per_seed")
+                                         if isinstance((docking.get("reference_baseline") or {}).get("per_seed"), dict)
+                                         else {}) or {}).items()
             },
             "limitation": (
                 "This summary supports ranking and pose-consistency review. Full commands, logs, "
@@ -1640,11 +2453,9 @@ class Workflow:
 
     def _search_policy(self) -> dict[str, Any]:
         configured = self.context.task.get("search_policy") or {}
-        batch_mode = self._batch_enabled()
-        mode = "portfolio" if batch_mode else str(configured.get("mode", "family_coverage"))
         return {
-            "mode": mode,
-            "site_lock_enabled": False if batch_mode else bool(configured.get("site_lock_enabled", False)),
+            "mode": str(configured.get("mode", "family_coverage")),
+            "site_lock_enabled": bool(configured.get("site_lock_enabled", False)),
             "site_strategy_required": bool(configured.get("site_strategy_required", False)),
             "minimum_prioritized_sites": int(configured.get("minimum_prioritized_sites", 1)),
             "local_patience": int(configured.get("local_patience", 3)),
@@ -1656,10 +2467,11 @@ class Workflow:
 
     @staticmethod
     def _transformation_target(transformation: dict[str, Any]) -> dict[str, Any]:
-        if transformation.get("operation") == "replace_fragment":
+        site_type = Workflow._edit_site_type(transformation)
+        if site_type in {"bond", "linker"}:
             return {
-                "target_type": "replacement_site",
-                "target_id": transformation.get("replacement_site_id"),
+                "target_type": "bond",
+                "target_id": transformation.get("bond_site_id"),
             }
         return {
             "target_type": "atom",
@@ -1679,9 +2491,8 @@ class Workflow:
     ) -> list[dict[str, Any]]:
         """Return unique host exploration records for one target.
 
-        Geometry screening and candidate-batch results are local search evidence,
-        but they are not docking evidence. Keep the latest record for a
-        transformation so a batch prescreen followed by docking counts once.
+        Geometry screening is local search evidence, but it is not docking evidence.
+        Keep the latest record for each transformation so the search history remains auditable.
         """
         records: dict[str, dict[str, Any]] = {}
         for item in self.state.exploration_attempts:
@@ -1751,10 +2562,10 @@ class Workflow:
                 "status": status,
                 "attempt_count": len(attempts),
                 "attempt_count_definition": (
-                    "unique host-recorded transformations, including geometry screening and batch evidence; "
+                    "unique host-recorded transformations, including geometry screening; "
                     "this is not a docking count"
                 ),
-                "geometry_accepted": sum(item.get("status") in {"geometry_accepted", "batch_geometry_accepted", "docked"} for item in attempts),
+                "geometry_accepted": sum(item.get("status") in {"geometry_accepted", "docked"} for item in attempts),
                 "geometry_rejected": sum(item.get("status") == "geometry_rejected" for item in attempts),
                 "docking_count": len(docking),
                 "families": families,
@@ -1846,7 +2657,7 @@ class Workflow:
             "active_site_search": active_status,
             "proposed_target": proposed,
             "instruction": (
-                "Continue the active target with a chemically distinct, tool-supported candidate batch or transformation. "
+                "Continue the active target with one chemically distinct, tool-supported transformation. "
                 "The host advances to the next prioritized site only after the LLM explicitly closes the active target "
                 "with an evidence-backed MARK_UNMODIFIABLE decision. Patience is advisory and does not force a site switch."
             ),
@@ -1861,14 +2672,14 @@ class Workflow:
             ("atom", index, global_search["atom_clearance"].get(str(index)))
             for index in global_search["editable_hydrogen_atoms"]
         ] + [
-            ("replacement_site", site_id, None)
-            for site_id in global_search["replacement_sites"]
+            ("bond", site_id, None)
+            for site_id in global_search["bond_sites"]
         ]
         for target_type, target_id, clearance in targets:
             records = (
                 global_search["attempted_atoms"].get(str(target_id), [])
                 if target_type == "atom"
-                else global_search["attempted_replacement_sites"].get(target_id, [])
+                else global_search["attempted_bond_sites"].get(target_id, [])
             )
             transformations = [
                 item.get("transformation") or {} for item in records
@@ -1880,8 +2691,8 @@ class Workflow:
                 matches = (
                     target_type == "atom"
                     and transformation.get("edit_atom_index") == target_id
-                    or target_type == "replacement_site"
-                    and transformation.get("replacement_site_id") == target_id
+                    or target_type == "bond"
+                    and transformation.get("bond_site_id") == target_id
                 )
                 if matches:
                     docking.append(item)
@@ -1909,14 +2720,14 @@ class Workflow:
                 "closed": (
                     target_id in global_search["closed_atoms"]
                     if target_type == "atom"
-                    else target_id in global_search["closed_replacement_sites"]
+                    else target_id in global_search["closed_bond_sites"]
                 ),
                 "distinct_transformations": len({
                     json.dumps(self._exploration_transformation(item), sort_keys=True)
                     for item in transformations
                 }),
                 "transformations": self._llm_safe_value(transformations[-8:]),
-                "geometry_accepted": sum(item.get("status") in {"geometry_accepted", "batch_geometry_accepted", "docked"} for item in records),
+                "geometry_accepted": sum(item.get("status") in {"geometry_accepted", "docked"} for item in records),
                 "geometry_rejected": sum(item.get("status") == "geometry_rejected" for item in records),
                 "geometry_feasible_not_docked": self._geometry_feasible_not_docked(target_type, target_id),
                 "docking_count": len(docking),
@@ -1950,21 +2761,8 @@ class Workflow:
             self._transformation_key(item.get("transformation"))
             for item in self.state.docking_history
         }
-        batch_details: dict[str, dict[str, Any]] = {}
-        for observation in self.state.observations:
-            if observation.tool != "generate_site_candidate_batch":
-                continue
-            result = observation.result or {}
-            if result.get("target_type") != target_type or result.get("target_id") != target_id:
-                continue
-            for item in result.get("candidates") or []:
-                transformation = item.get("transformation") or {}
-                batch_details[self._transformation_key(transformation)] = {
-                    "canonical_smiles": item.get("canonical_smiles"),
-                    "fragment_properties": self._llm_safe_value(item.get("fragment_properties")),
-                }
         candidates: dict[str, dict[str, Any]] = {}
-        accepted_statuses = {"batch_geometry_accepted", "geometry_accepted"}
+        accepted_statuses = {"geometry_accepted"}
         for item in self.state.exploration_attempts:
             if item.get("target_type") != target_type or item.get("target_id") != target_id:
                 continue
@@ -1975,7 +2773,6 @@ class Workflow:
             if key in docked_keys:
                 continue
             entry = self._compact_transformation(transformation)
-            entry.update(batch_details.get(key, {}))
             candidates[key] = entry
         return list(candidates.values())
 
@@ -2005,9 +2802,9 @@ class Workflow:
                 "attempt_count": len(records),
                 "families": sorted({item.get("family") for item in records if item.get("family")}),
             })
-        for target_id, records in (global_search.get("attempted_replacement_sites") or {}).items():
+        for target_id, records in (global_search.get("attempted_bond_sites") or {}).items():
             attempted_targets.append({
-                "target_type": "replacement_site",
+                "target_type": "bond",
                 "target_id": target_id,
                 "attempt_count": len(records),
                 "families": sorted({item.get("family") for item in records if item.get("family")}),
@@ -2015,8 +2812,8 @@ class Workflow:
         return {
             key: global_search.get(key)
             for key in (
-                "complete", "closed_atoms", "closed_replacement_sites", "open_targets",
-                "missing_edit_atoms", "missing_atom_coverage", "missing_replacement_sites",
+                "complete", "closed_atoms", "closed_bond_sites", "open_targets",
+                "missing_edit_atoms", "missing_atom_coverage", "missing_bond_sites",
                 "missing_replacement_coverage", "missing_global_families",
                 "missing_target_diversity", "pending_obligations", "policy",
             )
@@ -2051,8 +2848,10 @@ class Workflow:
                 "fragments": self._llm_safe_value(self.state.fragment_memory),
                 "candidates": self._llm_safe_value(self.state.candidate_memory),
                 "elite_archive": self._llm_safe_value(self.state.elite_archive),
+                "sar_memory": self._llm_safe_value(self.state.sar_memory[-64:]),
             },
             "adaptive_target_summaries": self._adaptive_target_summaries(global_search),
+            "sar_memory": self._llm_safe_value(self.state.sar_memory[-64:]),
             # Keep a small compatibility window; working_memory is authoritative
             # for current decisions and the full history remains on disk.
             "candidate_history": self._compact_candidate_history()[-8:],
@@ -2075,12 +2874,12 @@ class Workflow:
                 "properties, fragment 3D profile, docking scores, seed consistency, pose consensus, interaction "
                 "changes, and the trend of prior transformations. Search the fragment library for chemically "
                 "appropriate alternatives instead of repeatedly using the smallest generic fragment. For "
-                "replace_fragment, only use a fragment returned by search_fragment_library and obtain its "
+                "bond:replacement, only use a fragment returned by search_fragment_library and obtain its "
                 "get_fragment_spatial_profile before validate_candidate_geometry. Continue a target while a "
                 "new chemically distinct, evidence-backed option could improve or meaningfully validate the "
                 "local trend. When site_lock_enabled is true, active_target is authoritative: do not switch "
                 "targets until it is explicitly closed with MARK_UNMODIFIABLE; patience is only a review signal. "
-                "Use generate_site_candidate_batch when several compatible fragments should be compared. After "
+                "Evaluate one chemically distinct candidate at a time. After "
                 "the active target has been explored sufficiently and no credible option remains, "
                 "explicitly use MARK_UNMODIFIABLE with scope site and an evidence-based reason. STOP is allowed "
                 "only after every target is adaptively explored and explicitly closed, or the hard safety limit "
@@ -2126,16 +2925,16 @@ class Workflow:
                     "Your previous response expressed a molecular transformation but was not a "
                     "valid workflow decision. Return READY with top-level action, understanding, "
                     "edit_hypothesis, and the complete transformation. Preserve every valid supplied "
-                    "transformation field and fill any missing required fields. For replace_fragment "
-                    "use replacement_site_id; for replace_hydrogen use edit_atom_index. Return exactly "
+                    "transformation field and fill any missing required fields. For a bond site use "
+                    "bond_site_id; for an atom or ring site use edit_atom_index. Return exactly "
                     "one JSON object."
                 )
             else:
                 mode = "decision_repair"
                 instruction = (
                     "Return exactly one complete JSON object with a top-level string action. "
-                    "The action must be one of QUERY, QUERY_BATCH, READY, PLAN_BATCH, CONFIRM, "
-                    "MARK_UNMODIFIABLE, STOP, or PROPOSE_TOOL; it must never be a registered tool name. "
+                    "The action must be one of QUERY, QUERY_BATCH, READY, MARK_UNMODIFIABLE, STOP, "
+                    "or PROPOSE_TOOL; it must never be a registered tool name. "
                     "Use QUERY with question, tool, "
                     "and arguments; QUERY_BATCH with a queries array; READY with a complete transformation; "
                     "MARK_UNMODIFIABLE with a precise target, scope, and reason; STOP with a reason; or "
@@ -2211,7 +3010,7 @@ class Workflow:
             "phase": phase,
             "operation": normalized.get("operation"),
             "fragment_smiles": normalized.get("fragment_smiles"),
-            "replacement_site_id": normalized.get("replacement_site_id"),
+            "bond_site_id": normalized.get("bond_site_id"),
             "edit_atom_index": normalized.get("edit_atom_index"),
         })
         return normalized
@@ -2254,7 +3053,7 @@ class Workflow:
                 raise RuntimeError("QUERY_BATCH requires a non-empty queries array")
 
             # Filter duplicates per item so new independent queries in the same
-            # batch still execute. Existing observations remain authoritative.
+            # Independent queries still execute. Existing observations remain authoritative.
             executable: list[dict[str, Any]] = []
             skipped: list[dict[str, Any]] = []
             signatures: set[str] = set()
@@ -2271,7 +3070,7 @@ class Workflow:
                     skipped.append(self._duplicate_tool_rejection(
                         tool,
                         arguments,
-                        source="same_batch" if signature in signatures else "previous_observation",
+                        source="same_query" if signature in signatures else "previous_observation",
                     ))
                     continue
                 signatures.add(signature)
@@ -2442,6 +3241,8 @@ class Workflow:
     def _retry_ready_decision(
         self, previous_design: dict[str, Any], rejection: dict[str, Any]
     ) -> dict[str, Any]:
+        if self._direct_edit_mode:
+            return self._retry_direct_decision(previous_design, rejection)
         no_progress_retries = 0
         duplicate_ready_retries = 0
         max_no_progress_retries = 12  # Only consecutive no-progress decisions count.
@@ -2465,8 +3266,8 @@ class Workflow:
                             "and docking_history. All prior transformations are forbidden. You may QUERY a "
                             "new fact or return READY with a revised site or fragment. "
                             "If you return READY, include understanding, edit_hypothesis, operation, "
-                            "edit_atom_index for replace_hydrogen or replacement_site_id for "
-                            "replace_fragment, and fragment_id or fragment_smiles."
+                            "edit_atom_index for atom/ring sites or bond_site_id for bond sites, "
+                            "plus the change_type payload."
                         ),
                     }
                 )
@@ -2577,23 +3378,25 @@ class Workflow:
             transformation = self._transformation(decision)
         except Exception as error:
             raise ReadyDecisionError(decision, str(error)) from error
-        site_lock_rejection = self._site_lock_rejection(transformation)
-        if site_lock_rejection is not None:
-            raise ReadyDecisionError(
-                decision,
-                site_lock_rejection["instruction"],
-                failure_class=site_lock_rejection["failure_class"],
-                instruction=site_lock_rejection["instruction"],
-            )
-        operation = transformation["operation"]
-        if operation not in {"replace_hydrogen", "replace_fragment"}:
-            raise ReadyDecisionError(decision, f"Unsupported READY operation: {operation!r}")
+        if not self._direct_edit_mode:
+            site_lock_rejection = self._site_lock_rejection(transformation)
+            if site_lock_rejection is not None:
+                raise ReadyDecisionError(
+                    decision,
+                    site_lock_rejection["instruction"],
+                    failure_class=site_lock_rejection["failure_class"],
+                    instruction=site_lock_rejection["instruction"],
+                )
+        site_type = transformation["site_type"]
+        change_type = transformation["change_type"]
         index = transformation.get("edit_atom_index")
         parent_attempt = transformation.get("parent_attempt")
         validation_parent = self._resolve_parent_candidate(parent_attempt)
-        if not isinstance(index, int) or not 0 <= index < validation_parent.GetNumAtoms():
+        if site_type in {"atom", "ring"} and (
+            not isinstance(index, int) or not 0 <= index < validation_parent.GetNumAtoms()
+        ):
             raise ReadyDecisionError(decision, f"Invalid edit_atom_index: {index!r}")
-        if operation == "replace_hydrogen":
+        if site_type == "atom" and change_type == "addition":
             atom = validation_parent.GetAtomWithIdx(index)
             if (
                 atom.GetTotalNumHs() < 1
@@ -2601,12 +3404,24 @@ class Workflow:
             ):
                 raise ReadyDecisionError(
                     decision,
-                    f"Selected edit atom {index} has no replaceable hydrogen for replace_hydrogen",
+                    f"Selected edit atom {index} has no replaceable hydrogen for an addition",
                     instruction=(
                         "Choose a heavy atom with a replaceable hydrogen and provide a concrete "
                         "fragment_smiles; do not use placeholder atom indices or SMILES."
                     ),
                 )
+        if self._direct_edit_mode:
+            # In single_edit_mode the dossier is the initial host-provided
+            # context. No local tool evidence gate or site lock is exposed to
+            # the LLM; the actual deterministic construction/geometry check in
+            # design() remains authoritative.
+            self._emit("single_edit_ready_accepted", {
+                "site_type": site_type,
+                "change_type": change_type,
+                "edit_atom_index": index,
+                "bond_site_id": transformation.get("bond_site_id"),
+            })
+            return
         environment_sites = {
             (item.arguments.get("atom_index"), item.arguments.get("parent_attempt"))
             for item in self.state.observations
@@ -2623,12 +3438,14 @@ class Workflow:
                 continue
             args = item.result.get("transformation") or item.arguments
             observed = {
-                "operation": args.get("operation", "replace_hydrogen"),
+                "site_type": self._edit_site_type(args),
+                "change_type": self._edit_change_type(args),
                 "edit_atom_index": args.get("edit_atom_index", args.get("atom_index")),
-                "replacement_site_id": args.get("replacement_site_id"),
+                "bond_site_id": args.get("bond_site_id"),
                 "cut_bond": args.get("cut_bond"),
                 "fragment_smiles": args.get("fragment_smiles"),
                 "fragment_id": args.get("fragment_id"),
+                "element": args.get("element"),
                 "parent_attempt": args.get("parent_attempt"),
                 "replace_existing_substituent": args.get("replace_existing_substituent"),
             }
@@ -2637,8 +3454,8 @@ class Workflow:
             self._same_transformation(observed, transformation)
             for observed in candidate_geometry
         )
-        replacement_sites_queried = any(
-            item.tool == "list_fragment_replacement_sites"
+        bond_sites_queried = any(
+            item.tool == "list_bond_sites"
             for item in self.state.observations
         )
         missing_evidence = []
@@ -2652,7 +3469,7 @@ class Workflow:
                 "tool": "get_atom_environment",
                 "arguments": environment_arguments,
             })
-        if operation == "replace_hydrogen" and (index, parent_attempt) not in geometry_sites:
+        if site_type == "atom" and change_type == "addition" and (index, parent_attempt) not in geometry_sites:
             missing_evidence.append("growth space")
             growth_arguments = {"atom_index": index, "distance": 2.0}
             if parent_attempt is not None:
@@ -2661,10 +3478,10 @@ class Workflow:
                 "tool": "check_growth_space",
                 "arguments": growth_arguments,
             })
-        if operation == "replace_fragment" and not replacement_sites_queried:
+        if site_type in {"bond", "linker"} and not bond_sites_queried:
             missing_evidence.append("host-enumerated replacement site")
             recommended_queries.append({
-                "tool": "list_fragment_replacement_sites",
+                "tool": "list_bond_sites",
                 "arguments": {"limit": 50},
             })
         if self._search_policy()["mode"] == "adaptive":
@@ -2697,13 +3514,13 @@ class Workflow:
                 )
                 for item in self.state.observations
             )
-            if operation == "replace_fragment" and not library_match:
+            if site_type in {"bond", "linker"} and change_type == "replacement" and not library_match:
                 missing_evidence.append("selected fragment library record")
                 recommended_queries.append({
                     "tool": "search_fragment_library",
                     "arguments": {
                         "query": "",
-                        "operation": "replace_fragment",
+                        "change_type": "replacement",
                         "limit": 50,
                     },
                 })
@@ -2742,17 +3559,21 @@ class Workflow:
                 })
         if not exact_geometry:
             missing_evidence.append("exact accepted candidate geometry")
-            geometry_arguments = {
-                "operation": operation,
-                "fragment_smiles": transformation["fragment_smiles"],
+            geometry_arguments: dict[str, Any] = {
+                "site_type": site_type,
+                "change_type": change_type,
             }
+            if change_type in {"addition", "replacement"}:
+                geometry_arguments["fragment_smiles"] = transformation.get("fragment_smiles")
+            if change_type == "replacement" and site_type in {"atom", "ring"}:
+                geometry_arguments["element"] = transformation.get("element")
             if parent_attempt is not None:
                 geometry_arguments["parent_attempt"] = parent_attempt
                 geometry_arguments["replace_existing_substituent"] = True
             if transformation.get("fragment_id"):
                 geometry_arguments["fragment_id"] = transformation["fragment_id"]
-            if operation == "replace_fragment":
-                geometry_arguments["replacement_site_id"] = transformation["replacement_site_id"]
+            if site_type in {"bond", "linker"}:
+                geometry_arguments["bond_site_id"] = transformation["bond_site_id"]
             else:
                 geometry_arguments["edit_atom_index"] = index
             recommended_queries.append({
@@ -2762,9 +3583,10 @@ class Workflow:
         if missing_evidence:
             raise ReadyEvidenceError(transformation, missing_evidence, recommended_queries)
         self._emit("ready_gate_passed", {
-            "operation": operation,
+            "site_type": site_type,
+            "change_type": change_type,
             "edit_atom_index": index,
-            "replacement_site_id": transformation.get("replacement_site_id"),
+            "bond_site_id": transformation.get("bond_site_id"),
             "cut_bond": transformation.get("cut_bond"),
             "fragment_id": transformation.get("fragment_id"),
             "fragment_smiles": transformation.get("fragment_smiles"),
@@ -2783,6 +3605,57 @@ class Workflow:
                 configured.get("hard_max_attempts", self.context.task.get("max_edit_attempts", 30))
             ),
         }
+
+    def _termination_settings(self) -> dict[str, Any]:
+        """Hard termination policy, mirroring the llmdd-2 DesignTerminationPolicy."""
+        policy = self.context.task.get("termination_policy") or {}
+        return {
+            "max_consecutive_invalid_edits": int(policy.get("max_consecutive_invalid_edits", 3)),
+            "max_consecutive_policy_rejections": int(policy.get("max_consecutive_policy_rejections", 3)),
+            "max_consecutive_designer_failures": int(policy.get("max_consecutive_designer_failures", 3)),
+            "max_consecutive_no_improvement": int(policy.get("max_consecutive_no_improvement", 5)),
+        }
+
+    def _stop_reason_value(self, decision: dict[str, Any]) -> str | None:
+        """Return a valid STOP reason, or None when the decision lacks one."""
+        value = decision.get("stop_reason") or decision.get("reason")
+        return value if value in self.STOP_REASONS else None
+
+    def _completion_reason_value(self, decision: dict[str, Any]) -> str | None:
+        """Return a valid site-completion reason, or None when the decision lacks one."""
+        value = decision.get("completion_reason") or decision.get("reason")
+        return value if value in self.SITE_COMPLETION_REASONS else None
+
+    def _auto_close_active_target(self, non_improving: int) -> dict[str, Any] | None:
+        """Close the active target when consecutive non-improvement exhausts the budget."""
+        if non_improving < self._termination_settings()["max_consecutive_no_improvement"]:
+            return None
+        active = self.state.active_target
+        if not active:
+            return None
+        target_type = active.get("target_type")
+        target_id = active.get("target_id")
+        if not target_type or target_id is None or self._is_unmodifiable(target_type, target_id):
+            return None
+        decision = {
+            "action": "MARK_UNMODIFIABLE",
+            "target_type": target_type,
+            "target_id": target_id,
+            "scope": "site",
+            "completion_reason": "no_promising_edit",
+            "reason": "Host auto-close after consecutive non-improvement.",
+        }
+        try:
+            if self._record_unmodifiable(decision):
+                return {
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "completion_reason": "no_promising_edit",
+                    "source": "host_auto_close",
+                }
+        except RuntimeError:
+            pass
+        return None
 
     def _record_candidate_history(
         self,
@@ -2808,6 +3681,7 @@ class Workflow:
                 "canonical_smiles": candidate.get("canonical_smiles") or validation.get("canonical_smiles"),
                 "property_delta": validation.get("property_delta"),
                 "severe_clash_count": validation.get("severe_clash_count"),
+                "initial_receptor_clash_check": validation.get("initial_receptor_clash_check"),
                 "formal_charge": candidate.get("formal_charge"),
                 "heavy_atoms": candidate.get("heavy_atoms"),
                 "molecular_weight": candidate.get("molecular_weight"),
@@ -2832,9 +3706,11 @@ class Workflow:
 
     @staticmethod
     def _design_region(transformation: dict[str, Any]) -> str:
-        if transformation.get("operation") == "replace_fragment":
-            return f"replacement:{transformation.get('replacement_site_id')}"
-        return f"atom:{transformation.get('edit_atom_index')}"
+        site_type = Workflow._edit_site_type(transformation)
+        change_type = Workflow._edit_change_type(transformation)
+        if site_type in {"bond", "linker"}:
+            return f"{site_type}:{transformation.get('bond_site_id')}:{change_type}"
+        return f"{site_type}:{transformation.get('edit_atom_index')}:{change_type}"
 
     def _validated_design_regions(self) -> list[str]:
         regions = set()
@@ -2843,8 +3719,8 @@ class Workflow:
                 continue
             arguments = item.result.get("transformation") or item.arguments
             if (
-                arguments.get("operation") == "replace_fragment"
-                and not isinstance(arguments.get("replacement_site"), dict)
+                self._edit_site_type(arguments) in {"bond", "linker"}
+                and not isinstance(arguments.get("bond"), dict)
             ):
                 continue
             regions.add(self._design_region(arguments))
@@ -2860,45 +3736,53 @@ class Workflow:
 
     @staticmethod
     def _modification_family(transformation: dict[str, Any]) -> str:
-        if transformation.get("operation") == "replace_fragment":
-            return "fragment_replacement"
+        site_type = Workflow._edit_site_type(transformation)
+        change_type = Workflow._edit_change_type(transformation)
+        if change_type == "deletion":
+            return "substituent_deletion"
+        if site_type in {"atom", "ring"} and change_type == "replacement":
+            element = transformation.get("element")
+            return (
+                f"element_replacement:{str(element).upper()}" if element
+                else "element_replacement"
+            )
         smiles = transformation.get("fragment_smiles")
         if not isinstance(smiles, str):
-            return "other"
-        molecule = Chem.MolFromSmiles(smiles)
-        if molecule is None:
-            return "other"
-        dummy = [atom.GetIdx() for atom in molecule.GetAtoms() if atom.GetAtomicNum() == 0]
-        if dummy:
-            molecule = Chem.RWMol(molecule)
-            molecule.RemoveAtom(dummy[0])
-            molecule = molecule.GetMol()
-        symbols = {atom.GetSymbol().upper() for atom in molecule.GetAtoms()}
-        if symbols & {"F", "CL", "BR", "I"}:
-            return "halogen"
-        if any(
-            atom.GetIsAromatic() and atom.GetSymbol().upper() in {"N", "O", "S"}
-            for atom in molecule.GetAtoms()
-        ):
-            return "heteroaryl"
-        if symbols & {"N", "O", "S"}:
-            return "polar"
-        if symbols <= {"C"}:
-            return "alkyl"
-        return "other"
-
-    @classmethod
-    def _local_modification_family(cls, transformation: dict[str, Any]) -> str:
-        chemical_transformation = dict(transformation)
-        chemical_transformation["operation"] = "replace_hydrogen"
-        family = cls._modification_family(chemical_transformation)
-        if transformation.get("operation") == "replace_fragment":
+            family = "other"
+        else:
+            molecule = Chem.MolFromSmiles(smiles)
+            family = "other"
+            if molecule is not None:
+                dummy = [
+                    atom.GetIdx() for atom in molecule.GetAtoms() if atom.GetAtomicNum() == 0
+                ]
+                if dummy:
+                    molecule = Chem.RWMol(molecule)
+                    molecule.RemoveAtom(dummy[0])
+                    molecule = molecule.GetMol()
+                symbols = {atom.GetSymbol().upper() for atom in molecule.GetAtoms()}
+                if symbols & {"F", "CL", "BR", "I"}:
+                    family = "halogen"
+                elif any(
+                    atom.GetIsAromatic() and atom.GetSymbol().upper() in {"N", "O", "S"}
+                    for atom in molecule.GetAtoms()
+                ):
+                    family = "heteroaryl"
+                elif symbols & {"N", "O", "S"}:
+                    family = "polar"
+                elif symbols <= {"C"}:
+                    family = "alkyl"
+        if site_type in {"bond", "linker"}:
             return f"fragment_replacement:{family}"
         return family
 
+    @classmethod
+    def _local_modification_family(cls, transformation: dict[str, Any]) -> str:
+        return cls._modification_family(transformation)
+
     @staticmethod
-    def _replace_hydrogen_site_supported(atom: Chem.Atom) -> bool:
-        """Return whether the current single-bond editor supports replacing this H."""
+    def _addition_site_supported(atom: Chem.Atom) -> bool:
+        """Return whether the current single-bond editor supports attaching a fragment here."""
         if atom.GetAtomicNum() <= 1 or atom.GetTotalNumHs() < 1:
             return False
         # Aromatic [nH] substitution requires explicit tautomer/protonation handling.
@@ -2912,23 +3796,23 @@ class Workflow:
         editable_atoms = sorted(
             atom.GetIdx()
             for atom in hydrogen_atoms
-            if self._replace_hydrogen_site_supported(atom)
+            if self._addition_site_supported(atom)
         )
         host_ineligible_atoms = [
             {
                 "atom_index": atom.GetIdx(),
                 "element": atom.GetSymbol(),
                 "reason": (
-                    "The current replace_hydrogen editor does not support aromatic [nH] "
+                    "The current addition editor does not support aromatic [nH] "
                     "substitution without explicit tautomer/protonation handling."
                 ),
             }
             for atom in hydrogen_atoms
-            if not self._replace_hydrogen_site_supported(atom)
+            if not self._addition_site_supported(atom)
         ]
-        replacement_sites = [
-            site["replacement_site_id"]
-            for site in self.tools.list_fragment_replacement_sites(limit=100).get("sites", [])
+        bond_sites = [
+            site["bond_site_id"]
+            for site in self.tools.list_bond_sites(limit=100).get("sites", [])
         ]
         search_policy = self._search_policy()
         adaptive_search = search_policy["mode"] == "adaptive"
@@ -2945,7 +3829,7 @@ class Workflow:
         attempted_by_atom: dict[int, list[dict[str, Any]]] = {
             index: [] for index in tracked_atom_indices
         }
-        attempted_by_site: dict[str, list[dict[str, Any]]] = {site_id: [] for site_id in replacement_sites}
+        attempted_by_site: dict[str, list[dict[str, Any]]] = {site_id: [] for site_id in bond_sites}
 
         # candidate_history is retained as a compatibility source for older runs;
         # new runs use exploration_attempts, which includes rejected edits.
@@ -2981,14 +3865,14 @@ class Workflow:
 
         for item in records:
             transformation = item.get("transformation") or {}
-            operation = transformation.get("operation", "replace_hydrogen")
+            site_type = self._edit_site_type(transformation)
             record = coverage_record(item)
-            if operation == "replace_hydrogen":
+            if site_type in {"atom", "ring"}:
                 index = transformation.get("edit_atom_index")
                 if index in attempted_by_atom:
                     attempted_by_atom[index].append(record)
-            elif operation == "replace_fragment":
-                site_id = transformation.get("replacement_site_id")
+            elif site_type in {"bond", "linker"}:
+                site_id = transformation.get("bond_site_id")
                 if site_id in attempted_by_site:
                     attempted_by_site[site_id].append(record)
 
@@ -2998,8 +3882,8 @@ class Workflow:
             if self._is_unmodifiable("atom", index)
         }
         closed_sites = {
-            site_id for site_id in replacement_sites
-            if self._is_unmodifiable("replacement_site", site_id)
+            site_id for site_id in bond_sites
+            if self._is_unmodifiable("bond", site_id)
         }
 
         def family_closed(target_type: str, target_id: Any, family: str) -> bool:
@@ -3021,7 +3905,8 @@ class Workflow:
         for item in self.state.docking_history:
             transformation = item.get("transformation") or {}
             if (
-                transformation.get("operation") == "replace_hydrogen"
+                self._edit_site_type(transformation) == "atom"
+                and self._edit_change_type(transformation) == "addition"
                 and self._modification_family(transformation) == "halogen"
                 and isinstance(item.get("raw_quality_from_mean"), (int, float))
                 and float(item["raw_quality_from_mean"]) > 0
@@ -3038,7 +3923,7 @@ class Workflow:
                 all_families.add(family)
             elif item.get("scope") == "site":
                 all_families.add(
-                    "fragment_replacement" if item.get("target_type") == "replacement_site" else "non_halogen"
+                    "fragment_replacement" if item.get("target_type") == "bond" else "non_halogen"
                 )
         families = sorted(all_families)
 
@@ -3069,26 +3954,29 @@ class Workflow:
             distinct = distinct_fragments(site_records)
             if site_id not in closed_sites and len(distinct) < 2:
                 missing_replacement_coverage.append({
-                    "replacement_site_id": site_id,
+                    "bond_site_id": site_id,
                     "attempt_count": len(site_records),
                     "distinct_fragments": sorted(distinct),
                     "required_distinct_fragments": 2,
                 })
 
         missing_atoms = [index for index in editable_atoms if index not in closed_atoms and not attempted_by_atom[index]]
-        missing_sites = [site_id for site_id in replacement_sites if site_id not in closed_sites and not attempted_by_site[site_id]]
+        missing_sites = [site_id for site_id in bond_sites if site_id not in closed_sites and not attempted_by_site[site_id]]
         halogen_hits_without_non_halogen = [
             index for index in sorted(best_halogen_hit_atoms)
             if not family_closed("atom", index, "non_halogen")
             and "non_halogen" not in seen_atom_families(index)
         ]
+        fragment_replacement_seen = any(
+            str(item).startswith("fragment_replacement") for item in families
+        )
         missing_global_families = [
             family for family in ("halogen", "non_halogen", "fragment_replacement")
             if (
                 family == "halogen" and "halogen" not in families
                 or family == "non_halogen"
                 and not any(item in families for item in ("alkyl", "polar", "heteroaryl", "other", "non_halogen"))
-                or family == "fragment_replacement" and "fragment_replacement" not in families
+                or family == "fragment_replacement" and not fragment_replacement_seen
             )
         ]
         missing_target_diversity = []
@@ -3097,8 +3985,8 @@ class Workflow:
                 {"target_type": "atom", "target_id": index}
                 for index in editable_atoms if index not in closed_atoms
             ] + [
-                {"target_type": "replacement_site", "target_id": site_id}
-                for site_id in replacement_sites if site_id not in closed_sites
+                {"target_type": "bond", "target_id": site_id}
+                for site_id in bond_sites if site_id not in closed_sites
             ]
             complete = not open_targets
         else:
@@ -3116,8 +4004,8 @@ class Workflow:
             })
         for site_id in missing_sites:
             pending_obligations.append({
-                "type": "replacement_site",
-                "replacement_site_id": site_id,
+                "type": "bond",
+                "bond_site_id": site_id,
                 "required_action": "attempt a fragment or use MARK_UNMODIFIABLE",
             })
         for item in missing_atom_coverage:
@@ -3131,7 +4019,7 @@ class Workflow:
         for item in missing_replacement_coverage:
             pending_obligations.append({
                 "type": "replacement_fragments",
-                "replacement_site_id": item["replacement_site_id"],
+                "bond_site_id": item["bond_site_id"],
                 "additional_distinct_fragments_required": (
                     item["required_distinct_fragments"] - len(item["distinct_fragments"])
                 ),
@@ -3225,17 +4113,17 @@ class Workflow:
             "editable_hydrogen_atoms": editable_atoms,
             "host_ineligible_hydrogen_atoms": host_ineligible_atoms,
             "atom_clearance": {str(index): clearance for index, clearance in atom_clearance.items()},
-            "replacement_sites": replacement_sites,
+            "bond_sites": bond_sites,
             "exploration_attempts": self._llm_safe_value(self.state.exploration_attempts),
             "unmodifiable_targets": self._llm_safe_value(self.state.unmodifiable_targets),
             "attempted_atoms": {str(index): records for index, records in attempted_by_atom.items() if records},
-            "attempted_replacement_sites": {site_id: records for site_id, records in attempted_by_site.items() if records},
+            "attempted_bond_sites": {site_id: records for site_id, records in attempted_by_site.items() if records},
             "closed_atoms": sorted(closed_atoms),
-            "closed_replacement_sites": sorted(closed_sites),
+            "closed_bond_sites": sorted(closed_sites),
             "modification_families_seen": families,
             "missing_edit_atoms": missing_atoms,
             "missing_atom_coverage": missing_atom_coverage,
-            "missing_replacement_sites": missing_sites,
+            "missing_bond_sites": missing_sites,
             "missing_replacement_coverage": missing_replacement_coverage,
             "halogen_hit_atoms_missing_non_halogen_followup": halogen_hits_without_non_halogen,
             "missing_global_families": missing_global_families,
@@ -3262,8 +4150,6 @@ class Workflow:
 
     def _stop_gate_rejection(self) -> dict[str, Any] | None:
         coverage = self._global_search_coverage()
-        # Optimization mode seeks a diverse high-quality portfolio under a
-        # finite budget; exhaustive site closure belongs to coverage mode.
         if coverage["policy"]["mode"] == "optimization":
             return None
         if coverage["complete"]:
@@ -3290,6 +4176,41 @@ class Workflow:
             ),
         }
 
+    def _update_sar_memory(
+        self, attempt: int, transformation: dict[str, Any], docking_entry: dict[str, Any]
+    ) -> None:
+        """Persist a bounded, structured local SAR observation for every docked candidate."""
+        evidence = docking_entry.get("pose_evidence") or {}
+        rmsd = evidence.get("rmsd") or {}
+        pose = evidence.get("pose") or {}
+        interactions = evidence.get("interactions") or {}
+        self.state.sar_memory.append({
+            "attempt": attempt,
+            "target": self._transformation_target(transformation),
+            "parent_attempt": transformation.get("parent_attempt"),
+            "operation": transformation.get("operation"),
+            "fragment_id": transformation.get("fragment_id"),
+            "fragment_smiles": transformation.get("fragment_smiles"),
+            "delta_candidate_minus_reference": docking_entry.get("delta_candidate_minus_reference"),
+            "seed_win_fraction": docking_entry.get("seed_win_fraction"),
+            "seed_stddev": docking_entry.get("seed_stddev"),
+            "quality": docking_entry.get("quality"),
+            "status": docking_entry.get("status"),
+            "native_like": evidence.get("native_like"),
+            "mean_core_rmsd_to_frozen_reference": rmsd.get("mean_core_rmsd_to_frozen_reference"),
+            "max_core_rmsd_to_frozen_reference": rmsd.get("max_core_rmsd_to_frozen_reference"),
+            "pose_classification": pose.get("classification"),
+            "pose_family_seeds": pose.get("family_seeds", []),
+            "retained_interactions": interactions.get("retained_consensus", []),
+            "gained_interactions": interactions.get("gained_consensus", []),
+            "lost_interactions": interactions.get("lost_consensus", []),
+            "evidence_status": evidence.get("status"),
+            "interpretation_boundary": (
+                "This is an observed structure/docking comparison. It is not an experimental activity label."
+            ),
+        })
+        self.state.sar_memory = self.state.sar_memory[-128:]
+
     def _record_docking_result(
         self,
         attempt: int,
@@ -3307,6 +4228,7 @@ class Workflow:
         seed_stddev = None
         seed_win_fraction = None
         stability_eligible = False
+        coverage_penalty = 0.0
         if isinstance(metric, dict):
             summary = metric.get("delta_candidate_minus_reference") or {}
             value = summary.get("mean")
@@ -3320,11 +4242,17 @@ class Workflow:
                 seed_win_fraction = (
                     float(win_fraction) if isinstance(win_fraction, (int, float)) else 0.0
                 )
-                stability_eligible = (
+                retention_passed = (not docking.get("pose_retention") or
+                                    (docking.get("status") == "complete" and
+                                     docking["pose_retention"].get("status") == "passed"))
+                stability_eligible = (retention_passed and
                     seed_win_fraction + 1e-9 >= settings["minimum_seed_win_fraction"]
                 )
+                if docking.get("pose_retention"):
+                    coefficient = float((self.context.task.get("pose_retention") or {}).get("missing_seed_penalty", 1.0))
+                    coverage_penalty = coefficient * (1.0 - docking.get("paired_seed_fraction", 0.0))
                 if stability_eligible:
-                    quality = raw_quality - settings["seed_stddev_penalty"] * seed_stddev
+                    quality = raw_quality - settings["seed_stddev_penalty"] * seed_stddev - coverage_penalty
 
         previous_best = self.state.convergence.get("best_quality")
         minimum = settings["minimum_improvement"]
@@ -3345,6 +4273,7 @@ class Workflow:
             if is_significant_improvement
             else int(self.state.convergence.get("non_improving_attempts", 0)) + 1
         )
+        auto_closed_target = self._auto_close_active_target(non_improving)
 
         entry = {
             "attempt": attempt,
@@ -3359,6 +4288,9 @@ class Workflow:
             "direction": direction,
             "delta_candidate_minus_reference": delta,
             "raw_quality_from_mean": raw_quality,
+            "seed_coverage_penalty": coverage_penalty,
+            "pose_retention": docking.get("pose_retention"),
+            "paired_seed_fraction": docking.get("paired_seed_fraction"),
             "seed_stddev": seed_stddev,
             "seed_win_fraction": seed_win_fraction,
             "seed_stddev_penalty": settings["seed_stddev_penalty"],
@@ -3374,9 +4306,12 @@ class Workflow:
             "best_attempt_so_far": best_attempt,
             "comparison": docking.get("comparison"),
             "pose_consensus": docking.get("pose_consensus"),
+            "pose_evidence": docking.get("pose_evidence"),
             "interaction_consensus": docking.get("interaction_consensus"),
+            "plip_comparison": docking.get("plip_comparison"),
         }
         self.state.docking_history.append(entry)
+        self._update_sar_memory(attempt, transformation, entry)
         self._refresh_site_search()
         scored_count = sum(
             item.get("raw_quality_from_mean") is not None for item in self.state.docking_history
@@ -3386,11 +4321,23 @@ class Workflow:
         )
         validated_regions = self._validated_design_regions()
         docked_regions = self._docked_design_regions()
-        global_search = {} if self._batch_enabled() else self._global_search_coverage()
+        global_search = self._global_search_coverage()
         best_entry = next(
             (item for item in self.state.docking_history if item.get("attempt") == best_attempt),
             None,
         )
+        best_confirmation = (best_entry or {}).get("confirmation") or {}
+        best_uses_confirmation = (
+            isinstance(best_quality, (int, float))
+            and isinstance(best_confirmation.get("quality"), (int, float))
+            and abs(float(best_quality) - float(best_confirmation["quality"])) < 1e-12
+        )
+        best_delta = (
+            best_confirmation.get("delta_candidate_minus_reference")
+            if best_uses_confirmation else
+            best_entry.get("delta_candidate_minus_reference") if best_entry else None
+        )
+        best_direction = (best_entry or {}).get("direction")
         self.state.convergence = {
             "status": "searching",
             "converged": False,
@@ -3404,23 +4351,27 @@ class Workflow:
             "minimum_seed_win_fraction": settings["minimum_seed_win_fraction"],
             "best_attempt": best_attempt,
             "best_quality": best_quality,
-            "best_delta_candidate_minus_reference": (
-                best_entry.get("delta_candidate_minus_reference") if best_entry else None
-            ),
+            "best_delta_candidate_minus_reference": best_delta,
             "best_reference_hit": bool(
-                best_entry and best_entry.get("raw_quality_from_mean", 0) > 0
+                isinstance(best_delta, (int, float))
+                and (
+                    best_delta < 0
+                    if best_direction == "lower_is_better"
+                    else best_delta > 0
+                )
             ),
+            "selection_stage": "confirmation" if best_uses_confirmation else "screening",
             "non_improving_attempts": non_improving,
+            "auto_close_recommended": bool(auto_closed_target),
+            "auto_closed_target": auto_closed_target,
+            "termination_policy": self._termination_settings(),
             "validated_design_regions": validated_regions,
             "docked_design_regions": docked_regions,
             "design_region_count_is_descriptive_only": True,
             "global_search": global_search,
             "next_decision": (
-                "Review the portfolio and choose another evidence-backed batch, confirmation, or STOP. "
-                "No exhaustive site-closure gate applies."
-                if self._batch_enabled() else
-                "LLM should continue with a new evidence-backed transformation. STOP is blocked until "
-                "global_search.complete is true, unless hard_max_attempts is reached."
+                "LLM should continue with a new evidence-backed transformation at the active target. "
+                "STOP is blocked until global_search.complete is true, unless hard_max_attempts is reached."
             ),
         }
         self._emit("docking_scored", {
@@ -3452,6 +4403,11 @@ class Workflow:
         stopping_reason: str,
     ) -> dict[str, Any]:
         best_attempt = self.state.convergence.get("best_attempt")
+        if not history or ((self.context.task.get("pose_retention") or {}).get("enabled")
+                           and not isinstance(best_attempt, int)):
+            return {"status": "no_candidate_accepted", "stopping_reason": stopping_reason,
+                    "attempts": history, "docking_history": self.state.docking_history,
+                    "reason": "No scored, pose-gated candidate met the seed stability/win policy"}
         if not isinstance(best_attempt, int):
             best_attempt = next(
                 (item["attempt"] for item in reversed(history) if item.get("docking")),
@@ -3463,22 +4419,32 @@ class Workflow:
         )
         self.state.convergence["termination_reason"] = stopping_reason
         self.state.convergence["converged"] = False
-        self.state.convergence["global_search"] = (
-            {} if self._batch_enabled() else self._global_search_coverage()
-        )
+        self.state.convergence["global_search"] = self._global_search_coverage()
         rbfe = {
             "stage": "rbfe",
             "status": "deferred",
             "message": "RBFE is intentionally deferred until docking pose selection and ligand mapping are validated.",
         }
+        best_evaluation = best.get("confirmation") or best.get("docking", {})
+        confirmation_pose_stable = (
+            (best.get("confirmation") or {}).get("pose_consensus") or {}
+        ).get("stable")
+        output_status = (
+            "candidate_provisional"
+            if best.get("confirmation") and confirmation_pose_stable is False
+            else "candidate_accepted"
+        )
         return {
-            "status": "candidate_accepted",
+            "status": output_status,
             "stopping_reason": stopping_reason,
             "best_attempt": best_attempt,
-            "candidate_path": best["candidate_path"],
+            "candidate_path": best_evaluation.get("evaluation_pose_path", best["candidate_path"]),
+            "constructed_candidate_path": best["candidate_path"],
+            "evaluation_pose_paths": best_evaluation.get("evaluation_pose_paths", {}),
             "reference_path": str(reference_path),
             "attempts": history,
-            "docking": best.get("confirmation") or best.get("docking", {}),
+            "docking": best_evaluation,
+            "confirmation_pose_stable": confirmation_pose_stable,
             "docking_history": self.state.docking_history,
             "elite_archive": self.state.elite_archive,
             "convergence": self.state.convergence,
@@ -3486,438 +4452,29 @@ class Workflow:
             "fep": rbfe,
         }
 
-    def _batch_screen_and_dock(
-        self,
-        planned: list[dict[str, Any]],
-        history: list[dict[str, Any]],
-        seen_candidate_smiles: dict[str, int],
-        reference_path: Path,
-        receptor_path: Path,
-    ) -> dict[str, Any]:
-        """Screen one LLM batch, then dock accepted structures without another LLM turn."""
-        screening = {
-            "candidates": [
-                {
-                    **item["candidate"],
-                    **item["transformation"],
-                    "parent_attempt": item["transformation"].get("parent_attempt"),
-                    "target_type": item["candidate"].get("target_type"),
-                    "target_id": item["candidate"].get("target_id"),
-                    "hypothesis": item["candidate"].get("hypothesis"),
-                }
-                for item in planned
-            ]
-        }
-        screen_result = self.tools.screen_candidate_batch(screening["candidates"])
-        accepted = screen_result.get("accepted", [])
-        rejected = screen_result.get("rejected", [])
-        for item in accepted + rejected:
-            transformation = item.get("transformation") or {}
-            self._record_exploration_attempt(
-                transformation,
-                "batch_geometry_accepted" if item in accepted else "geometry_rejected",
-                "batch_plan",
-                reason=item.get("error"),
-            )
-        batch_result = {
-            "batch_round": self.state.batch_round,
-            "submitted": len(planned),
-            "geometry_accepted": len(accepted),
-            "geometry_rejected": len(rejected),
-            "screening": [
-                {
-                    "position": item.get("position"),
-                    "target_type": self._transformation_target(item.get("transformation") or {}).get("target_type"),
-                    "target_id": self._transformation_target(item.get("transformation") or {}).get("target_id"),
-                    "transformation": self._compact_transformation(item.get("transformation")),
-                    "status": item.get("status"),
-                    "canonical_smiles": item.get("canonical_smiles"),
-                    "failure_class": item.get("failure_class"),
-                    "error": item.get("error"),
-                    "hypothesis": item.get("hypothesis"),
-                }
-                for item in accepted + rejected
-            ],
-            "docking": [],
-        }
-        if not reference_path.exists():
-            write_sdf(EditResult(self.context.ligand, {"status": "reference"}), reference_path, name="reference-ligand")
-        if not receptor_path.exists():
-            self.context.write_receptor_pdb(receptor_path)
-        settings = self._batch_settings()
-        for item in accepted:
-            transformation = dict(item.get("transformation") or {})
-            candidate_smiles = item.get("canonical_smiles")
-            if not isinstance(candidate_smiles, str) or candidate_smiles in seen_candidate_smiles:
-                continue
-            attempt = len(history) + 1
-            seen_candidate_smiles[candidate_smiles] = attempt
-            parent_attempt = transformation.get("parent_attempt")
-            parent = self._resolve_parent_candidate(parent_attempt)
-            result = apply_transformation(parent, transformation, self.context.protein_atoms, seed=17)
-            self.state.evidence.add("candidate_geometry")
-            self._emit("candidate_geometry_accepted", {
-                "attempt": attempt,
-                "canonical_smiles": candidate_smiles,
-                "property_delta": result.report.get("property_delta"),
-            })
-            target = self._transformation_target(transformation)
-            site_key = self._target_key(target["target_type"], target["target_id"])
-            site_state = self.state.site_board.setdefault(site_key, {
-                "target_type": target["target_type"], "target_id": target["target_id"],
-                "status": "screening", "attempts": 0, "best_quality": None,
-            })
-            site_state["attempts"] = int(site_state.get("attempts", 0)) + 1
-            candidate_path = self.run_dir / f"candidate-{attempt:02d}.sdf"
-            write_sdf(result, candidate_path, name=f"candidate-{attempt:02d}")
-            report = {
-                "attempt": attempt,
-                "parent_attempt": parent_attempt,
-                "generation": transformation.get("generation", 1),
-                "decision": {"action": "PLAN_BATCH", "candidate": item.get("hypothesis")},
-                "transformation": transformation,
-                "validation": result.report,
-                "candidate_path": str(candidate_path),
-            }
-            self._emit("docking_started", {"attempt": attempt, "candidate_path": str(candidate_path)})
-            docking = self.docking_adapter.run_with_reference_baseline(
-                candidate_path=candidate_path,
-                receptor_path=receptor_path,
-                reference_path=reference_path,
-                output_dir=self.run_dir / f"docking-attempt-{attempt:02d}",
-                reference_output_dir=self.run_dir / "docking-reference-baseline",
-                reference_result=self.reference_docking_result,
-                seeds_override=settings["screening_seeds"],
-            ) if hasattr(self.docking_adapter, "run_with_reference_baseline") else self.docking_adapter.run(
-                candidate_path=candidate_path,
-                receptor_path=receptor_path,
-                reference_path=reference_path,
-                output_dir=self.run_dir / f"docking-attempt-{attempt:02d}",
-            )
-            report["docking"] = docking
-            history.append(report)
-            self._emit("docking_completed", {
-                "attempt": attempt,
-                "status": docking.get("status"),
-                "seed_count": docking.get("seed_count"),
-                "pose_count_per_seed": docking.get("pose_count_per_seed"),
-                "error": docking.get("error") or docking.get("message"),
-            })
-            self._record_candidate_history(report, transformation)
-            if docking.get("status") == "complete":
-                baseline = docking.get("reference_baseline")
-                if isinstance(baseline, dict) and baseline.get("status") == "complete":
-                    self.reference_docking_result = baseline
-                trend = self._record_docking_result(attempt, transformation, candidate_path, docking)
-                trend["evaluation_stage"] = "screening"
-                self._update_working_memory(transformation=transformation, docking_entry=trend)
-                if isinstance(trend.get("quality"), (int, float)) and (
-                    site_state.get("best_quality") is None
-                    or float(trend["quality"]) > float(site_state["best_quality"])
-                ):
-                    site_state["best_quality"] = float(trend["quality"])
-                    site_state["best_attempt"] = attempt
-                if trend.get("stability_eligible"):
-                    self.parent_candidates[attempt] = Chem.Mol(result.molecule)
-                    self.parent_metadata[attempt] = {
-                        "attempt": attempt,
-                        "generation": transformation.get("generation", 1),
-                        "target_type": self._transformation_target(transformation)["target_type"],
-                        "target_id": self._transformation_target(transformation)["target_id"],
-                        "quality": trend.get("quality"),
-                        "canonical_smiles": candidate_smiles,
-                        "candidate_path": str(candidate_path),
-                    }
-                batch_result["docking"].append({
-                    "attempt": attempt,
-                    "status": docking.get("status"),
-                    "quality": trend.get("quality"),
-                    "delta": trend.get("delta_candidate_minus_reference"),
-                    "seed_win_fraction": trend.get("seed_win_fraction"),
-                    "seed_stddev": trend.get("seed_stddev"),
-                    "is_new_best": trend.get("is_new_best"),
-                    "pose_consensus": trend.get("pose_consensus"),
-                    "interaction_consensus": trend.get("interaction_consensus"),
-                })
-            else:
-                batch_result["docking"].append({"attempt": attempt, "status": docking.get("status"), "error": docking.get("error")})
-            self._write_json(f"edit-attempt-{attempt:02d}.json", report)
-        self._write_json("docking-history.json", {"history": self.state.docking_history, "convergence": self.state.convergence})
-        self._record_batch_observation(batch_result)
-        return batch_result
 
-    def _batch_confirm(self, decision: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, Any]:
-        settings = self._batch_settings()
-        ids = decision.get("candidate_ids")
-        if not isinstance(ids, list) or not ids or len(ids) > settings["max_confirmation_candidates"]:
-            raise RuntimeError("CONFIRM requires a bounded non-empty candidate_ids array")
-        confirmations = []
-        for value in ids:
-            try:
-                attempt = int(str(value).split("-")[-1])
-            except ValueError as error:
-                raise RuntimeError(f"Invalid confirmation candidate ID: {value}") from error
-            report = next((item for item in history if item.get("attempt") == attempt), None)
-            if report is None or not report.get("candidate_path"):
-                raise RuntimeError(f"Unknown confirmation candidate: {value}")
-            if hasattr(self.docking_adapter, "run_with_reference_baseline"):
-                docking = self.docking_adapter.run_with_reference_baseline(
-                    candidate_path=Path(report["candidate_path"]),
-                    receptor_path=self.run_dir / "receptor-protein-only.pdb",
-                    reference_path=self.run_dir / "reference-ligand.sdf",
-                    output_dir=self.run_dir / f"confirmation-attempt-{attempt:02d}",
-                    reference_output_dir=self.run_dir / "docking-reference-baseline",
-                    reference_result=self.reference_docking_result,
-                    seeds_override=settings["confirmation_seeds"],
-                )
-            else:
-                docking = self.docking_adapter.run(
-                    candidate_path=Path(report["candidate_path"]),
-                    receptor_path=self.run_dir / "receptor-protein-only.pdb",
-                    reference_path=self.run_dir / "reference-ligand.sdf",
-                    output_dir=self.run_dir / f"confirmation-attempt-{attempt:02d}",
-                )
-            report["confirmation"] = docking
-            metric_name = self._optimization_settings()["primary_metric"]
-            metric = ((docking.get("comparison") or {}).get("metrics") or {}).get(metric_name) or {}
-            delta_summary = metric.get("delta_candidate_minus_reference") or {}
-            delta = delta_summary.get("mean")
-            direction = metric.get("direction")
-            raw_quality = (
-                (-float(delta) if direction == "lower_is_better" else float(delta))
-                if isinstance(delta, (int, float)) else None
-            )
-            seed_stddev = float(delta_summary.get("stddev", 0.0) or 0.0)
-            seed_win_fraction = float(metric.get("candidate_better_seed_fraction", 0.0) or 0.0)
-            eligible = (
-                raw_quality is not None
-                and seed_win_fraction + 1e-9 >= self._optimization_settings()["minimum_seed_win_fraction"]
-            )
-            confirmed_quality = (
-                raw_quality - self._optimization_settings()["seed_stddev_penalty"] * seed_stddev
-                if eligible else None
-            )
-            trend = next((item for item in self.state.docking_history if item.get("attempt") == attempt), None)
-            if trend is not None:
-                trend["confirmation"] = {
-                    "status": docking.get("status"),
-                    "primary_metric": metric_name,
-                    "delta_candidate_minus_reference": delta,
-                    "seed_stddev": seed_stddev,
-                    "seed_win_fraction": seed_win_fraction,
-                    "stability_eligible": eligible,
-                    "quality": confirmed_quality,
-                    "pose_consensus": docking.get("pose_consensus"),
-                    "interaction_consensus": docking.get("interaction_consensus"),
-                }
-            candidate_record = next((item for item in self.state.candidate_history if item.get("attempt") == attempt), None)
-            if candidate_record is not None:
-                candidate_record["confirmation"] = {
-                    "status": docking.get("status"),
-                    "comparison": docking.get("comparison"),
-                    "pose_consensus": docking.get("pose_consensus"),
-                    "interaction_consensus": docking.get("interaction_consensus"),
-                }
-            confirmations.append({
-                "attempt": attempt,
-                "status": docking.get("status"),
-                "confirmed_quality": confirmed_quality,
-                "stability_eligible": eligible,
-                "comparison": docking.get("comparison"),
-                "pose_consensus": docking.get("pose_consensus"),
-                "interaction_consensus": docking.get("interaction_consensus"),
-            })
-            self._write_json(f"edit-attempt-{attempt:02d}.json", report)
-        confirmed = [
-            item for item in confirmations if isinstance(item.get("confirmed_quality"), (int, float))
-        ]
-        if confirmed:
-            best_confirmed = max(confirmed, key=lambda item: float(item["confirmed_quality"]))
-            self.state.convergence["best_attempt"] = best_confirmed["attempt"]
-            self.state.convergence["best_quality"] = best_confirmed["confirmed_quality"]
-            self.state.convergence["selection_stage"] = "confirmation"
-        self._write_json("docking-history.json", {
-            "history": self.state.docking_history,
-            "convergence": self.state.convergence,
-        })
-        self._write_json("state-checkpoint.json", self.state.compact_view())
-        return {"action": "CONFIRM", "confirmations": confirmations}
 
-    def portfolio_optimize(self, resume: bool = False) -> dict[str, Any]:
-        """Run bounded multi-site, batch-planned optimization."""
-        settings = self._batch_settings()
-        history: list[dict[str, Any]] = []
-        seen: dict[str, int] = {}
-        reference_path = self.run_dir / "reference-ligand.sdf"
-        receptor_path = self.run_dir / "receptor-protein-only.pdb"
-        self._design_phase = True
-        if resume:
-            reports, progress = self._restore_run_state()
-            history = list(reports)
-            for report in reports:
-                canonical = ((report.get("validation") or {}).get("candidate") or {}).get("canonical_smiles")
-                if isinstance(canonical, str):
-                    seen[canonical] = int(report["attempt"])
-            if self.state.design_dossier is None:
-                self._batch_dossier()
-        else:
-            self._batch_dossier()
-        self.state.site_board = self.state.site_board or {}
-        instruction = (
-            "Continue from the restored portfolio without repeating completed transformations. Review the current "
-            "site board and prior batches, then return PLAN_BATCH, CONFIRM, or STOP."
-            if resume else
-            "Use the supplied design dossier to plan the first multi-site screening batch. Select chemically "
-            "diverse library fragments for several plausible targets. Return PLAN_BATCH with at most the configured "
-            "batch size; do not query basic fragment properties already supplied."
-        )
-        decisions = 0
-        query_only_rounds = 0
-        decision = self._repair_decision(
-            self.client.complete_json(self._batch_payload(instruction)),
-            self._batch_payload(instruction),
-            "portfolio_planning",
-        )
-        while decisions < settings["max_llm_decisions"] and self.state.batch_round < settings["max_batches"]:
-            decisions += 1
-            action = decision.get("action")
-            if action in {"QUERY", "QUERY_BATCH"}:
-                query_only_rounds += 1
-                if query_only_rounds > settings["max_query_only_rounds"]:
-                    rejection = {
-                        "status": "rejected",
-                        "failure_class": "query_only_budget_exhausted",
-                        "instruction": "The query-only budget is exhausted. Return PLAN_BATCH, CONFIRM, or STOP now.",
-                    }
-                    decision = self._repair_decision(
-                        self.client.complete_json(self._batch_payload(rejection["instruction"], rejection)),
-                        self._batch_payload(rejection["instruction"], rejection),
-                        "portfolio_planning",
-                    )
-                    query_only_rounds = settings["max_query_only_rounds"]
-                    continue
-                self._validate_portfolio_query(decision)
-                self._handle_decision(decision)
-                decision = self._repair_decision(
-                    self.client.complete_json(self._batch_payload(
-                        "Use the new evidence to return PLAN_BATCH, CONFIRM, or STOP. Do not query supplied facts."
-                    )),
-                    self._batch_payload("Use the new evidence to return PLAN_BATCH, CONFIRM, or STOP. Do not query supplied facts."),
-                    "portfolio_planning",
-                )
-                continue
-            if action == "PLAN_BATCH":
-                query_only_rounds = 0
-                self._record_decision(decision)
-                try:
-                    planned = self._validate_batch_plan(decision)
-                except (RuntimeError, ValueError) as error:
-                    rejection = {
-                        "status": "rejected",
-                        "failure_class": "invalid_batch_plan",
-                        "error": str(error),
-                        "instruction": "Correct the PLAN_BATCH using only dossier-listed targets and fragment IDs; then return PLAN_BATCH, CONFIRM, or STOP.",
-                    }
-                    self.state.tool_rejections.append(rejection)
-                    decision = self._repair_decision(
-                        self.client.complete_json(self._batch_payload(rejection["instruction"], rejection)),
-                        self._batch_payload(rejection["instruction"], rejection),
-                        "portfolio_planning",
-                    )
-                    continue
-                used_screening = sum(int(item.get("submitted", 0)) for item in self.state.batch_history)
-                remaining_screening = settings["max_screening_candidates"] - used_screening
-                if remaining_screening <= 0:
-                    break
-                planned = planned[:remaining_screening]
-                self.state.batch_round += 1
-                result = self._batch_screen_and_dock(
-                    planned, history, seen, reference_path, receptor_path,
-                )
-                if not result["docking"] and not history:
-                    break
-                stagnation = settings["stagnation_batches"]
-                recent_batches = self.state.batch_history[-stagnation:]
-                if (
-                    stagnation > 0
-                    and len(recent_batches) == stagnation
-                    and not any(
-                        docking.get("is_new_best")
-                        for batch in recent_batches
-                        for docking in batch.get("docking", [])
-                    )
-                ):
-                    decision = {
-                        "action": "STOP",
-                        "reason": f"No new portfolio best was found in the last {stagnation} batches.",
-                        "evidence": "The configured stagnation batch limit was reached.",
-                    }
-                    self._record_decision(decision)
-                    break
-                decision = self._repair_decision(
-                    self.client.complete_json(self._batch_payload(
-                        "Review the latest batch feedback. Promote improving sites, deprioritize or discard clearly "
-                        "inferior sites, then return PLAN_BATCH for the next batch, CONFIRM for a few finalists, or STOP.",
-                        result,
-                    )),
-                    self._batch_payload("Review the latest batch feedback and choose PLAN_BATCH, CONFIRM, or STOP.", result),
-                    "portfolio_planning",
-                )
-                continue
-            if action == "CONFIRM":
-                self._record_decision(decision)
-                try:
-                    confirmation = self._batch_confirm(decision, history)
-                except RuntimeError as error:
-                    rejection = {
-                        "status": "rejected",
-                        "failure_class": "invalid_confirmation",
-                        "error": str(error),
-                        "instruction": "Choose only existing screening candidate IDs within the confirmation budget, or return PLAN_BATCH/STOP.",
-                    }
-                    self.state.tool_rejections.append(rejection)
-                    decision = self._repair_decision(
-                        self.client.complete_json(self._batch_payload(rejection["instruction"], rejection)),
-                        self._batch_payload(rejection["instruction"], rejection),
-                        "portfolio_planning",
-                    )
-                    continue
-                decision = self._repair_decision(
-                    self.client.complete_json(self._batch_payload(
-                        "Review the confirmation results. Return STOP if the portfolio is adequate; otherwise return "
-                        "one final PLAN_BATCH only when a clearly supported new direction remains.",
-                        confirmation,
-                    )),
-                    self._batch_payload("Review confirmation results and return STOP or a justified PLAN_BATCH.", confirmation),
-                    "portfolio_planning",
-                )
-                continue
-            if action == "STOP":
-                self._record_decision(decision)
-                break
-            raise RuntimeError(f"Unsupported portfolio action: {action!r}")
-        if not history:
-            return {"status": "no_candidate_accepted", "stopping_reason": "portfolio_no_candidate", "attempts": history}
-        if not any(report.get("confirmation") for report in history):
-            quality_by_attempt = {
-                item.get("attempt"): item.get("quality") for item in self.state.docking_history
-            }
-            ranked = sorted(
-                history,
-                key=lambda report: (
-                    quality_by_attempt.get(report.get("attempt")) is not None,
-                    float(quality_by_attempt.get(report.get("attempt")) or float("-inf")),
-                ),
-                reverse=True,
-            )
-            finalists = [
-                f"attempt-{int(report['attempt']):02d}"
-                for report in ranked[: settings["max_confirmation_candidates"]]
-            ]
-            if finalists:
-                self._batch_confirm({"action": "CONFIRM", "candidate_ids": finalists}, history)
-        reason = "llm_stop" if decision.get("action") == "STOP" else "portfolio_budget_limit"
-        return self._accepted_output(history, reference_path, reason)
+
+
+
+
+    def _construct_candidate(self, parent: Chem.Mol, transformation: dict[str, Any]) -> EditResult:
+        result = apply_transformation(parent, transformation, self.context.protein_atoms, seed=17)
+        policy = (self.context.task.get("candidate_construction") or {}).get("initial_receptor_clash_policy", "reject")
+        if policy == "defer_to_docking" and result.report.get("failure_class") == "steric_clash":
+            retention = self.context.task.get("pose_retention") or {}
+            if not self.closed_pool or not retention.get("enabled") or not retention.get("maximum_heavy_atom_overlap"):
+                raise RuntimeError("Initial clashes may be deferred only in a closed pool with a hard final-pose steric gate")
+            result.report["initial_receptor_clash_check"] = {
+                "status": "deferred_to_docking", "original_status": result.report["status"],
+                "severe_clash_count": result.report.get("severe_clash_count"),
+                "details": result.report.get("rejection_details"),
+                "meaning": "A single receptor-free construction conformer is not a binding pose; final docked heavy-atom clashes remain a hard gate."}
+            result.report.update(status="accepted", failure_class="none", geometry_gate_stage="docked_evaluation_pose",
+                rejection_details={"failure_class": None,
+                    "message": "Initial receptor clashes recorded separately; hard steric validation is on docked Evaluation Poses."})
+            result.report.pop("recommended_next_queries", None)
+        return result
 
     def design(
         self,
@@ -3989,14 +4546,19 @@ class Workflow:
                 "fragment_smiles": transformation.get("fragment_smiles"),
             })
             try:
-                result = apply_transformation(
-                    parent_molecule,
-                    transformation,
-                    self.context.protein_atoms,
-                    seed=17,
-                )
+                result = self._construct_candidate(parent_molecule, transformation)
                 attempt_path = self.run_dir / f"edit-attempt-{attempt:02d}.sdf"
                 write_sdf(result, attempt_path, name=f"edit-attempt-{attempt:02d}")
+                if self._single_edit_enabled():
+                    candidate = Chem.RemoveHs(Chem.Mol(result.molecule))
+                    self._write_json(f"molecule-attempt-{attempt:02d}.json", {
+                        "attempt": attempt, "edit_base": "original_co_crystal_ligand",
+                        "transformation": transformation,
+                        "molecule_graph": self.tools._molecule_graph(candidate),
+                        "molecular_properties": self.tools._molecular_properties(candidate),
+                        "edit_layers": result.report.get("edit_layers"),
+                        "site_policy": transformation.get("site_policy"),
+                    })
                 report = {
                     "attempt": attempt,
                     "parent_attempt": parent_attempt,
@@ -4019,12 +4581,9 @@ class Workflow:
                         "failure_stage": "deterministic_geometry_prescreen",
                         "failure_class": "candidate_construction_or_geometry",
                         "error": str(error),
-                        "recommended_next_queries": [
-                            "get_atom_environment",
-                            "check_growth_space",
-                            "validate_candidate_geometry",
-                            "search_fragment_library",
-                        ],
+                        **({} if self._direct_edit_mode else {"recommended_next_queries": [
+                            "get_atom_environment", "check_growth_space",
+                            "validate_candidate_geometry", "search_fragment_library"]}),
                     },
                     "candidate_path": None,
                 }
@@ -4064,20 +4623,29 @@ class Workflow:
                     break
                 decision = self._retry_ready_decision(decision, rejection)
                 if decision.get("action") == "STOP":
+                    stopping_reason = decision.get("stop_reason") or "llm_stop"
                     if any(item.get("docking", {}).get("status") == "complete" for item in history):
-                        return self._accepted_output(history, reference_path, "llm_stop")
-                    return {"status": "no_candidate_accepted", "stopping_reason": "llm_stop", "attempts": history}
+                        return self._accepted_output(history, reference_path, stopping_reason)
+                    return {"status": "no_candidate_accepted", "stopping_reason": stopping_reason, "attempts": history}
                 continue
 
             candidate_smiles = result.report["candidate"]["canonical_smiles"]
             previous_attempt = seen_candidate_smiles.get(candidate_smiles)
             if previous_attempt is not None:
+                canonicalization = transformation.get("site_canonicalization") or {}
                 duplicate = {
                     "status": "rejected",
                     "failure_stage": "candidate_identity_check",
                     "failure_class": "duplicate_candidate_structure",
                     "canonical_smiles": candidate_smiles,
                     "first_seen_attempt": previous_attempt,
+                    "symmetry_note": (
+                        f"Requested atom {canonicalization.get('requested_target_id')} is "
+                        f"symmetry-equivalent to {canonicalization.get('canonical_site_id')}; the host "
+                        "used the canonical representative, so the product is identical to an existing "
+                        "attempt. Choose a different position or a different fragment."
+                        if canonicalization else None
+                    ),
                     "docking": {
                         "stage": "docking",
                         "status": "not_run_duplicate_candidate",
@@ -4098,9 +4666,10 @@ class Workflow:
                     break
                 decision = self._retry_ready_decision(decision, duplicate)
                 if decision.get("action") == "STOP":
+                    stopping_reason = decision.get("stop_reason") or "llm_stop"
                     if any(item.get("docking", {}).get("status") == "complete" for item in history):
-                        return self._accepted_output(history, reference_path, "llm_stop")
-                    return {"status": "no_candidate_accepted", "stopping_reason": "llm_stop", "attempts": history}
+                        return self._accepted_output(history, reference_path, stopping_reason)
+                    return {"status": "no_candidate_accepted", "stopping_reason": stopping_reason, "attempts": history}
                 continue
             seen_candidate_smiles[candidate_smiles] = attempt
             self._update_exploration_attempt(
@@ -4113,6 +4682,7 @@ class Workflow:
                 "canonical_smiles": candidate_smiles,
                 "property_delta": result.report.get("property_delta"),
                 "severe_clash_count": result.report.get("severe_clash_count"),
+                "initial_receptor_clash_check": result.report.get("initial_receptor_clash_check"),
             })
 
             candidate_path = self.run_dir / f"candidate-{attempt:02d}.sdf"
@@ -4170,6 +4740,24 @@ class Workflow:
                 "error": docking.get("error") or docking.get("message"),
             })
 
+            # ``evaluation_failed`` is a per-seed/per-candidate pose-gate failure just
+            # like ``no_eligible_pose``.  Only retrying one of them made a single bad
+            # seed end the entire run as ``docking_not_complete``.
+            if docking.get("status") in self.POSE_GATE_FAILURE_STATUSES and self._single_edit_enabled():
+                self._record_docking_result(attempt, transformation, candidate_path, docking)
+                self._write_json("docking-history.json", {"history": self.state.docking_history,
+                                                         "convergence": self.state.convergence})
+                if attempt == hard_max:
+                    return self._accepted_output(history, reference_path, "hard_safety_limit")
+                decision = self._retry_ready_decision(decision, {
+                    "failure_class": "pose_retention", "latest_docking": self._docking_feedback_summary(docking),
+                    "instruction": "No majority of eligible poses; no rank-1 fallback. Propose a distinct original-ligand edit or STOP."
+                })
+                if decision.get("action") == "STOP":
+                    return self._accepted_output(
+                        history, reference_path, decision.get("stop_reason") or "llm_stop"
+                    )
+                continue
             if docking.get("status") != "complete":
                 return self._accepted_output(history, reference_path, "docking_not_complete")
 
@@ -4180,13 +4768,23 @@ class Workflow:
                 transformation=transformation,
                 docking_entry=trend_entry,
             )
-            if trend_entry.get("stability_eligible"):
+            if trend_entry.get("stability_eligible") and not self._single_edit_enabled():
                 self.parent_candidates[attempt] = Chem.Mol(result.molecule)
+                target = self._transformation_target(transformation)
+                parent_metadata = self._parent_metadata_for(parent_attempt)
+                target_key = self._target_key(target["target_type"], target["target_id"])
+                modified_targets = list(parent_metadata.get("modified_targets") or [])
+                if target_key not in modified_targets:
+                    modified_targets.append(target_key)
+                lineage = list(parent_metadata.get("lineage") or []) + [attempt]
                 self.parent_metadata[attempt] = {
                     "attempt": attempt,
+                    "parent_attempt": parent_attempt,
                     "generation": transformation.get("generation", 1),
-                    "target_type": self._transformation_target(transformation)["target_type"],
-                    "target_id": self._transformation_target(transformation)["target_id"],
+                    "target_type": target["target_type"],
+                    "target_id": target["target_id"],
+                    "modified_targets": modified_targets,
+                    "lineage": lineage,
                     "quality": trend_entry.get("quality"),
                     "canonical_smiles": candidate_smiles,
                     "candidate_path": str(candidate_path),
@@ -4230,17 +4828,16 @@ class Workflow:
                     "best_quality": self.state.convergence.get("best_quality"),
                 },
                 "convergence": self.state.convergence,
-                "recommended_next_queries": [
-                    "search_fragment_library",
-                    "get_ligand_fragment",
-                    "get_atom_environment",
-                    "check_growth_space",
-                    "validate_candidate_geometry",
-                ],
             }
+            if not self._direct_edit_mode:
+                feedback["recommended_next_queries"] = [
+                    "search_fragment_library", "get_ligand_fragment",
+                    "get_atom_environment", "check_growth_space", "validate_candidate_geometry"]
             next_decision = self._retry_ready_decision(decision, feedback)
             if next_decision.get("action") == "STOP":
-                return self._accepted_output(history, reference_path, "llm_stop")
+                return self._accepted_output(
+                    history, reference_path, next_decision.get("stop_reason") or "llm_stop"
+                )
             next_transformation = self._transformation(next_decision)
             if self._same_transformation(transformation, next_transformation):
                 if trend_entry.get("raw_quality_from_mean") is None:
@@ -4260,11 +4857,13 @@ class Workflow:
                 }
                 next_decision = self._retry_ready_decision(decision, revision_feedback)
                 if next_decision.get("action") == "STOP":
-                    return self._accepted_output(history, reference_path, "llm_stop")
+                    return self._accepted_output(
+                        history, reference_path, next_decision.get("stop_reason") or "llm_stop"
+                    )
                 next_transformation = self._transformation(next_decision)
                 if self._same_transformation(transformation, next_transformation):
-                    raise RuntimeError(
-                        "LLM repeated the same transformation twice without selecting a new hypothesis"
+                    return self._accepted_output(
+                        history, reference_path, "no_candidate_revision_without_new_hypothesis"
                     )
             decision = next_decision
 
@@ -4284,10 +4883,47 @@ class Workflow:
             "protein_atoms": len(self.context.protein_atoms),
             "resume": resume,
         })
-        if resume:
-            result = self.portfolio_optimize(resume=True) if self._batch_enabled() else self._resume_design()
-        elif self._batch_enabled():
-            result = self.portfolio_optimize()
+        self._direct_edit_mode = self._single_edit_enabled()
+        if (self.context.task.get("pose_retention") or {}).get("enabled"):
+            reference_path = self.run_dir / "reference-ligand.sdf"
+            receptor_path = self.run_dir / "receptor-protein-only.pdb"
+            if not reference_path.exists():
+                # Add ligand hydrogens only; original heavy coordinates are unchanged.
+                write_sdf(EditResult(Chem.AddHs(self.context.ligand, addCoords=True), {"status": "reference"}),
+                          reference_path, name="reference-ligand")
+            if not receptor_path.exists():
+                self.context.write_receptor_pdb(receptor_path)
+            self._emit("reference_calibration_started", {"reference_path": str(reference_path)})
+            if hasattr(self.docking_adapter, "prepare_reference"):
+                baseline = self.docking_adapter.prepare_reference(reference_path, receptor_path,
+                                                                  self.run_dir / "docking-reference-baseline")
+            else:
+                baseline = {"status": "calibration_failed", "error": "Configured adapter cannot calibrate a reference"}
+            self.reference_docking_result = baseline
+            self._emit("reference_calibration_completed", {"status": baseline.get("status"), "error": baseline.get("error")})
+            if baseline.get("status") != "complete":
+                result = {"status": "reference_calibration_failed", "stopping_reason": "reference_calibration_failed",
+                          "reference_calibration": baseline, "attempts": []}
+                final = {"state": self.state.compact_view(), "result": result}
+                self._write_json("result.json", final)
+                return final
+        if self._direct_edit_mode:
+            # Prepare the dossier and one-shot external Playwright/MCP evidence
+            # before the first LLM request. The bundle is reused on all later
+            # iterations and is never refreshed by the design loop.
+            self._prepare_initial_context()
+            if resume:
+                result = self._resume_design()
+            else:
+                first_decision = self._direct_decision(
+                    "Use the supplied structure dossier and one-shot external research bundle to "
+                    "understand the chemistry, choose the most promising edit site yourself, and "
+                    "return exactly one READY transformation. Do not call local tools."
+                )
+                result = ({"status": "no_candidate_accepted", "stopping_reason": "llm_stop", "attempts": []}
+                          if first_decision.get("action") == "STOP" else self.design(first_decision))
+        elif resume:
+            result = self._resume_design()
         else:
             first_decision = self.collect_context()
             result = self.design(first_decision)
@@ -4316,36 +4952,6 @@ class ScriptedDemoClient:
         self.step = 0
 
     def complete_json(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if payload.get("mode") == "portfolio_planning":
-            if payload.get("latest_feedback") or payload.get("state", {}).get("latest_batch"):
-                return {
-                    "action": "STOP",
-                    "reason": "The deterministic scripted portfolio smoke test completed one batch.",
-                    "evidence": "At least one host-screened candidate was evaluated.",
-                }
-            return {
-                "action": "PLAN_BATCH",
-                "rationale": "Run one small host-grounded screening candidate for the smoke test.",
-                "site_updates": [{
-                    "target_type": "atom",
-                    "target_id": 10,
-                    "status": "screening",
-                    "reason": "Atom 10 is a host-listed editable phenyl site.",
-                }],
-                "candidates": [{
-                    "target_type": "atom",
-                    "target_id": 10,
-                    "operation": "replace_hydrogen",
-                    "fragment_id": "curated-fluoro",
-                    "hypothesis": {
-                        "site_evidence": "The host dossier lists atom 10 and its local growth clearance.",
-                        "intended_change": "Replace one hydrogen with fluorine.",
-                        "expected_effect": "Test a minimal local substituent without rewriting the scaffold.",
-                        "risk": "The edit may not improve docking.",
-                        "success_criterion": "The candidate passes deterministic geometry and reaches docking.",
-                    },
-                }],
-            }
         observations = payload["state"]["observations"]
         if not any(item["tool"] == "get_edit_site_candidates" for item in observations):
             return {

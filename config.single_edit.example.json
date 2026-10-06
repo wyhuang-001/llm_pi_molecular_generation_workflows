@@ -1,0 +1,40 @@
+{
+  "base_url": "https://YOUR-OPENAI-COMPATIBLE-ENDPOINT/v1",
+  "model": "YOUR_MODEL_ID",
+  "wire_api": "responses",
+  "api_key_env": "OPENAI_API_KEY",
+  "api_key": "",
+  "timeout_seconds": 600,
+  "max_api_retries": 5,
+  "retry_delay_seconds": 10,
+  "max_output_tokens": 4096,
+  "send_images": true,
+  "docking": {
+    "enabled": true,
+    "timeout_seconds": 3600,
+    "max_retries": 2,
+    "retry_delay_seconds": 2,
+    "seeds": [17, 29, 43],
+    "command": [
+      "gnina",
+      "-r", "{receptor}",
+      "-l", "{candidate}",
+      "--autobox_ligand", "{reference}",
+      "--autobox_add", "4",
+      "--seed", "{seed}",
+      "--num_modes", "20",
+      "-o", "{output_dir}/docked.sdf",
+      "--log", "{output_dir}/gnina.log"
+    ]
+  },
+  "plip": {
+    "enabled": true,
+    "executable": "plip",
+    "timeout_seconds": 900,
+    "xml": true,
+    "pictures": false
+  },
+  "rbfe": {
+    "enabled": false
+  }
+}

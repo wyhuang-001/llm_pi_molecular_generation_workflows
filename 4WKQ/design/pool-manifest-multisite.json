@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "mode": "multisite_reachability",
+  "task": "4WKQ/task.benchmark-multisite.json",
+  "inputs": {
+    "task_sha256": "50ed3338549f1f353655e36c0eedffe170e30ceda3b235c025ded436e3c77f5c",
+    "reachability_sha256": "c3dee704f25cce56fcb8f5b189c8fbabd56eb1b143416ab35de17f9b886e1e28",
+    "general_library_sha256": "eede5d25300dd86a62366ddf5ac7f7e886a2c3ef77c60166cdd89f71a88edbee"
+  },
+  "rules": {
+    "cut_space": "every directed non-ring single bond that keeps the protected core",
+    "site_space": "the task edit-site table (atom and cut sites)",
+    "verification": "exact graph reconstruction against the parent; a decomposition is kept only when the assembled product equals the target SMILES",
+    "minimal_representation": "smallest attachment fragment per compound",
+    "background": {
+      "source": "molecular_agent/data/fragment_library_v2.json",
+      "per_size_class_cap": 60,
+      "seed": 410627,
+      "similarity_stop": 0.9,
+      "activity_used": false
+    }
+  },
+  "candidate_count": 213,
+  "maximum_unique_candidates": 30,
+  "maximum_design_requests": 150,
+  "counts": {
+    "catalog_total": 213,
+    "literature_compounds": 27,
+    "literature_covered": 26,
+    "literature_uncovered": 1,
+    "literature_derived_fragments": 22,
+    "all_decomposition_fragments": 88,
+    "compounds_needing_no_fragment": 0,
+    "bond_sites": 11,
+    "atom_sites": 15
+  },
+  "public_files": {
+    "catalog": "4WKQ/design/fragments-multisite.json",
+    "catalog_sha256": "c9a7c8000ae3543366f34994d98de9fee96842cd8543d5c9f7019c47227338f4",
+    "site_table": "4WKQ/design/sites-multisite.json",
+    "site_table_sha256": "d65da6074103bd75721ddd4ab4755a33f89d6098855775b8be6606f39b154590",
+    "site_table_derived_from": "4WKQ/design/sites-v2.json"
+  },
+  "private_files": {
+    "reachability": "4WKQ/benchmark-private/reachability-multisite.json",
+    "reachability_sha256": "52b8d649d463ed16762e1564a15f5bebadb8f2963f0e7d8efbb45f598fba16f8"
+  }
+}

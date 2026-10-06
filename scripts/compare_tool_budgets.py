@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from molecular_agent.adapters import configured_adapters
-from molecular_agent.editing import EditResult, apply_substituent, write_sdf
+from molecular_agent.editing import EditResult, apply_atom_addition, write_sdf
 from scripts.openai_compatible_client import OpenAICompatibleChatClient
 from molecular_agent.structure import ComplexContext
 
@@ -374,7 +374,7 @@ def run_budget(
 
         if final_decision is not None:
             try:
-                edit_result = apply_substituent(
+                edit_result = apply_atom_addition(
                     context.ligand,
                     final_decision["edit_atom_index"],
                     final_decision["fragment_smiles"],

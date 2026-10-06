@@ -9,7 +9,7 @@ SOURCE_CONFIG="${CONFIG_PATH:-config.aicloud.json}"
 TASK_PATH="${TASK_PATH:-input/task.json}"
 RUN_ROOT="${RUN_ROOT:-runs/docking-loop-test}"
 CONTEXT_ROUNDS="${CONTEXT_ROUNDS:-256}"
-EDIT_ATTEMPTS="${EDIT_ATTEMPTS:-80}"
+EDIT_ATTEMPTS="${EDIT_ATTEMPTS:-400}"
 SCRIPTED_EDIT_ATTEMPTS="${SCRIPTED_EDIT_ATTEMPTS:-1}"
 MODE="scripted"
 RUN_TESTS=1
@@ -37,7 +37,7 @@ Environment overrides:
   TASK_PATH         Task JSON (default: input/task.json)
   RUN_ROOT          Output root (default: runs/docking-loop-test)
   CONTEXT_ROUNDS    Runtime context-query budget (default: 256)
-  EDIT_ATTEMPTS     Runtime maximum candidate attempts for real mode (default: 80)
+  EDIT_ATTEMPTS     Runtime maximum candidate attempts for real mode (default: 400)
   SCRIPTED_EDIT_ATTEMPTS  Maximum attempts for the single-candidate scripted smoke test (default: 1)
   CODEX_CONFIG_DIR  Local Codex configuration directory (default: ~/.codex)
   OPENAI_API_KEY    Optional current-provider key override; otherwise read from Codex auth.json

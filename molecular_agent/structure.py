@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -140,7 +141,8 @@ def _build_ligand_from_component(
                 f"Element mismatch for ligand atom {atom_name}: "
                 f"PDB={pdb_atom.element}, component={element}"
             )
-        rdkit_atom = Chem.Atom(element)
+        # CCD commonly uses upper-case two-letter symbols (e.g. CL); RDKit needs Cl.
+        rdkit_atom = Chem.Atom(element.capitalize())
         rdkit_atom.SetFormalCharge(_cif_charge(charge))
         if aromatic_flag == "Y":
             rdkit_atom.SetIsAromatic(True)
@@ -190,13 +192,20 @@ class ComplexContext:
         self.task = json.loads(self.task_path.read_text(encoding="utf-8"))
         self.complex_path = (self.input_dir / self.task["complex_path"]).resolve()
         self.atoms = parse_pdb(self.complex_path)
-        self.protein_atoms = [atom for atom in self.atoms if atom.record == "ATOM"]
+        self.retained_hetero_residues = set(self.task.get("receptor_preparation", {}).get(
+            "retain_hetero_residue_names", ["TPO", "SEP", "PTR", "MSE"]
+        ))
+        self.protein_atoms = [atom for atom in self.atoms if atom.record == "ATOM"
+                              or atom.residue_name in self.retained_hetero_residues]
         self.ligand_pdb_atoms = self._select_ligand_atoms()
         self.ligand_selector = {
             "chain": self.ligand_pdb_atoms[0].chain,
             "residue_name": self.ligand_pdb_atoms[0].residue_name,
             "residue_number": self.ligand_pdb_atoms[0].residue_number,
         }
+        self.protein_atoms = [atom for atom in self.protein_atoms if _selector_key(atom) !=
+                              (self.ligand_selector["chain"], self.ligand_selector["residue_name"],
+                               self.ligand_selector["residue_number"])]
         self.component_path = _component_path(
             self.complex_path.parent, self.ligand_selector["residue_name"]
         )
@@ -212,13 +221,19 @@ class ComplexContext:
                 "Chemical component/PDB ligand atom mismatch: "
                 f"{self.ligand.GetNumHeavyAtoms()} vs {len(self.ligand_pdb_atoms)}"
             )
+        # Stable provenance, independent of the RDKit index after an edit.
+        for atom in self.ligand.GetAtoms():
+            atom.SetIntProp("_reference_atom_index", atom.GetIdx())
         self.ligand_source = f"PDB coordinates + chemical component topology: {self.component_path}"
 
     def _select_ligand_atoms(self) -> list[PDBAtom]:
         selector = self.task.get("ligand_selector")
         groups: dict[tuple[str, str, int], list[PDBAtom]] = {}
         for atom in self.atoms:
-            if atom.record != "HETATM" or atom.residue_name in {"HOH", "WAT", "DOD"}:
+            # Prepared PDBs can contain explicit ligand H/D. CCD topology and stable
+            # reference indices are heavy-atom based; hydrogens are prepared separately.
+            if (atom.record != "HETATM" or atom.residue_name in {"HOH", "WAT", "DOD"}
+                    or atom.element in {"H", "D", "T"}):
                 continue
             groups.setdefault(_selector_key(atom), []).append(atom)
         if selector:
@@ -226,6 +241,7 @@ class ComplexContext:
                 atom
                 for atom in self.atoms
                 if atom.record == "HETATM"
+                and atom.element not in {"H", "D", "T"}
                 and atom.chain == selector["chain"]
                 and atom.residue_name == selector["residue_name"]
                 and atom.residue_number == int(selector["residue_number"])
@@ -245,17 +261,53 @@ class ComplexContext:
             raise ValueError(f"Multiple equally large ligand candidates; add ligand_selector: {choices}")
         return candidates[0]
 
+    def preparation_identity(self) -> dict[str, Any]:
+        """Tie cached prepared inputs to the source used to construct NEW candidates."""
+        return {
+            "complex_sha256": hashlib.sha256(self.complex_path.read_bytes()).hexdigest(),
+            "component_sha256": hashlib.sha256(self.component_path.read_bytes()).hexdigest(),
+            "ligand_selector": self.ligand_selector,
+            "receptor_policy": "ATOM plus reviewed HETATM, blank/A altloc, no added receptor H",
+            "ligand_hydrogen_policy": "RDKit AddHs(addCoords=True), unchanged crystal heavy coordinates",
+        }
+
     def write_receptor_pdb(self, path: Path) -> Path:
-        """Write the protein ATOM records without the selected/co-crystallized ligands."""
-        lines = [
-            line
-            for line in self.complex_path.read_text(encoding="utf-8").splitlines()
-            if line[:6].strip() == "ATOM"
-        ]
+        """Keep protein and explicitly reviewed modified residues, not other ligands/water."""
+        original = self.complex_path.read_text(encoding="utf-8").splitlines()
+        selected = self.ligand_selector
+        lines = [line for line in original
+                 if (line[:6].strip() == "ATOM" or
+                     (line[:6].strip() == "HETATM" and
+                      line[17:20].strip() in self.retained_hetero_residues))
+                 and line[16:17] in {" ", "A"}
+                 and not (line[21:22].strip() == selected["chain"]
+                          and line[17:20].strip() == selected["residue_name"]
+                          and int(line[22:26]) == selected["residue_number"])]
         if not lines:
             raise ValueError("Complex contains no protein ATOM records")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join([*lines, "END", ""]), encoding="utf-8")
+        kept_serials = {int(line[6:11]) for line in lines}
+        conect = []
+        for line in original:
+            if line.startswith("CONECT"):
+                ids = [int(line[i:i+5]) for i in range(6, len(line), 5) if line[i:i+5].strip()]
+                if ids and ids[0] in kept_serials:
+                    ids = [i for i in ids if i in kept_serials]
+                    if len(ids) > 1:
+                        conect.append("CONECT" + "".join(f"{i:5d}" for i in ids))
+        path.write_text("\n".join([*lines, *conect, "END", ""]), encoding="utf-8")
+        excluded = sorted({f"{a.residue_name}:{a.chain}:{a.residue_number}"
+                           for a in self.atoms if a.serial not in kept_serials})
+        manifest = {
+            "source": str(self.complex_path), "source_identity": self.preparation_identity(),
+            "retained_atom_count": len(lines),
+            "retained_hetero_residue_names": sorted(self.retained_hetero_residues),
+            "retained_hetero_atom_count": sum(line.startswith("HETATM") for line in lines),
+            "excluded_residues": excluded, "altloc_policy": "blank or A",
+            "hydrogen_policy": "preserve receptor input; GNINA internal preparation; PLIP nohydro",
+            "limitations": "No pH/protonation optimization. Waters/metals/cofactors excluded unless explicitly listed; review before calibration.",
+        }
+        path.with_suffix(".preparation.json").write_text(json.dumps(manifest, indent=2))
         return path
 
     def protein_near(self, xyz: np.ndarray, radius: float) -> list[tuple[PDBAtom, float]]:

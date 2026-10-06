@@ -1,0 +1,49 @@
+{
+  "status": "structure_and_reachability_audit_only",
+  "reference_pdb": "4WKQ",
+  "ligand": {
+    "residue": "IRE:A:1101",
+    "heavy_atoms": 31,
+    "chemical_identity_matches_ccd": true,
+    "canonical_smiles": "COc1cc2ncnc(Nc3ccc(F)c(Cl)c3)c2cc1OCCCN1CCOCC1"
+  },
+  "preparation": {
+    "input_is_maestro_prepared_not_untouched_deposition": true,
+    "ligand_heavy_direct_rmsd_vs_deposition": 0.0,
+    "ligand_max_heavy_displacement_vs_deposition": 0.0,
+    "shared_receptor_heavy_atom_count": 2310,
+    "shared_receptor_heavy_direct_rmsd_vs_deposition": 0.15457593295082814,
+    "retained_modified_residue": "CSX:A:797 (S-OXY CYSTEINE); do not silently delete or convert to CYS",
+    "altloc_policy": "blank/A; subject to preparation review"
+  },
+  "edit_definition": {
+    "chemical_position": "quinazoline C6",
+    "core_anchor_pdb_atom_name": "CBA",
+    "core_anchor_reference_index": 10,
+    "side_atom_pdb_atom_name": "OAV",
+    "side_reference_index": 9,
+    "cut_bond": [
+      10,
+      9
+    ],
+    "fragment_includes_linker_oxygen": true,
+    "warning": "PDB atom named C6 is NOT the medicinal-chemistry C6 substitution position"
+  },
+  "dataset": {
+    "source_sha256": "9f728ecbec7cae36c2ef2088b06e7b4e432c1060ad37bfb7f318c8a8879b6398",
+    "record_count": 28,
+    "unique_structures": 28,
+    "assay_counts": {
+      "CHEMBL677210": 28
+    },
+    "endpoint_counts": {
+      "IC50": 28
+    },
+    "reachable_records_including_reference": 27,
+    "unreachable_records": 1,
+    "reference_records": 1,
+    "unique_reachable_fragments_including_reference": 27,
+    "unique_nonreference_fragments": 26
+  },
+  "leakage_policy": "No experimental labels or compound membership details in this public report; private output is never designer context."
+}

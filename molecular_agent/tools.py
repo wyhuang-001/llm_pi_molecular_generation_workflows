@@ -1,15 +1,77 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
+import hashlib
+import json
 from typing import Any, Callable
 
 import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem, Crippen, Descriptors, Lipinski, rdMolDescriptors
 
-from .editing import apply_substituent, apply_transformation
+from .edit_taxonomy import (
+    CHANGE_TYPES,
+    EditTaxonomyError,
+    SITE_ALLOWED_CHANGE_TYPES,
+    axes_for_operation,
+    change_types_from_legacy_operations,
+    normalize_transformation,
+    operation_label,
+    taxonomy_documentation,
+)
+from .editing import apply_transformation
 from .fragment_library import FragmentLibrary, chemical_tags, size_class_for
 from .structure import ComplexContext
+
+
+def apply_site_canonicalization(transformation: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite a symmetry-redundant atom target to its canonical representative.
+
+    Attaching the same fragment to any member of a symmetry class gives the identical
+    molecule, so the host canonicalises instead of rejecting.  The requested index is
+    kept for audit.
+    """
+    info = transformation.get("site_canonicalization")
+    if not isinstance(info, dict):
+        return transformation
+    canonical = info.get("canonical_target_id")
+    if isinstance(canonical, int) and transformation.get("edit_atom_index") != canonical:
+        transformation.setdefault("requested_edit_atom_index", transformation.get("edit_atom_index"))
+        transformation["edit_atom_index"] = canonical
+    return transformation
+
+
+#: RDKit's default rotatable-bond pattern (single, acyclic, non-terminal, no triple bond).
+ROTATABLE_BOND_SMARTS = Chem.MolFromSmarts("[!$(*#*)&!D1]-&!@[!$(*#*)&!D1]")
+
+#: Canonical change type -> historical fragment-library operation name.
+#: The frozen unified library still stores ``substitute`` / ``replace_fragment``; the
+#: boundary maps to those names instead of rewriting multi-megabyte generated data.
+LIBRARY_OPERATION_FOR_CHANGE_TYPE = {
+    "addition": "substitute",
+    "replacement": "replace_fragment",
+}
+
+
+def _library_panel(
+    library: FragmentLibrary,
+    change_type: str | None,
+    limit: int,
+    max_heavy_atoms: int,
+    size_classes: list[str] | None = None,
+    chemical_tags: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return a library panel for a change type, or an empty panel when none applies."""
+    operation = LIBRARY_OPERATION_FOR_CHANGE_TYPE.get(change_type or "")
+    if operation is None:
+        return []
+    return library.panel(
+        operation=operation,
+        limit=limit,
+        max_heavy_atoms=max_heavy_atoms,
+        size_classes=size_classes,
+        chemical_tags_any=chemical_tags,
+    )
 
 
 class ToolRegistry:
@@ -22,7 +84,8 @@ class ToolRegistry:
         self.context = context
         self.fragment_library = fragment_library or FragmentLibrary()
         self.parent_resolver = parent_resolver
-        self._replacement_sites = self._build_replacement_sites()
+        self.site_table = self._load_site_table()
+        self._bond_sites = self._build_bond_sites()
         self._tools: dict[str, tuple[Callable[..., dict[str, Any]], set[str], dict[str, Any]]] = {
             "get_ligand_info": (
                 self.get_ligand_info,
@@ -45,15 +108,15 @@ class ToolRegistry:
                     "additionalProperties": False,
                 },
             ),
-            "screen_candidate_batch": (
-                self.screen_candidate_batch,
-                {"candidate_batch"},
+            "get_complex_geometry": (
+                self.get_complex_geometry,
+                {"complex_geometry"},
                 {
                     "type": "object",
                     "properties": {
-                        "candidates": {"type": "array", "minItems": 1, "maxItems": 32},
+                        "radius": {"type": "number", "minimum": 4.0, "maximum": 8.0},
+                        "max_pocket_atoms": {"type": "integer", "minimum": 32, "maximum": 400},
                     },
-                    "required": ["candidates"],
                     "additionalProperties": False,
                 },
             ),
@@ -63,7 +126,7 @@ class ToolRegistry:
                 {
                     "type": "object",
                     "properties": {
-                        "target_type": {"type": "string", "enum": ["atom", "replacement_site"]},
+                        "target_type": {"type": "string", "enum": ["atom", "bond"]},
                         "target_id": {},
                         "size_classes": {
                             "type": "array",
@@ -91,7 +154,7 @@ class ToolRegistry:
                                 "properties": {
                                     "target_type": {
                                         "type": "string",
-                                        "enum": ["atom", "replacement_site"],
+                                        "enum": ["atom", "bond"],
                                     },
                                     "target_id": {},
                                     "priority": {"type": "integer", "minimum": 1},
@@ -167,9 +230,9 @@ class ToolRegistry:
                     "required": ["atom_index", "distance"],
                 },
             ),
-            "list_fragment_replacement_sites": (
-                self.list_fragment_replacement_sites,
-                {"replacement_sites"},
+            "list_bond_sites": (
+                self.list_bond_sites,
+                {"bond_sites"},
                 {
                     "type": "object",
                     "properties": {
@@ -177,17 +240,17 @@ class ToolRegistry:
                     },
                 },
             ),
-            "get_replacement_site_spatial_profile": (
-                self.get_replacement_site_spatial_profile,
-                {"replacement_site_spatial_profile"},
+            "get_bond_site_spatial_profile": (
+                self.get_bond_site_spatial_profile,
+                {"bond_site_spatial_profile"},
                 {
                     "type": "object",
                     "properties": {
-                        "replacement_site_id": {"type": "string", "minLength": 1},
+                        "bond_site_id": {"type": "string", "minLength": 1},
                         "max_distance": {"type": "number", "minimum": 1.0, "maximum": 6.0},
                         "probe_count": {"type": "integer", "minimum": 2, "maximum": 8},
                     },
-                    "required": ["replacement_site_id"],
+                    "required": ["bond_site_id"],
                 },
             ),
             "validate_candidate_geometry": (
@@ -196,40 +259,24 @@ class ToolRegistry:
                 {
                     "type": "object",
                     "properties": {
-                        "operation": {"type": "string", "enum": ["replace_hydrogen", "replace_fragment"]},
+                        "site_type": {
+                            "type": "string",
+                            "enum": ["atom", "bond", "linker", "ring"],
+                        },
+                        "change_type": {
+                            "type": "string",
+                            "enum": ["addition", "deletion", "replacement"],
+                        },
                         "atom_index": {"type": "integer", "minimum": 0},
                         "edit_atom_index": {"type": "integer", "minimum": 0},
-                        "replacement_site_id": {"type": "string", "minLength": 1},
+                        "bond_site_id": {"type": "string", "minLength": 1},
                         "fragment_id": {"type": "string"},
                         "fragment_smiles": {"type": "string", "minLength": 1},
+                        "element": {"type": "string", "minLength": 1},
                         "parent_attempt": {"type": "integer", "minimum": 1},
                         "replace_existing_substituent": {"type": "boolean"},
                     },
-                    "required": ["fragment_smiles"],
-                },
-            ),
-            "generate_site_candidate_batch": (
-                self.generate_site_candidate_batch,
-                {"candidate_batch"},
-                {
-                    "type": "object",
-                    "properties": {
-                        "target_type": {
-                            "type": "string",
-                            "enum": ["atom", "replacement_site"],
-                        },
-                        "target_id": {},
-                        "query": {"type": "string"},
-                        "max_heavy_atoms": {"type": "integer", "minimum": 1, "maximum": 30},
-                        "size_class": {
-                            "type": "string",
-                            "enum": ["minimal", "small", "medium", "large"],
-                        },
-                        "chemical_tag": {"type": "string", "minLength": 1},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 32},
-                        "parent_attempt": {"type": "integer", "minimum": 1},
-                    },
-                    "required": ["target_type", "target_id"],
+                    "required": ["site_type", "change_type"],
                     "additionalProperties": False,
                 },
             ),
@@ -241,7 +288,7 @@ class ToolRegistry:
                     "properties": {
                         "query": {"type": "string"},
                         "max_heavy_atoms": {"type": "integer", "minimum": 1, "maximum": 30},
-                        "operation": {"type": "string", "enum": ["substitute", "replace_fragment"]},
+                        "change_type": {"type": "string", "enum": ["addition", "replacement"]},
                         "size_class": {
                             "type": "string",
                             "enum": ["minimal", "small", "medium", "large"],
@@ -307,9 +354,9 @@ class ToolRegistry:
                 "Returns one compact deterministic dossier containing ligand, pocket, interactions, all "
                 "editable sites, the complete library summary, and diverse operation-compatible panels."
             ),
-            "screen_candidate_batch": (
-                "Builds and geometrically screens a bounded set of LLM-selected transformations. "
-                "It does not run docking."
+            "get_complex_geometry": (
+                "Returns a bounded, machine-readable 3D complex representation in receptor coordinates: "
+                "ligand atoms, local pocket atoms, edit vectors, distances, roles, and interaction edges."
             ),
             "get_fragment_panel": (
                 "Returns a refreshed, diverse panel with complete precomputed chemistry for one host-listed "
@@ -323,14 +370,9 @@ class ToolRegistry:
             "detect_basic_interactions": "cutoff must be at least 4.0 A to cover key interactions.",
             "get_atom_environment": "radius must be at least 4.0 A for the final edit atom.",
             "check_growth_space": "probe distance must be at least 1.5 A for the final edit atom.",
-            "list_fragment_replacement_sites": "Enumerates host-validated directed side-chain cuts. Use replacement_site_id; never guess cut_bond indices.",
-            "get_replacement_site_spatial_profile": "Returns deterministic attachment-vector probes and nearest protein distances for one returned replacement_site_id. It reports geometry facts, not a suitability verdict.",
-            "validate_candidate_geometry": "Runs the exact deterministic candidate construction and rigid-protein clash check. replace_fragment requires a replacement_site_id returned by list_fragment_replacement_sites.",
-            "generate_site_candidate_batch": (
-                "For one locked atom or replacement site, retrieve an operation-compatible fragment batch "
-                "and run deterministic candidate construction and rigid-protein clash prescreening. "
-                "Optional size_class and chemical_tag filters expose the unified library action space."
-            ),
+            "list_bond_sites": "Enumerates host-validated directed side-chain cuts. Use bond_site_id; never guess cut_bond indices. Each site lists allowed_change_types (deletion and/or replacement).",
+            "get_bond_site_spatial_profile": "Returns deterministic attachment-vector probes and nearest protein distances for one returned bond_site_id. It reports geometry facts, not a suitability verdict.",
+            "validate_candidate_geometry": "Runs the exact deterministic candidate construction and rigid-protein clash check. Every site lists allowed_change_types; bond sites require a bond_site_id from list_bond_sites, and bond:deletion needs no fragment.",
             "search_fragment_library": (
                 "Searches by one supported chemical term (for example heterocycle, pyridine, morpholine, "
                 "indole, oxetane, nitrile), one valid SMILES/SMARTS pattern, or an empty query for browsing. "
@@ -363,17 +405,16 @@ class ToolRegistry:
             "get_ligand_info": True,
             "get_edit_site_candidates": True,
             "get_design_dossier": True,
-            "screen_candidate_batch": True,
+            "get_complex_geometry": True,
             "get_fragment_panel": True,
             "assess_edit_sites": True,
             "get_pocket_residues": float(arguments.get("radius", 0)) >= 5.0,
             "detect_basic_interactions": float(arguments.get("cutoff", 0)) >= 4.0,
             "get_atom_environment": float(arguments.get("radius", 0)) >= 4.0,
             "check_growth_space": float(arguments.get("distance", 0)) >= 1.5,
-            "list_fragment_replacement_sites": True,
-            "get_replacement_site_spatial_profile": True,
+            "list_bond_sites": True,
+            "get_bond_site_spatial_profile": True,
             "validate_candidate_geometry": True,
-            "generate_site_candidate_batch": True,
             "get_fragment_properties": True,
             "get_fragment_spatial_profile": True,
             "get_ligand_fragment": True,
@@ -386,7 +427,304 @@ class ToolRegistry:
         )
         return result, set(potential_evidence) if covers and not rejected_query else set()
 
+    @staticmethod
+    def _site_change_types(record: dict[str, Any]) -> list[str]:
+        """Return the canonical ``change_type`` list for one site record.
+
+        New site tables list ``allowed_change_types`` directly.  Frozen tables and
+        older run artifacts list legacy ``allowed_operations``; those are projected
+        onto the canonical change types so no generated library or site table has to
+        be rewritten.
+        """
+        explicit = record.get("allowed_change_types")
+        if isinstance(explicit, list) and explicit:
+            return [item for item in explicit if item in CHANGE_TYPES]
+        return change_types_from_legacy_operations(record.get("allowed_operations"))
+
+    def _protected_core_indices(self) -> set[int]:
+        """Atoms the pose/native-like comparison relies on and an edit must not remove.
+
+        Combines the explicit protected core, the pose-retention comparison core, the
+        calibrated anchor atoms, and any protected atoms from a frozen site table.
+        Indices are in the heavy-atom (``RemoveHs``) ligand frame, the same frame used
+        by ``removed_atom_indices``.
+        """
+        task = self.context.task
+        protected = {
+            int(index)
+            for index in (task.get("fragment_replacement") or {}).get(
+                "protected_core_atom_indices"
+            ) or []
+            if isinstance(index, int)
+        }
+        retention = task.get("pose_retention") or {}
+        protected |= {
+            int(index) for index in retention.get("core_atom_indices") or [] if isinstance(index, int)
+        }
+        for anchor in retention.get("anchors") or []:
+            index = anchor.get("ligand_atom_index")
+            if isinstance(index, int):
+                protected.add(index)
+        if self.site_table:
+            protected |= {
+                int(index)
+                for index in self.site_table.get("protected_atom_indices") or []
+                if isinstance(index, int)
+            }
+        return protected
+
+    def _removal_profile(self, removed_atom_indices: Any) -> dict[str, Any]:
+        """Deterministic consequence profile for the side a bond edit removes.
+
+        The three fields answer three different questions.  ``core_overlap`` is a
+        legality check: removing a pose-comparison atom would invalidate the
+        native-like comparison.  The other two are the gain side of the ledger,
+        because the reference-interaction list only reports what a deletion loses.
+        """
+        molecule = Chem.RemoveHs(Chem.Mol(self.context.ligand))
+        removed = sorted(
+            {int(index) for index in removed_atom_indices or [] if isinstance(index, int)}
+        )
+        roles: Counter[str] = Counter()
+        for index in removed:
+            if 0 <= index < molecule.GetNumAtoms():
+                roles.update(self._ligand_polar_roles(molecule.GetAtomWithIdx(index)))
+        rotatable = (
+            {tuple(sorted(match)) for match in molecule.GetSubstructMatches(ROTATABLE_BOND_SMARTS)}
+            if ROTATABLE_BOND_SMARTS is not None else set()
+        )
+        removed_set = set(removed)
+        overlap = sorted(removed_set & self._protected_core_indices())
+        return {
+            "removed_polar_roles": {role: roles[role] for role in ("donor", "acceptor") if roles[role]},
+            "removed_rotatable_bonds": sum(
+                1 for begin, end in rotatable if begin in removed_set or end in removed_set
+            ),
+            "core_overlap": overlap,
+        }
+
+    def _load_site_table(self) -> dict[str, Any] | None:
+        """Load the host-supplied edit-site table, when the task names one.
+
+        The table is the authoritative site list: it fixes which atoms and which
+        directed cuts exist, which operations each one accepts, and which region is
+        protected. It never names a fragment.
+        """
+        configured = self.context.task.get("edit_site_table_path")
+        if not configured:
+            return None
+        path = (self.context.input_dir / str(configured)).resolve()
+        if not path.is_file():
+            raise ValueError(f"edit_site_table_path does not exist: {path}")
+        table = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(table, dict) or not isinstance(table.get("atom_sites"), list):
+            raise ValueError(f"Edit-site table must contain atom_sites: {path}")
+        table["path"] = str(path)
+        table["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return table
+
+    def _site_table_policy(
+        self,
+        change_type: str,
+        target_type: str,
+        target_id: Any,
+    ) -> dict[str, Any]:
+        """Return whether one change type is allowed on one host-listed site."""
+        if self.site_table is None:
+            return {"status": "complete", "allowed": True, "source": "enumerated_sites"}
+        if target_type == "atom":
+            record = next(
+                (item for item in self.site_table["atom_sites"] if item["atom_index"] == target_id),
+                None,
+            )
+        elif target_type == "bond":
+            record = next(
+                (item for item in self.site_table["cut_sites"] if item["site_id"] == target_id),
+                None,
+            )
+        else:
+            raise ValueError("target_type must be atom or bond_site")
+        if record is None:
+            return {
+                "status": "rejected",
+                "allowed": False,
+                "failure_class": "unlisted_edit_site",
+                "reason": f"{target_type} {target_id!r} is not in the host edit-site table",
+                "source": "edit_site_table",
+            }
+        allowed = self._site_change_types(record)
+        if change_type not in allowed:
+            return {
+                "status": "rejected",
+                "allowed": False,
+                "failure_class": (
+                    "protected_edit_site"
+                    if record.get("protection") == "protected"
+                    else "change_type_not_allowed_at_site"
+                ),
+                "reason": (
+                    f"{target_type} {target_id!r} is {record.get('protection')} and does not allow "
+                    f"change_type {change_type!r}; allowed change types: {allowed or 'none'}"
+                ),
+                "site": record,
+                "source": "edit_site_table",
+            }
+        canonical = record.get("canonical_atom_index")
+        canonicalization = None
+        if target_type == "atom" and isinstance(canonical, int) and canonical != target_id:
+            canonicalization = {
+                "requested_target_id": target_id,
+                "canonical_target_id": canonical,
+                "canonical_site_id": f"atom-{canonical:03d}",
+                "reason": "symmetry_equivalent_site",
+            }
+        return {
+            "status": "complete",
+            "allowed": True,
+            "site": record,
+            "protection": record.get("protection"),
+            "probe_verdict": record.get("probe_verdict"),
+            "canonicalization": canonicalization,
+            "source": "edit_site_table",
+        }
+
+    def list_edit_sites(self) -> dict[str, Any]:
+        """Return the host-supplied site list when present, else the enumerated one."""
+        if self.site_table is None:
+            return self.get_edit_site_candidates()
+        return {
+            "status": "complete",
+            "source": "edit_site_table",
+            "site_table_path": self.site_table.get("path"),
+            "site_table_sha256": self.site_table.get("sha256"),
+            "protected_atom_indices": self.site_table.get("protected_atom_indices", []),
+            "atom_coverage": self.site_table.get("atom_coverage"),
+            "atom_sites": self.site_table["atom_sites"],
+            "cut_sites": self.site_table["cut_sites"],
+            "input_contract": self.site_table.get("input_contract"),
+            "limitation": (
+                "Probe verdicts are rigid-structure geometry facts, not free-energy verdicts. "
+                "A protected site stays visible and auditable but rejects every operation."
+            ),
+        }
+
     def get_edit_site_candidates(self) -> dict[str, Any]:
+        if self.site_table is not None:
+            return self._site_table_candidates()
+        return self._enumerated_site_candidates()
+
+    def _site_table_candidates(self) -> dict[str, Any]:
+        interactions = self.detect_basic_interactions(4.0).get("contacts", [])
+        interactions_by_atom: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for contact in interactions:
+            atom_index = contact.get("ligand_atom_index")
+            if isinstance(atom_index, int):
+                interactions_by_atom[atom_index].append(contact)
+        atom_sites = []
+        for record in self.site_table["atom_sites"]:
+            if not record.get("allowed_operations"):
+                continue
+            atom_index = record["atom_index"]
+            environment = self.get_atom_environment(atom_index, 4.0)
+            try:
+                growth = self.check_growth_space(atom_index, 3.0)
+            except Exception as error:
+                growth = {"status": "unavailable", "error": str(error)}
+            atom_sites.append({
+                "target_type": "atom",
+                "site_type": "ring" if record.get("is_ring_atom") else "atom",
+                "target_id": atom_index,
+                "site_id": record["site_id"],
+                "region": record["region"],
+                "element": record["element"],
+                "aromatic": record["is_aromatic"],
+                "replaceable_hydrogens": record["hydrogen_count"],
+                "allowed_operations": record["allowed_operations"],
+                "allowed_change_types": self._site_change_types(record),
+                "protection": record["protection"],
+                "probe_clearance": record["probe_clearance"],
+                "probe_verdict": record["probe_verdict"],
+                "symmetry_equivalent_atom_indices": record.get("symmetry_equivalent_atom_indices", [atom_index]),
+                "symmetry_representative": record.get("symmetry_representative", True),
+                "equivalent_to": record.get("equivalent_to"),
+                "nearby_protein_atoms": environment["protein_atoms"][:10],
+                "current_interactions": interactions_by_atom.get(atom_index, [])[:8],
+                "growth_probe": {
+                    key: growth.get(key)
+                    for key in (
+                        "status", "probe_distance", "probe_xyz", "minimum_clearance",
+                        "nearest_protein_atoms", "error",
+                    )
+                    if key in growth
+                },
+            })
+        bond_sites = []
+        for site in self._bond_sites:
+            if not site.get("allowed_operations"):
+                continue
+            try:
+                spatial = self.get_bond_site_spatial_profile(
+                    site["bond_site_id"], max_distance=4.0, probe_count=5
+                )
+                directional_clearance = [
+                    {
+                        "label": item["label"],
+                        "minimum_protein_atom_distance_along_probe": item[
+                            "minimum_protein_atom_distance_along_probe"
+                        ],
+                    }
+                    for item in spatial["direction_profiles"]
+                ]
+            except Exception as error:
+                directional_clearance = [{"status": "unavailable", "error": str(error)}]
+            bond_sites.append({
+                "target_type": "bond",
+                "site_type": "bond",
+                "target_id": site["bond_site_id"],
+                "site_id": site["bond_site_id"],
+                "bond_site_id": site["bond_site_id"],
+                "region": site.get("region"),
+                "label": site.get("label"),
+                "allowed_operations": site.get("allowed_operations", []),
+                "allowed_change_types": self._site_change_types(site),
+                "protection": site.get("protection"),
+                "retained_atom_index": site["retained_atom_index"],
+                "removed_side_atom_index": site["removed_side_atom_index"],
+                "removed_heavy_atoms": site["removed_heavy_atoms"],
+                "removed_fraction": site["removed_fraction"],
+                "removed_fragment_smiles": site["removed_fragment_smiles"],
+                "attachment_vector": site["attachment_vector"],
+                "retained_atom_interactions": interactions_by_atom.get(
+                    site["retained_atom_index"], []
+                )[:8],
+                "removed_reference_interactions": self._removed_side_interactions(
+                    site, interactions_by_atom
+                ),
+                "removed_polar_roles": site.get("removed_polar_roles", {}),
+                "removed_rotatable_bonds": site.get("removed_rotatable_bonds"),
+                "core_overlap": site.get("core_overlap", []),
+                "directional_clearance": directional_clearance,
+            })
+        return {
+            "status": "complete",
+            "source": "edit_site_table",
+            "atom_site_count": len(atom_sites),
+            "bond_site_count": len(bond_sites),
+            "atom_sites": atom_sites,
+            "bond_sites": bond_sites,
+            "protected_atom_indices": self.site_table.get("protected_atom_indices", []),
+            "site_type_vocabulary": [
+                "core_anchor", "pocket_extension", "solvent_exposed",
+                "linker_or_sidechain", "uncertain",
+            ],
+            "edit_taxonomy": taxonomy_documentation(),
+            "limitation": (
+                "The host fixed this site list; the designer chooses which fragment goes to which site. "
+                "Probe verdicts are geometry facts, not affinity predictions."
+            ),
+        }
+
+    def _enumerated_site_candidates(self) -> dict[str, Any]:
         interactions = self.detect_basic_interactions(4.0).get("contacts", [])
         interactions_by_atom: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for contact in interactions:
@@ -413,6 +751,9 @@ class ToolRegistry:
                 "element": atom.GetSymbol(),
                 "aromatic": atom.GetIsAromatic(),
                 "replaceable_hydrogens": atom.GetTotalNumHs(),
+                "allowed_operations": ["addition"],
+                "allowed_change_types": ["addition"],
+                "site_type": "ring" if atom.IsInRing() else "atom",
                 "nearby_protein_atoms": environment["protein_atoms"][:10],
                 "current_interactions": interactions_by_atom.get(atom_index, [])[:8],
                 "growth_probe": {
@@ -424,11 +765,11 @@ class ToolRegistry:
                     if key in growth
                 },
             })
-        replacement_sites = []
-        for site in self._replacement_sites:
+        bond_sites = []
+        for site in self._bond_sites:
             try:
-                spatial = self.get_replacement_site_spatial_profile(
-                    site["replacement_site_id"], max_distance=4.0, probe_count=5
+                spatial = self.get_bond_site_spatial_profile(
+                    site["bond_site_id"], max_distance=4.0, probe_count=5
                 )
                 directional_clearance = [
                     {
@@ -441,30 +782,42 @@ class ToolRegistry:
                 ]
             except Exception as error:
                 directional_clearance = [{"status": "unavailable", "error": str(error)}]
-            replacement_sites.append({
-                "target_type": "replacement_site",
-                "target_id": site["replacement_site_id"],
+            bond_sites.append({
+                "target_type": "bond",
+                "site_type": "bond",
+                "target_id": site["bond_site_id"],
+                "site_id": site["bond_site_id"],
+                "bond_site_id": site["bond_site_id"],
                 "retained_atom_index": site["retained_atom_index"],
                 "removed_side_atom_index": site["removed_side_atom_index"],
                 "removed_heavy_atoms": site["removed_heavy_atoms"],
                 "removed_fraction": site["removed_fraction"],
                 "removed_fragment_smiles": site["removed_fragment_smiles"],
+                "allowed_operations": ["deletion", "replacement"],
+                "allowed_change_types": ["deletion", "replacement"],
                 "attachment_vector": site["attachment_vector"],
                 "retained_atom_interactions": interactions_by_atom.get(
                     site["retained_atom_index"], []
                 )[:8],
+                "removed_reference_interactions": self._removed_side_interactions(
+                    site, interactions_by_atom
+                ),
+                "removed_polar_roles": site.get("removed_polar_roles", {}),
+                "removed_rotatable_bonds": site.get("removed_rotatable_bonds"),
+                "core_overlap": site.get("core_overlap", []),
                 "directional_clearance": directional_clearance,
             })
         return {
             "status": "complete",
             "atom_site_count": len(atom_sites),
-            "replacement_site_count": len(replacement_sites),
+            "bond_site_count": len(bond_sites),
             "atom_sites": atom_sites,
-            "replacement_sites": replacement_sites,
+            "bond_sites": bond_sites,
             "site_type_vocabulary": [
                 "core_anchor", "pocket_extension", "solvent_exposed",
                 "linker_or_sidechain", "uncertain",
             ],
+            "edit_taxonomy": taxonomy_documentation(),
             "limitation": (
                 "These are deterministic host-supported targets and rigid-structure summaries. Priority and "
                 "site type remain LLM assessments; receptor flexibility and binding free energy are not modeled."
@@ -493,25 +846,184 @@ class ToolRegistry:
             return 8
         return 12
 
+    def get_complex_geometry(
+        self, radius: float = 5.5, max_pocket_atoms: int = 240
+    ) -> dict[str, Any]:
+        """Return the bounded 3D representation exposed to the LLM.
+
+        Coordinates are authoritative host facts, not a learned embedding.  The LLM receives
+        a compact receptor-frame representation with explicit atom identity, local distances,
+        donor/acceptor roles, edit vectors and interaction edges.  Raw PDB/SDF files remain
+        audit artifacts and are not required for a text-only model to reason about geometry.
+        """
+        if not 4.0 <= float(radius) <= 8.0:
+            raise ValueError("radius must be between 4.0 and 8.0 angstrom")
+        if not 32 <= int(max_pocket_atoms) <= 400:
+            raise ValueError("max_pocket_atoms must be between 32 and 400")
+        ligand = Chem.RemoveHs(Chem.Mol(self.context.ligand))
+        ligand_conf = ligand.GetConformer()
+        ligand_xyz = ligand_conf.GetPositions()
+        centroid = np.mean(ligand_xyz, axis=0)
+        ligand_atoms = []
+        for atom in ligand.GetAtoms():
+            point = ligand_conf.GetAtomPosition(atom.GetIdx())
+            ligand_atoms.append({
+                "atom_index": atom.GetIdx(),
+                "reference_atom_index": (
+                    atom.GetIntProp("_reference_atom_index")
+                    if atom.HasProp("_reference_atom_index") else atom.GetIdx()
+                ),
+                "element": atom.GetSymbol(),
+                "formal_charge": atom.GetFormalCharge(),
+                "aromatic": atom.GetIsAromatic(),
+                "hydrogens": atom.GetTotalNumHs(),
+                "roles": self._ligand_polar_roles(atom),
+                "xyz": [round(float(value), 3) for value in point],
+                "relative_to_ligand_centroid": [
+                    round(float(value), 3) for value in np.asarray(point) - centroid
+                ],
+            })
+
+        pocket_by_serial: dict[int, tuple[Any, float]] = {}
+        for point in ligand_xyz:
+            for protein_atom, distance in self.context.protein_near(np.asarray(point), radius):
+                old = pocket_by_serial.get(protein_atom.serial)
+                if old is None or distance < old[1]:
+                    pocket_by_serial[protein_atom.serial] = (protein_atom, distance)
+        pocket_rows = []
+        for atom, minimum_distance in sorted(
+            pocket_by_serial.values(), key=lambda item: (item[1], item[0].serial)
+        )[: int(max_pocket_atoms)]:
+            pocket_rows.append({
+                "source_serial": atom.serial,
+                "atom": atom.name,
+                "residue": f"{atom.residue_name}:{atom.chain}:{atom.residue_number}",
+                "element": atom.element,
+                "roles": self._protein_polar_roles(atom),
+                "xyz": [round(float(value), 3) for value in atom.xyz],
+                "minimum_ligand_distance": round(float(minimum_distance), 3),
+            })
+
+        interactions = self.detect_basic_interactions(min(4.5, float(radius)))
+        interaction_edges = []
+        for contact in interactions.get("contacts", []):
+            interaction_edges.append({
+                key: contact[key]
+                for key in (
+                    "kind", "ligand_atom_index", "protein_atom", "distance",
+                    "ligand_roles", "protein_roles", "hydrogen_bond_role_compatible",
+                    "role_warning",
+                ) if key in contact
+            })
+
+        site_vectors = []
+        for atom in ligand.GetAtoms():
+            if atom.GetAtomicNum() <= 1 or atom.GetTotalNumHs() < 1:
+                continue
+            index = atom.GetIdx()
+            neighbors = [item for item in atom.GetNeighbors() if item.GetAtomicNum() > 1]
+            if not neighbors:
+                continue
+            origin = np.asarray(ligand_xyz[index], dtype=float)
+            center = np.mean([ligand_xyz[item.GetIdx()] for item in neighbors], axis=0)
+            vector = origin - center
+            norm = float(np.linalg.norm(vector))
+            if norm <= 1e-8:
+                continue
+            unit = vector / norm
+            probe = origin + unit * 3.0
+            nearest = min(
+                (float(np.linalg.norm(protein.xyz - probe)) for protein in self.context.protein_atoms),
+                default=float("nan"),
+            )
+            site_vectors.append({
+                "target_type": "atom",
+                "target_id": index,
+                "origin_xyz": [round(float(value), 3) for value in origin],
+                "outward_unit_vector": [round(float(value), 4) for value in unit],
+                "probe_xyz_at_3A": [round(float(value), 3) for value in probe],
+                "probe_clearance": round(nearest, 3) if np.isfinite(nearest) else None,
+            })
+        for site in self._bond_sites:
+            profile = self.get_bond_site_spatial_profile(
+                site["bond_site_id"], max_distance=min(4.0, float(radius)), probe_count=5
+            )
+            site_vectors.append({
+                "target_type": "bond",
+                "target_id": site["bond_site_id"],
+                "retained_atom_index": site["retained_atom_index"],
+                "attachment_vector": [round(float(value), 4) for value in site["attachment_vector"]],
+                "directional_clearance": [
+                    {
+                        "label": item.get("label"),
+                        "unit_vector": item.get("unit_vector"),
+                        "minimum_protein_atom_distance_along_probe": item.get(
+                            "minimum_protein_atom_distance_along_probe"
+                        ),
+                        "limiting_sample": {
+                            "distance_from_attachment": (item.get("limiting_sample") or {}).get(
+                                "distance_from_attachment"
+                            ),
+                            "probe_xyz": (item.get("limiting_sample") or {}).get("probe_xyz"),
+                            "nearest_protein_atoms": [
+                                {
+                                    key: row.get(key)
+                                    for key in ("atom", "element", "distance")
+                                }
+                                for row in ((item.get("limiting_sample") or {}).get("nearest_protein_atoms") or [])[:3]
+                            ],
+                        },
+                    }
+                    for item in profile.get("direction_profiles", [])
+                ],
+            })
+
+        representation = {
+            "status": "complete",
+            "schema_version": "simple-molecular-agent.complex-geometry.v1",
+            "coordinate_frame": "input_receptor_pdb_frame",
+            "units": "angstrom",
+            "coordinate_policy": "direct coordinates; no ligand alignment or fitted embedding",
+            "ligand_centroid_xyz": [round(float(value), 3) for value in centroid],
+            "ligand_atoms": ligand_atoms,
+            "pocket_atoms": pocket_rows,
+            "interaction_edges": interaction_edges,
+            "edit_site_vectors": site_vectors,
+            "truncation": {
+                "pocket_radius": float(radius),
+                "max_pocket_atoms": int(max_pocket_atoms),
+                "pocket_atoms_returned": len(pocket_rows),
+            },
+            "limitations": [
+                "Coordinates are host-extracted facts, not an LLM-learned 3D embedding.",
+                "Pocket rows describe proximity and roles; they do not prove energetic contribution.",
+                "Hydrogen-bond claims require donor/acceptor compatibility and pose-level verification.",
+            ],
+        }
+        representation["geometry_identity"] = hashlib.sha256(
+            json.dumps(representation, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return representation
+
     def get_design_dossier(self, panel_size: int = 6) -> dict[str, Any]:
-        """Build the bounded initial context for portfolio-style optimization."""
+        """Build the bounded initial context for sequential site-locked optimization."""
         if not 2 <= int(panel_size) <= 20:
             raise ValueError("panel_size must be between 2 and 20")
         sites = self.get_edit_site_candidates()
         enriched_sites = []
-        for site in sites["atom_sites"] + sites["replacement_sites"]:
-            operation = "substitute" if site["target_type"] == "atom" else "replace_fragment"
+        for site in sites["atom_sites"] + sites["bond_sites"]:
+            change_types = site.get("allowed_change_types") or self._site_change_types(site)
+            panel_change = next(
+                (item for item in ("replacement", "addition") if item in change_types), None
+            )
             max_heavy_atoms = self._site_max_fragment_heavy_atoms(site)
             enriched_sites.append({
                 **site,
-                "supported_operation": (
-                    "replace_hydrogen" if site["target_type"] == "atom" else "replace_fragment"
-                ),
+                "allowed_change_types": change_types,
+                "fragment_edit_change_type": panel_change,
                 "recommended_max_fragment_heavy_atoms": max_heavy_atoms,
-                "fragment_panel": self.fragment_library.panel(
-                    operation=operation,
-                    limit=int(panel_size),
-                    max_heavy_atoms=max_heavy_atoms,
+                "fragment_panel": _library_panel(
+                    self.fragment_library, panel_change, int(panel_size), max_heavy_atoms
                 ),
             })
         return {
@@ -519,7 +1031,9 @@ class ToolRegistry:
             "ligand": self.get_ligand_info(),
             "pocket": self.get_pocket_residues(6.0),
             "reference_interactions": self.detect_basic_interactions(4.5),
+            "geometry": self.get_complex_geometry(),
             "fragment_library": self.fragment_library.overview(),
+            "edit_taxonomy": taxonomy_documentation(),
             "sites": enriched_sites,
             "site_count": len(enriched_sites),
             "panel_size_per_site": int(panel_size),
@@ -529,77 +1043,6 @@ class ToolRegistry:
             ),
         }
 
-    def screen_candidate_batch(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
-        """Deterministically construct and geometrically screen an LLM-selected batch."""
-        if not isinstance(candidates, list) or not candidates:
-            raise ValueError("screen_candidate_batch requires a non-empty candidates array")
-        if len(candidates) > 32:
-            raise ValueError("screen_candidate_batch accepts at most 32 candidates")
-        accepted = []
-        rejected = []
-        seen_structures: set[str] = set()
-        for position, candidate in enumerate(candidates, start=1):
-            if not isinstance(candidate, dict):
-                rejected.append({
-                    "position": position,
-                    "status": "rejected",
-                    "failure_class": "invalid_candidate_spec",
-                    "error": "Candidate must be an object",
-                })
-                continue
-            transformation = {
-                key: candidate[key]
-                for key in (
-                    "operation", "edit_atom_index", "replacement_site_id", "fragment_id",
-                    "fragment_smiles", "parent_attempt", "replace_existing_substituent",
-                )
-                if candidate.get(key) is not None
-            }
-            target_type = candidate.get("target_type")
-            target_id = candidate.get("target_id")
-            if target_type == "atom":
-                transformation.setdefault("operation", "replace_hydrogen")
-                transformation.setdefault("edit_atom_index", target_id)
-            elif target_type == "replacement_site":
-                transformation.setdefault("operation", "replace_fragment")
-                transformation.setdefault("replacement_site_id", target_id)
-            result = self.validate_candidate_geometry(**transformation)
-            item = {
-                "position": position,
-                "hypothesis": candidate.get("hypothesis"),
-                "transformation": result.get("transformation", transformation),
-                "status": result.get("status"),
-                "failure_class": result.get("failure_class"),
-                "error": result.get("error"),
-                "validation": result,
-            }
-            canonical = ((result.get("candidate") or {}).get("canonical_smiles"))
-            if result.get("status") == "accepted" and isinstance(canonical, str):
-                if canonical in seen_structures:
-                    item.update({
-                        "status": "rejected",
-                        "failure_class": "duplicate_candidate_structure",
-                        "error": "Another candidate in this batch generated the same canonical structure.",
-                    })
-                    rejected.append(item)
-                    continue
-                seen_structures.add(canonical)
-                item["canonical_smiles"] = canonical
-                accepted.append(item)
-            else:
-                rejected.append(item)
-        return {
-            "status": "complete",
-            "submitted_count": len(candidates),
-            "accepted_count": len(accepted),
-            "rejected_count": len(rejected),
-            "accepted": accepted,
-            "rejected": rejected,
-            "limitation": (
-                "Accepted candidates passed deterministic construction and rigid-protein geometry only; "
-                "they have not yet been docked."
-            ),
-        }
 
     def get_fragment_panel(
         self,
@@ -611,7 +1054,7 @@ class ToolRegistry:
         limit: int = 12,
     ) -> dict[str, Any]:
         dossier = self.get_edit_site_candidates()
-        sites = dossier["atom_sites"] + dossier["replacement_sites"]
+        sites = dossier["atom_sites"] + dossier["bond_sites"]
         site = next(
             (
                 item for item in sites
@@ -621,21 +1064,26 @@ class ToolRegistry:
         )
         if site is None:
             raise ValueError(f"Unknown host target: {target_type}:{target_id}")
-        operation = "substitute" if target_type == "atom" else "replace_fragment"
+        change_types = site.get("allowed_change_types") or self._site_change_types(site)
+        panel_change = next(
+            (item for item in ("replacement", "addition") if item in change_types), None
+        )
         capacity = self._site_max_fragment_heavy_atoms(site)
         effective_max = min(capacity, int(max_heavy_atoms or capacity))
-        fragments = self.fragment_library.panel(
-            operation=operation,
-            limit=int(limit),
-            max_heavy_atoms=effective_max,
+        fragments = _library_panel(
+            self.fragment_library,
+            panel_change,
+            int(limit),
+            effective_max,
             size_classes=size_classes,
-            chemical_tags_any=chemical_tags,
+            chemical_tags=chemical_tags,
         )
         return {
             "status": "complete",
             "target_type": target_type,
             "target_id": target_id,
-            "operation": operation,
+            "allowed_change_types": change_types,
+            "fragment_edit_change_type": panel_change,
             "site_capacity_heavy_atoms": capacity,
             "effective_max_heavy_atoms": effective_max,
             "requested_size_classes": size_classes,
@@ -658,8 +1106,8 @@ class ToolRegistry:
             and atom.GetTotalNumHs() > 0
             and not (atom.GetSymbol() == "N" and atom.GetIsAromatic())
         }
-        replacement_sites = {
-            site["replacement_site_id"] for site in self._replacement_sites
+        bond_sites = {
+            site["bond_site_id"] for site in self._bond_sites
         }
         allowed_types = {
             "core_anchor", "pocket_extension", "solvent_exposed",
@@ -677,14 +1125,14 @@ class ToolRegistry:
             site_type = item.get("site_type")
             rationale = item.get("rationale")
             search_status = item.get("search_status", "active")
-            if target_type not in {"atom", "replacement_site"}:
-                raise ValueError("site assessment target_type must be atom or replacement_site")
+            if target_type not in {"atom", "bond"}:
+                raise ValueError("site assessment target_type must be atom or bond_site")
             valid_target = (
                 target_type == "atom" and isinstance(target_id, int) and target_id in editable_atoms
             ) or (
-                target_type == "replacement_site"
+                target_type == "bond"
                 and isinstance(target_id, str)
-                and target_id in replacement_sites
+                and target_id in bond_sites
             )
             if not valid_target:
                 raise ValueError(f"Unknown or non-editable site target: {target_type}:{target_id}")
@@ -726,19 +1174,110 @@ class ToolRegistry:
             ),
         }
 
+    @staticmethod
+    def _molecule_graph(molecule: Chem.Mol) -> dict[str, Any]:
+        """Return a compact graph projection without pose coordinates.
+
+        Atom elements remain part of the graph because topology without element
+        identity is not a chemically meaningful molecular graph. Coordinates
+        stay in the PDB/SDF pose artifacts and are deliberately not duplicated
+        in the LLM JSON context.
+        """
+        atoms = []
+        for atom in molecule.GetAtoms():
+            atoms.append({
+                "atom_id": f"atom-{atom.GetIdx()}",
+                "atom_index": atom.GetIdx(),
+                "element": atom.GetSymbol(),
+                "atomic_number": atom.GetAtomicNum(),
+                "formal_charge": atom.GetFormalCharge(),
+                "isotope": atom.GetIsotope(),
+                "explicit_hydrogens": atom.GetNumExplicitHs(),
+                "implicit_hydrogens": atom.GetNumImplicitHs(),
+                "bond_degree": atom.GetDegree(),
+                "aromatic": atom.GetIsAromatic(),
+                "chiral_tag": str(atom.GetChiralTag()).split(".")[-1],
+            })
+        bonds = []
+        for bond in molecule.GetBonds():
+            bonds.append({
+                "bond_id": f"bond-{bond.GetIdx()}",
+                "atom_ids": [
+                    f"atom-{bond.GetBeginAtomIdx()}",
+                    f"atom-{bond.GetEndAtomIdx()}",
+                ],
+                "begin_atom_index": bond.GetBeginAtomIdx(),
+                "end_atom_index": bond.GetEndAtomIdx(),
+                "order": str(bond.GetBondType()).split(".")[-1],
+                "aromatic": bond.GetIsAromatic(),
+                "stereo": str(bond.GetStereo()).split(".")[-1],
+            })
+        hydrogen_free = Chem.RemoveHs(molecule)
+        chemical_smiles = Chem.MolToSmiles(hydrogen_free, isomericSmiles=True)
+        normalized_smiles = Chem.MolToSmiles(hydrogen_free, isomericSmiles=False)
+        identity_material = {
+            "normalized_smiles": normalized_smiles,
+            "atoms": atoms,
+            "bonds": bonds,
+        }
+        graph_identity = hashlib.sha256(
+            json.dumps(identity_material, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        chemical_identity = hashlib.sha256(
+            json.dumps(
+                {"chemical_smiles": chemical_smiles, "formal_charge": Chem.GetFormalCharge(molecule)},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        return {
+            "schema_version": "simple-molecular-agent.molecule-graph.v1",
+            "atom_identity": "rdkit_atom_index_for_current_structure",
+            "normalized_smiles": normalized_smiles,
+            "chemical_smiles": chemical_smiles,
+            "canonical_smiles": chemical_smiles,
+            "graph_identity": graph_identity,
+            "chemical_identity": chemical_identity,
+            "atoms": atoms,
+            "bonds": bonds,
+        }
+
+    @staticmethod
+    def _molecular_properties(molecule: Chem.Mol) -> dict[str, Any]:
+        return {
+            "schema_version": "simple-molecular-agent.molecule-properties.v1",
+            "molecular_formula": rdMolDescriptors.CalcMolFormula(molecule),
+            "molecular_weight": round(float(Descriptors.MolWt(molecule)), 4),
+            "exact_mass": round(float(Descriptors.ExactMolWt(molecule)), 4),
+            "formal_charge": int(Chem.GetFormalCharge(molecule)),
+            "heavy_atoms": int(molecule.GetNumHeavyAtoms()),
+            "component_count": len(Chem.GetMolFrags(molecule)),
+            "logp": round(float(Crippen.MolLogP(molecule)), 4),
+            "hbd": int(Lipinski.NumHDonors(molecule)),
+            "hba": int(Lipinski.NumHAcceptors(molecule)),
+            "tpsa": round(float(rdMolDescriptors.CalcTPSA(molecule)), 4),
+            "rotatable_bonds": int(rdMolDescriptors.CalcNumRotatableBonds(molecule)),
+            "ring_count": int(rdMolDescriptors.CalcNumRings(molecule)),
+            "aromatic_ring_count": int(rdMolDescriptors.CalcNumAromaticRings(molecule)),
+            "fraction_csp3": round(float(rdMolDescriptors.CalcFractionCSP3(molecule)), 4),
+        }
+
     def get_ligand_info(self) -> dict[str, Any]:
         molecule = self.context.ligand
+        graph = self._molecule_graph(molecule)
+        properties = self._molecular_properties(molecule)
         return {
             "name": molecule.GetProp("_Name") if molecule.HasProp("_Name") else "ligand",
-            "canonical_smiles": Chem.MolToSmiles(Chem.RemoveHs(molecule), isomericSmiles=True),
-            "formal_charge": Chem.GetFormalCharge(molecule),
-            "heavy_atoms": molecule.GetNumHeavyAtoms(),
-            "molecular_weight": round(Descriptors.MolWt(molecule), 2),
-            "logp": round(Crippen.MolLogP(molecule), 2),
-            "hbd": Lipinski.NumHDonors(molecule),
-            "hba": Lipinski.NumHAcceptors(molecule),
-            "tpsa": round(rdMolDescriptors.CalcTPSA(molecule), 2),
-            "atoms": self.context.ligand_atom_rows(),
+            "canonical_smiles": graph["canonical_smiles"],
+            "formal_charge": properties["formal_charge"],
+            "heavy_atoms": properties["heavy_atoms"],
+            "molecular_weight": properties["molecular_weight"],
+            "logp": properties["logp"],
+            "hbd": properties["hbd"],
+            "hba": properties["hba"],
+            "tpsa": properties["tpsa"],
+            "molecule_graph": graph,
+            "molecular_properties": properties,
         }
 
     def get_pocket_residues(self, radius: float) -> dict[str, Any]:
@@ -933,7 +1472,9 @@ class ToolRegistry:
             "limitation": "Rigid outward-vector probe; receptor flexibility and free energy are not modeled.",
         }
 
-    def _build_replacement_sites(self) -> list[dict[str, Any]]:
+    def _build_bond_sites(self) -> list[dict[str, Any]]:
+        if self.site_table is not None:
+            return self._bond_sites_from_table()
         molecule = Chem.RemoveHs(Chem.Mol(self.context.ligand))
         total_atoms = molecule.GetNumHeavyAtoms()
         configured = self.context.task.get("fragment_replacement") or {}
@@ -988,6 +1529,9 @@ class ToolRegistry:
                 "retained_heavy_atoms": len(retained),
                 "removed_heavy_atoms": len(removed),
                 "removed_fraction": round(len(removed) / total_atoms, 3),
+                "allowed_operations": ["deletion", "replacement"],
+                "allowed_change_types": ["deletion", "replacement"],
+                **self._removal_profile(sorted(removed)),
                 "retained_ring_atoms": len(retained & ring_atoms),
                 "removed_ring_atoms": len(removed & ring_atoms),
                 "retained_atom_indices": sorted(retained),
@@ -1012,14 +1556,48 @@ class ToolRegistry:
             )
         )
         for number, site in enumerate(candidates, start=1):
-            site["replacement_site_id"] = f"replacement-site-{number:03d}"
+            site["bond_site_id"] = f"bond-site-{number:03d}"
         return candidates
 
-    def list_fragment_replacement_sites(self, limit: int = 30) -> dict[str, Any]:
+    def _bond_sites_from_table(self) -> list[dict[str, Any]]:
+        molecule = Chem.RemoveHs(Chem.Mol(self.context.ligand))
+        ring_atoms = {index for ring in molecule.GetRingInfo().AtomRings() for index in ring}
+        sites = []
+        for record in self.site_table["cut_sites"]:
+            retained = list(record["retained_atom_indices"])
+            removed = list(record["removed_atom_indices"])
+            sites.append({
+                "bond_site_id": record["site_id"],
+                "site_id": record["site_id"],
+                "region": record.get("region"),
+                "label": record.get("label"),
+                "cut_bond": list(record["cut_bond"]),
+                "retained_atom_index": record["retained_atom_index"],
+                "removed_side_atom_index": record["removed_side_atom_index"],
+                "retained_atom_element": molecule.GetAtomWithIdx(record["retained_atom_index"]).GetSymbol(),
+                "removed_side_atom_element": molecule.GetAtomWithIdx(record["removed_side_atom_index"]).GetSymbol(),
+                "retained_heavy_atoms": record["retained_heavy_atoms"],
+                "removed_heavy_atoms": record["removed_heavy_atoms"],
+                "removed_fraction": record["removed_fraction"],
+                "retained_ring_atoms": len(set(retained) & ring_atoms),
+                "removed_ring_atoms": len(set(removed) & ring_atoms),
+                "retained_atom_indices": retained,
+                "removed_atom_indices": removed,
+                "retained_scaffold_smiles": record["retained_scaffold_smiles"],
+                "removed_fragment_smiles": record["removed_fragment_smiles"],
+                "attachment_vector": list(record["attachment_vector"]),
+                "allowed_operations": list(record.get("allowed_operations") or []),
+                "allowed_change_types": self._site_change_types(record),
+                **self._removal_profile(removed),
+                "protection": record.get("protection"),
+            })
+        return sites
+
+    def list_bond_sites(self, limit: int = 30) -> dict[str, Any]:
         return {
-            "count": min(len(self._replacement_sites), limit),
-            "total_count": len(self._replacement_sites),
-            "sites": self._replacement_sites[:limit],
+            "count": min(len(self._bond_sites), limit),
+            "total_count": len(self._bond_sites),
+            "sites": self._bond_sites[:limit],
             "policy": (
                 "Each site is a directed non-ring single-bond cut. The first atom and larger "
                 "ring-rich scaffold are retained; the listed removed side is deleted. Sites that "
@@ -1027,29 +1605,54 @@ class ToolRegistry:
             ),
         }
 
-    def resolve_replacement_site(self, replacement_site_id: str) -> dict[str, Any]:
-        for site in self._replacement_sites:
-            if site["replacement_site_id"] == replacement_site_id:
+    def resolve_bond_site(self, bond_site_id: str) -> dict[str, Any]:
+        for site in self._bond_sites:
+            if site["bond_site_id"] == bond_site_id:
                 return dict(site)
         raise ValueError(
-            f"Unknown replacement_site_id: {replacement_site_id}. "
-            "Call list_fragment_replacement_sites and select one returned ID."
+            f"Unknown bond_site_id: {bond_site_id}. "
+            "Call list_bond_sites and select one returned ID."
         )
 
-    def get_replacement_site_spatial_profile(
+    @staticmethod
+    def _removed_side_interactions(
+        site: dict[str, Any], interactions_by_atom: dict[int, list[dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        """Deterministic consequence of a deletion: which reference contacts disappear.
+
+        The removed side of a bond site is fully known, so the lost contacts are a
+        host fact rather than a prediction.  It lets the designer judge the real cost
+        of a truncation instead of discovering it only after docking.
+        """
+        seen: set[tuple[Any, ...]] = set()
+        lost: list[dict[str, Any]] = []
+        for index in site.get("removed_atom_indices") or []:
+            for contact in interactions_by_atom.get(index) or []:
+                key = (
+                    contact.get("kind"),
+                    contact.get("protein_atom"),
+                    contact.get("ligand_atom_index"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                lost.append(contact)
+        return lost[:12]
+
+    def get_bond_site_spatial_profile(
         self,
-        replacement_site_id: str,
+        bond_site_id: str,
         max_distance: float = 4.0,
         probe_count: int = 5,
     ) -> dict[str, Any]:
-        site = self.resolve_replacement_site(replacement_site_id)
+        site = self.resolve_bond_site(bond_site_id)
         conformer = self.context.ligand.GetConformer()
         point = conformer.GetAtomPosition(site["retained_atom_index"])
         origin = np.array([point.x, point.y, point.z], dtype=float)
         attachment = np.array(site["attachment_vector"], dtype=float)
         norm = float(np.linalg.norm(attachment))
         if norm < 1e-8:
-            raise ValueError(f"Replacement site {replacement_site_id} has no attachment direction")
+            raise ValueError(f"Replacement site {bond_site_id} has no attachment direction")
         forward = attachment / norm
         reference = np.array([1.0, 0.0, 0.0])
         if abs(float(np.dot(forward, reference))) > 0.85:
@@ -1113,7 +1716,7 @@ class ToolRegistry:
 
         return {
             "status": "complete",
-            "replacement_site_id": replacement_site_id,
+            "bond_site_id": bond_site_id,
             "retained_atom_index": site["retained_atom_index"],
             "removed_side_atom_index": site["removed_side_atom_index"],
             "attachment_origin_xyz": [round(float(value), 3) for value in origin],
@@ -1272,17 +1875,17 @@ class ToolRegistry:
             ),
         }
 
-    def _resolve_fragment_replacement(self, transformation: dict[str, Any]) -> None:
-        site_id = transformation.get("replacement_site_id")
+    def _resolve_bond_site(self, transformation: dict[str, Any]) -> None:
+        site_id = transformation.get("bond_site_id")
         if not isinstance(site_id, str):
             raise ValueError(
-                "replace_fragment requires replacement_site_id from "
-                "list_fragment_replacement_sites; direct cut_bond input is not accepted"
+                "A bond site requires bond_site_id from list_bond_sites; "
+                "direct cut_bond input is not accepted"
             )
-        site = self.resolve_replacement_site(site_id)
+        site = self.resolve_bond_site(site_id)
         transformation["cut_bond"] = site["cut_bond"]
         transformation["edit_atom_index"] = site["retained_atom_index"]
-        transformation["replacement_site"] = site
+        transformation["bond"] = site
 
     def _parent_ligand(self, parent_attempt: int | None = None) -> Chem.Mol:
         if parent_attempt is None:
@@ -1291,6 +1894,41 @@ class ToolRegistry:
             raise ValueError("parent_attempt is not available in this tool context")
         return self.parent_resolver(parent_attempt)
 
+    def _enforce_site_policy(self, transformation: dict[str, Any]) -> dict[str, Any] | None:
+        """Return a rejection when the chosen change type is not allowed at the site."""
+        if self.site_table is None:
+            return None
+        normalize_transformation(transformation)
+        site_type = transformation["site_type"]
+        change_type = transformation["change_type"]
+        if site_type in {"bond", "linker"}:
+            site_id = transformation.get("bond_site_id")
+            if not isinstance(site_id, str):
+                return None  # the normal validation path reports the missing site id
+            policy = self._site_table_policy(change_type, "bond", site_id)
+        else:
+            atom_index = transformation.get("edit_atom_index", transformation.get("atom_index"))
+            if not isinstance(atom_index, int):
+                return None
+            policy = self._site_table_policy(change_type, "atom", atom_index)
+        if policy.get("allowed"):
+            transformation["site_policy"] = {
+                "status": policy.get("status"),
+                "protection": policy.get("protection"),
+                "probe_verdict": policy.get("probe_verdict"),
+                "source": policy.get("source"),
+            }
+            if policy.get("canonicalization"):
+                transformation["site_canonicalization"] = policy["canonicalization"]
+            return None
+        return {
+            "status": "rejected",
+            "failure_class": policy.get("failure_class"),
+            "error": policy.get("reason"),
+            "site_policy": policy,
+            "transformation": transformation,
+        }
+
     def validate_candidate_geometry(
         self, parent_attempt: int | None = None, **transformation: Any
     ) -> dict[str, Any]:
@@ -1298,19 +1936,64 @@ class ToolRegistry:
         parent = self._parent_ligand(parent_attempt)
         if parent_attempt is not None:
             transformation["parent_attempt"] = parent_attempt
-        if transformation.get("operation") == "replace_fragment":
+        if "atom_index" in transformation and "edit_atom_index" not in transformation:
+            transformation["edit_atom_index"] = transformation["atom_index"]
+        target_type = transformation.get("target_type")
+        target_id = transformation.get("target_id")
+        if target_type == "atom" and transformation.get("edit_atom_index") is None:
+            transformation["edit_atom_index"] = target_id
+        elif target_type == "bond" and transformation.get("bond_site_id") is None:
+            transformation["bond_site_id"] = target_id
+        try:
+            normalize_transformation(transformation)
+        except EditTaxonomyError as exc:
+            return {"status": "rejected", "error": str(exc), "transformation": transformation}
+        policy_rejection = self._enforce_site_policy(transformation)
+        if policy_rejection is not None:
+            return policy_rejection
+        apply_site_canonicalization(transformation)
+        site_type = transformation["site_type"]
+        change_type = transformation["change_type"]
+        if site_type in {"bond", "linker"} and not transformation.get("replace_existing_substituent"):
             try:
-                self._resolve_fragment_replacement(transformation)
+                self._resolve_bond_site(transformation)
             except Exception as exc:
                 return {"status": "rejected", "error": str(exc), "transformation": transformation}
-        if transformation.get("fragment_id"):
+        resolved_bond = transformation.get("bond") or {}
+        if site_type in {"bond", "linker"} and resolved_bond.get("core_overlap"):
+            overlap = resolved_bond["core_overlap"]
+            return {
+                "status": "rejected",
+                "failure_class": "pose_core_removal",
+                "error": (
+                    f"This edit removes pose-comparison core atoms {overlap}; the native-like "
+                    "reference comparison would be invalid. Choose a site whose removed side "
+                    "lies outside the comparison core."
+                ),
+                "core_overlap": overlap,
+                "transformation": transformation,
+            }
+        if change_type == "replacement" and site_type in {"atom", "ring"} and not isinstance(
+            transformation.get("element"), str
+        ):
+            return {
+                "status": "rejected",
+                "error": "atom/ring replacement requires an element symbol",
+                "transformation": transformation,
+            }
+        needs_fragment = (site_type == "atom" and change_type == "addition") or (
+            site_type == "bond" and change_type == "replacement"
+        )
+        if needs_fragment and transformation.get("fragment_id"):
             record = self.fragment_library.get(str(transformation["fragment_id"]))
-            requested_operation = transformation.get("operation", "replace_hydrogen")
-            library_operation = "substitute" if requested_operation in {"substitute", "replace_hydrogen"} else requested_operation
+            library_operation = LIBRARY_OPERATION_FOR_CHANGE_TYPE.get(change_type, change_type)
             if not self.fragment_library.allows_operation(record, library_operation):
                 return {
                     "status": "rejected",
-                    "error": f"Fragment {transformation['fragment_id']} does not allow operation {library_operation}",
+                    "error": (
+                        f"Fragment {transformation['fragment_id']} does not allow a "
+                        f"{change_type} edit (library operation {library_operation})"
+                    ),
                     "transformation": transformation,
                 }
             if not transformation.get("fragment_smiles"):
@@ -1326,10 +2009,12 @@ class ToolRegistry:
             else:
                 transformation["fragment_smiles"] = record["smiles"]
             transformation["library_record"] = record
-            if transformation.get("operation") == "substitute":
-                transformation["operation"] = "replace_hydrogen"
-        if "atom_index" in transformation and "edit_atom_index" not in transformation:
-            transformation["edit_atom_index"] = transformation["atom_index"]
+        if needs_fragment and not isinstance(transformation.get("fragment_smiles"), str):
+            return {
+                "status": "rejected",
+                "error": "The transformation requires fragment_smiles or a valid fragment_id",
+                "transformation": transformation,
+            }
         try:
             result = apply_transformation(
                 parent,
@@ -1341,143 +2026,27 @@ class ToolRegistry:
             return {"status": "rejected", "error": str(exc), "transformation": transformation}
         return {**result.report, "transformation": transformation}
 
-    def generate_site_candidate_batch(
-        self,
-        target_type: str,
-        target_id: Any,
-        query: str = "",
-        max_heavy_atoms: int = 12,
-        size_class: str | None = None,
-        chemical_tag: str | None = None,
-        limit: int = 16,
-        parent_attempt: int | None = None,
-    ) -> dict[str, Any]:
-        parent = self._parent_ligand(parent_attempt)
-        if target_type == "atom":
-            if not isinstance(target_id, int) or not 0 <= target_id < parent.GetNumAtoms():
-                raise ValueError(f"Invalid ligand atom index: {target_id}")
-            atom = parent.GetAtomWithIdx(target_id)
-            if atom.GetAtomicNum() == 1:
-                raise ValueError("Edit-site tools require a heavy atom")
-            if parent_attempt is None:
-                if atom.GetTotalNumHs() < 1 or (atom.GetSymbol() == "N" and atom.GetIsAromatic()):
-                    raise ValueError(f"Atom {target_id!r} is not supported for replace_hydrogen")
-            else:
-                removable = [
-                    bond for bond in atom.GetBonds()
-                    if not bond.IsInRing()
-                    and bond.GetBondType() == Chem.BondType.SINGLE
-                    and bond.GetOtherAtom(atom).GetAtomicNum() > 1
-                ]
-                if not removable:
-                    raise ValueError(
-                        f"Atom {target_id!r} has no removable substituent for local replacement"
-                    )
-            operation = "substitute"
-        elif target_type == "replacement_site":
-            self.resolve_replacement_site(target_id)
-            operation = "replace_fragment"
-        else:
-            raise ValueError("target_type must be atom or replacement_site")
-        search = self.fragment_library.search(
-            query=query,
-            max_heavy_atoms=max_heavy_atoms,
-            operation=operation,
-            limit=limit,
-            size_class=size_class,
-            chemical_tag=chemical_tag,
-        )
-        if search.get("status") != "complete":
-            return {
-                **search,
-                "target_type": target_type,
-                "target_id": target_id,
-                "candidates": [],
-            }
-        candidates = []
-        rejected = []
-        seen_structures = set()
-        for record in search.get("fragments", []):
-            transformation = {
-                "operation": "replace_hydrogen" if target_type == "atom" else "replace_fragment",
-                "fragment_id": record["fragment_id"],
-                "fragment_smiles": record["smiles"],
-                "parent_attempt": parent_attempt,
-                "replace_existing_substituent": parent_attempt is not None,
-            }
-            if target_type == "atom":
-                transformation["edit_atom_index"] = target_id
-            else:
-                transformation["replacement_site_id"] = target_id
-                self._resolve_fragment_replacement(transformation)
-            try:
-                result = apply_transformation(
-                    parent,
-                    transformation,
-                    self.context.protein_atoms,
-                    seed=17,
-                )
-            except Exception as error:
-                rejected.append({
-                    "fragment_id": record["fragment_id"],
-                    "fragment_smiles": record["smiles"],
-                    "failure_class": "candidate_construction_or_geometry",
-                    "error": str(error),
-                })
-                continue
-            canonical = result.report["candidate"]["canonical_smiles"]
-            if canonical in seen_structures:
-                continue
-            seen_structures.add(canonical)
-            summary = {
-                "fragment_id": record["fragment_id"],
-                "fragment_smiles": record["smiles"],
-                "transformation": transformation,
-                "canonical_smiles": canonical,
-                "status": result.report["status"],
-                "failure_class": result.report.get("failure_class"),
-                "severe_clash_count": result.report.get("severe_clash_count"),
-                "property_delta": result.report.get("property_delta"),
-                "fragment_properties": record.get("properties"),
-            }
-            if result.report["status"] == "accepted":
-                candidates.append(summary)
-            else:
-                rejected.append(summary)
-        return {
-            "status": "complete",
-            "target_type": target_type,
-            "target_id": target_id,
-            "parent_attempt": parent_attempt,
-            "query": query,
-            "operation": operation,
-            "requested_limit": limit,
-            "size_class": size_class,
-            "chemical_tag": chemical_tag,
-            "library_match_count": search.get("count", 0),
-            "accepted_count": len(candidates),
-            "rejected_count": len(rejected),
-            "candidates": candidates,
-            "rejected": rejected[:20],
-            "limitation": (
-                "Candidates passed only deterministic construction and rigid-protein clash prescreening. "
-                "They are not docked, ranked by affinity, or experimental activity predictions."
-            ),
-        }
 
     def search_fragment_library(
         self,
         query: str = "",
         max_heavy_atoms: int = 12,
-        operation: str = "substitute",
+        change_type: str = "addition",
+        site_type: str | None = None,
+        operation: str | None = None,
         size_class: str | None = None,
         chemical_tag: str | None = None,
         limit: int = 30,
     ) -> dict[str, Any]:
+        # ``operation`` is accepted for older callers and run artifacts; the
+        # canonical selector is ``change_type``.
+        library_operation = operation or LIBRARY_OPERATION_FOR_CHANGE_TYPE.get(
+            change_type, change_type
+        )
         return self.fragment_library.search(
             query,
             max_heavy_atoms,
-            operation,
+            library_operation,
             limit,
             size_class=size_class,
             chemical_tag=chemical_tag,

@@ -58,6 +58,10 @@ def test_gpt_profiles_inherit_current_provider_and_credentials(config, monkeypat
     assert lightweight.base_url == current.base_url == "https://codex-current.invalid/v1"
     assert lightweight.api_key == current.api_key == "fake-current"
     assert lightweight.wire_api == current.wire_api == "responses"
+    if profile == "gpt-5.6-luna":
+        assert lightweight.timeout == 600
+        assert lightweight.max_api_retries == 5
+        assert lightweight.retry_delay_seconds == 10
 
 
 def test_doubao_isolates_credentials_and_uses_ark_responses(config, monkeypatch, tmp_path):
@@ -121,6 +125,8 @@ def test_chat_completions_wire_format_and_repair(config, monkeypatch, truncated)
 
     def fake_run(command, **kwargs):
         assert "https://api.deepseek.com/v1/chat/completions" in command
+        assert "--retry-all-errors" in command
+        assert command[command.index("--connect-timeout") + 1] == "90"
         body = json.loads(Path(command[command.index("--data-binary") + 1][1:]).read_text())
         assert "input" not in body and "reasoning" not in body
         assert body["messages"][0]["role"] == "system"
@@ -140,9 +146,13 @@ def test_chat_completions_wire_format_and_repair(config, monkeypatch, truncated)
     client = ResponsesClient(config, llm_profile="deepseek", progress=lambda e, d: events.append((e, d)))
     assert client.complete_json({"mode": "test"})["action"] == "QUERY"
     assert len(calls) == (2 if truncated else 1)
-    assert calls[0]["max_tokens"] == 4096
+    # DeepSeek reasoning is enabled by default; the profile keeps a large output
+    # budget because the reasoning trace shares the answer budget.
+    assert client.thinking == {"type": "enabled"}
+    assert "thinking" in calls[0] and calls[0]["thinking"] == {"type": "enabled"}
+    assert calls[0]["max_tokens"] == client.max_output_tokens >= 16384
     if truncated:
-        assert calls[1]["max_tokens"] == 4096
+        assert calls[1]["max_tokens"] == client.repair_max_output_tokens >= 16384
     assert events[-1][1]["cached_input_tokens"] == 50
 
 
