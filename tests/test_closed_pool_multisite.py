@@ -317,3 +317,14 @@ def test_mark_unmodifiable_closes_site_in_direct_mode(tmp_path):
     site_ids = {(s.get("target_type"), s.get("target_id")) for s in dossier.get("sites", [])}
     assert ("atom", 2) not in site_ids
     assert ("bond", "cut-001") not in site_ids
+
+
+def test_halogen_element_swap_uses_an_element_not_a_fragment(pool: ClosedPool) -> None:
+    """atom:replacement on Cl/F is an element swap (Cl -> Br), not a fragment replacement."""
+    normalized = pool.normalize({
+        "action": "READY", "site_type": "atom", "change_type": "replacement",
+        "edit_atom_index": 26, "element": "Br",
+    })
+    assert normalized["element"] == "Br"
+    assert "Br" in pool.product_smiles(normalized)
+    assert "Cl" not in pool.product_smiles(normalized)

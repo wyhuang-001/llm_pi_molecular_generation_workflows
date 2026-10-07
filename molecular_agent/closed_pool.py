@@ -249,7 +249,11 @@ class ClosedPool:
             out = {**decision, "site_type": site_type, "change_type": change_type,
                    "edit_atom_index": atom_index}
 
-        if change_type in {"addition", "replacement"} and site_type in {"atom", "bond"}:
+        needs_fragment = (
+            change_type == "addition"
+            or (change_type == "replacement" and site_type in {"bond", "linker"})
+        )
+        if needs_fragment:
             fragment_id = decision.get("fragment_id")
             smiles = decision.get("fragment_smiles")
             if smiles:
@@ -265,9 +269,12 @@ class ClosedPool:
             out["fragment_id"] = fragment_id
             out["fragment_smiles"] = record["smiles"]
         elif change_type == "replacement":
+            # atom:replacement and ring:replacement are element swaps (e.g. Cl -> Br),
+            # not fragment replacements; they take an element symbol, not a fragment.
             element = decision.get("element")
             if not isinstance(element, str) or not element.strip():
                 raise ValueError("An atom/ring replacement needs an element symbol")
+            out["element"] = element
         return out
 
     def product_smiles(self, decision: dict) -> str:
