@@ -20,25 +20,25 @@
       "activity_used": false
     }
   },
-  "candidate_count": 213,
+  "candidate_count": 214,
   "maximum_unique_candidates": 30,
   "maximum_design_requests": 150,
   "counts": {
-    "catalog_total": 213,
+    "catalog_total": 214,
     "literature_compounds": 27,
     "literature_covered": 26,
     "literature_uncovered": 1,
     "literature_derived_fragments": 22,
     "all_decomposition_fragments": 88,
     "compounds_needing_no_fragment": 0,
-    "bond_sites": 11,
+    "bond_sites": 13,
     "atom_sites": 15
   },
   "public_files": {
     "catalog": "4WKQ/design/fragments-multisite.json",
-    "catalog_sha256": "c9a7c8000ae3543366f34994d98de9fee96842cd8543d5c9f7019c47227338f4",
+    "catalog_sha256": "7593625655db6ae06f4f4d61220fa634b013a07757e794e74f85ee99e7805a50",
     "site_table": "4WKQ/design/sites-multisite.json",
-    "site_table_sha256": "d65da6074103bd75721ddd4ab4755a33f89d6098855775b8be6606f39b154590",
+    "site_table_sha256": "e2995333465252eb649f38c0658463d7011e8a101fc7b5a72334962d05a539f9",
     "site_table_derived_from": "4WKQ/design/sites-v2.json"
   },
   "private_files": {

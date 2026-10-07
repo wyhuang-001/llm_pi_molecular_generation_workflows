@@ -62,6 +62,17 @@ SCHEMA_VERSION = 1
 BACKGROUND_SEED = 410627
 BACKGROUND_PER_CLASS = 60
 SIMILARITY_STOP = 0.90
+#: Literature-justified aniline substituents, always added to the multisite catalog.
+#: erlotinib uses 3-ethynyl, the discovery series uses m-methyl, and halogens are the
+#: routine aniline scan; each is a single-port fragment usable for addition/replacement.
+ANILINE_SUBSTITUENTS = [
+    ("C#C[*:1]", "ethynyl"),
+    ("C[*:1]", "methyl"),
+    ("F[*:1]", "fluoro"),
+    ("Cl[*:1]", "chloro"),
+    ("Br[*:1]", "bromo"),
+    ("I[*:1]", "iodo"),
+]
 REACTIVE = [
     Chem.MolFromSmarts(smarts)
     for smarts in ("[O]-[O]", "[N]-[N]", "[N]-[O]", "[C](=O)[F,Cl,Br,I]")
@@ -438,6 +449,16 @@ def build(task_path: Path, reachability_path: Path, general_path: Path,
         catalog_records.append(record_for(
             f"BG-{size_class}-{number:03d}", smiles, ["addition", "replacement"], "T1", [],
         ))
+    # Literature-justified aniline substituents (gefitinib -> erlotinib ethynyl, m-methyl,
+    # halogen scans). Always included so the aniline region is explorable, even though the
+    # diversity-first background would not guarantee them.
+    seen_smiles = {canonical(record["smiles"]) for record in catalog_records}
+    for number, (smiles, name) in enumerate(ANILINE_SUBSTITUENTS, start=1):
+        if canonical(smiles) in seen_smiles:
+            continue
+        catalog_records.append(record_for(
+            f"AS-{name}", smiles, ["addition", "replacement"], "T1", [],
+        ))
 
     size_counts = Counter(record["size_class"] for record in catalog_records)
     catalog = {
@@ -528,6 +549,63 @@ def build(task_path: Path, reachability_path: Path, general_path: Path,
     return catalog, private, manifest
 
 
+def _halogen_cut_sites(task_path: Path) -> list[dict]:
+    """Add a directed cut site for every terminal halogen on an aromatic carbon.
+
+    The frozen site table protects the whole aniline including Cl/F, so the
+    aniline-halogen bonds are absent from ``cut_sites``. These extra sites make the
+    Cl/F substituents replaceable (single -> multi) via the ordinary bond machinery
+    while keeping the aniline ring itself protected.
+    """
+    context = ComplexContext(task_path)
+    molecule = Chem.RemoveHs(Chem.Mol(context.ligand))
+    total = molecule.GetNumHeavyAtoms()
+    ring_atoms = {index for ring in molecule.GetRingInfo().AtomRings() for index in ring}
+    sites: list[dict] = []
+    halogen_numbers = {9: "F", 17: "Cl", 35: "Br", 53: "I"}
+    for atom in molecule.GetAtoms():
+        number = atom.GetAtomicNum()
+        if number not in halogen_numbers or atom.IsInRing() or atom.GetDegree() != 1:
+            continue
+        neighbor = next(iter(atom.GetNeighbors()))
+        if neighbor.GetAtomicNum() != 6 or not neighbor.GetIsAromatic():
+            continue
+        retained_index, removed_index = neighbor.GetIdx(), atom.GetIdx()
+        retained = [index for index in range(total) if index != removed_index]
+        removed = [removed_index]
+        pos = molecule.GetConformer().GetAtomPosition
+        retained_point, removed_point = pos(retained_index), pos(removed_index)
+        sites.append({
+            "site_id": f"cut-{halogen_numbers[number]}",
+            "target_type": "replacement_site",
+            "region": "aniline-halogen",
+            "label": f"remove the {halogen_numbers[number].lower()} substituent",
+            "cut_bond": [retained_index, removed_index],
+            "retained_atom_index": retained_index,
+            "removed_side_atom_index": removed_index,
+            "retained_atom_indices": retained,
+            "removed_atom_indices": removed,
+            "retained_heavy_atoms": total - 1,
+            "removed_heavy_atoms": 1,
+            "removed_fraction": round(1 / total, 3),
+            "retained_scaffold_smiles": Chem.MolFragmentToSmiles(
+                molecule, atomsToUse=retained, isomericSmiles=True
+            ),
+            "removed_fragment_smiles": Chem.MolFragmentToSmiles(
+                molecule, atomsToUse=removed, isomericSmiles=True
+            ),
+            "attachment_vector": [
+                round(removed_point.x - retained_point.x, 3),
+                round(removed_point.y - retained_point.y, 3),
+                round(removed_point.z - retained_point.z, 3),
+            ],
+            "allowed_operations": ["deletion", "replacement"],
+            "allowed_change_types": ["deletion", "replacement"],
+            "protection": "open",
+        })
+    return sites
+
+
 def derive_site_table(task_path: Path, source: Path) -> dict:
     """Copy the frozen site table and widen the change types it permits.
 
@@ -546,11 +624,13 @@ def derive_site_table(task_path: Path, source: Path) -> dict:
     for record in table.get("cut_sites", []):
         # a directed non-ring cut can always be executed as a deletion or a replacement
         record["allowed_change_types"] = ["deletion", "replacement"]
+    table["cut_sites"] = list(table.get("cut_sites", [])) + _halogen_cut_sites(task_path)
     table["schema_version"] = int(table.get("schema_version", 1))
     table["derived_from"] = str(source.relative_to(ROOT))
     table["derived_note"] = (
         "Multisite variant of the frozen site table. Sites, protection and geometry are "
-        "unchanged; cut sites additionally advertise deletion."
+        "unchanged; cut sites additionally advertise deletion, and terminal aniline "
+        "halogens (Cl/F) gain directed cut sites so they can be replaced with fragments."
     )
     return table
 

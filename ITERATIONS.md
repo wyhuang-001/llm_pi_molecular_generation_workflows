@@ -22,3 +22,16 @@
 - best_quality 单调上升：0.116 → 0.277 → 0.283 → 0.328 → 0.43 → 0.462 → 0.59
 - 收敛：attempt 20 之后 8 个候选均未超过 best，模型以 `no_promising_edit` 停止
 - 对比上一轮（deepseek-flash）：候选 4→26，best_delta -0.29→-0.60，结束原因从重复死循环变为正常收敛
+
+## iter3（苯胺可编辑 + 单元素→多原子替换）
+- 文献查证（离线 ChEMBL 库 120 化合物 + 在线 ChEMBL API）：
+  - 吉非替尼类似物系列 97.5%（117/120）只改 C6 侧链，苯胺高度保守；
+  - 药物层面苯胺是被改的：吉非替尼(F+Cl) → 厄洛替尼(3-乙炔基) → 拉帕替尼/凡德他尼。
+- 设计落地：苯胺环=核心，Cl/F 与 H 可替换，且支持「单元素→多原子」替换。
+- 代码/构建改动（commit 见 git）：
+  1. `closed_pool._normalize_multisite`：修 element_swap 被误当 fragment replacement 的 bug（atom/ring:replacement 走 element 路径）。
+  2. `workflow`：direct 模式接入 MARK_UNMODIFIABLE（位点关闭 + completion_reason）。
+  3. `build_4wkq_multisite_library.py`：派生位点表新增 C-Cl/C-F 切断位点（cut-Cl/cut-F），片段库新增 AS-ethynyl 等苯胺取代片段。
+  4. 重建 fragments/sites/reachability/manifest，重新 freeze evaluator-multisite-v2。
+- 验证：Cl→乙炔基、Cl→甲基、F→H(deletion) 均能构建正确产物；全量 215 测试通过。
+- 注意：新位点/片段不改变文献覆盖（仍是 26 个 C6 化合物），苯胺编辑为无标签背景探索。

@@ -21,12 +21,12 @@
     }
   },
   "counts": {
-    "total": 213,
+    "total": 214,
     "by_size_class": {
       "large": 64,
       "medium": 73,
       "minimal": 12,
-      "small": 64
+      "small": 65
     },
     "literature_derived": 22,
     "background": 191
@@ -7826,6 +7826,39 @@
         "rotatable_bonds": 0,
         "ring_count": 2,
         "aromatic_ring_count": 2
+      },
+      "allowed_change_types": [
+        "addition",
+        "replacement"
+      ],
+      "allowed_operations": [
+        "replace_fragment",
+        "replace_hydrogen"
+      ],
+      "min_edit_tier": "T1",
+      "usable_at_site_types": []
+    },
+    {
+      "fragment_id": "AS-ethynyl",
+      "smiles": "C#C[*:1]",
+      "canonical_smiles": "C#C[*:1]",
+      "heavy_atoms": 2,
+      "size_class": "small",
+      "attachment_atom_element": "C",
+      "attachment_atom_is_aromatic": false,
+      "chemical_tags": [
+        "alkyl"
+      ],
+      "formal_charge": 0,
+      "properties": {
+        "molecular_weight": 25.03,
+        "logp": 0.13,
+        "hbd": 0,
+        "hba": 0,
+        "tpsa": 0.0,
+        "rotatable_bonds": 0,
+        "ring_count": 0,
+        "aromatic_ring_count": 0
       },
       "allowed_change_types": [
         "addition",
