@@ -70,3 +70,11 @@
   第一轮匹配并注入 `payload.experience_context`。
 - 只存 Host 验证事实，不存 LLM 推理。`experience-library/` 已加入 .gitignore。
 - 全量 219 测试通过（新增 3 个 experience 单测）。
+
+## 位点抉择 + 自动关闭（RRSI 式）
+- 借鉴 RRSI 的 stall flag + exploration directives + prune：
+  - 停滞判定：`non_improving_attempts >= max_consecutive_no_improvement` → convergence.stalled；
+  - 探索指令：`_untried_exploration` 列出未 docking 的位点/操作，`_exploration_directive` 生成文本，
+    停滞时注入 `payload.exploration_directive` 和 instruction，强制模型转向未试位点；
+  - prune：`_auto_close_exhausted_site` 已有关闭，配合探索指令完成「关掉耗尽位点 → 引导未试位点」。
+- 全量 220 测试通过（新增 exploration-directive 单测）。

@@ -350,3 +350,33 @@ def test_auto_close_exhausted_site_in_direct_mode(tmp_path):
         )
     assert workflow._is_unmodifiable("atom", 1)
     assert workflow.state.unmodifiable_targets[-1]["completion_reason"] == "no_promising_edit"
+
+
+def test_stall_emits_exploration_directive_for_untried_sites(tmp_path):
+    """RRSI-style: a stalled run is steered toward sites it has not docked yet."""
+    class Dummy:
+        def complete_json(self, payload):
+            return {"action": "STOP", "stop_reason": "no_promising_edit"}
+
+    workflow = Workflow(TASK, Dummy(), tmp_path / "run")
+    workflow._prepare_initial_context()
+    for i in range(1, 5):
+        workflow._record_docking_result(
+            i,
+            {"site_type": "atom", "change_type": "addition", "edit_atom_index": 1,
+             "fragment_smiles": f"[*:1]C(C{i})C"},
+            tmp_path / f"candidate-{i}.sdf",
+            {"status": "complete", "comparison": {"metrics": {"minimizedAffinity": {
+                "direction": "lower_is_better",
+                "delta_candidate_minus_reference": {"mean": 0.1 * i, "stddev": 0.05},
+                "candidate_better_seed_fraction": 1.0}}}},
+        )
+    convergence = workflow.state.convergence
+    assert convergence["stalled"] is True
+    assert workflow._is_unmodifiable("atom", 1)
+    untried = convergence["untried_exploration"]
+    assert len(untried["untried_sites"]) > 10, "most sites must still be untried"
+    directive = workflow._exploration_directive()
+    assert directive is not None and "untried site" in directive
+    payload = workflow._direct_payload("choose")
+    assert "untried site" in payload["instruction"]

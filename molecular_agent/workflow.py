@@ -1637,6 +1637,10 @@ class Workflow:
             payload["rejection"] = self._llm_safe_value(
                 self._closed_pool_feedback(rejection) if self.closed_pool else
                 self._direct_feedback_without_tool_suggestions(rejection))
+        directive = self._exploration_directive()
+        if directive:
+            payload["exploration_directive"] = directive
+            payload["instruction"] = f"{payload['instruction']}\n\n{directive}"
         return payload
 
     def _repair_direct_decision(
@@ -3791,6 +3795,57 @@ class Workflow:
             pass
         return None
 
+    def _untried_exploration(self) -> dict[str, Any]:
+        """RRSI-style exploration surface: sites/operations never docked yet."""
+        tried_sites: set[tuple[Any, ...]] = set()
+        tried_ops: set[str] = set()
+        for entry in self.state.docking_history:
+            target = self._transformation_target(entry.get("transformation") or {})
+            if target.get("target_id") is not None:
+                tried_sites.add((target["target_type"], target["target_id"]))
+            operation = (entry.get("transformation") or {}).get("operation")
+            if operation:
+                tried_ops.add(operation)
+        untried_sites: list[dict[str, Any]] = []
+        untried_ops: set[str] = set()
+        for site in (self.state.design_dossier or {}).get("sites", []):
+            target_type = site.get("target_type")
+            target_id = site.get("target_id")
+            if (target_type, target_id) not in tried_sites and not self._is_unmodifiable(target_type, target_id):
+                untried_sites.append({
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "region": site.get("region"),
+                    "allowed_change_types": site.get("allowed_change_types"),
+                })
+            for change_type in site.get("allowed_change_types") or []:
+                operation = f"{site.get('site_type', target_type)}:{change_type}"
+                if operation not in tried_ops:
+                    untried_ops.add(operation)
+        return {"untried_sites": untried_sites, "untried_operations": sorted(untried_ops)}
+
+    def _exploration_directive(self) -> str | None:
+        """When stalled, name untried sites/operations the designer has not exercised."""
+        if not self.state.convergence.get("stalled"):
+            return None
+        exploration = self._untried_exploration()
+        sites = exploration["untried_sites"]
+        operations = exploration["untried_operations"]
+        if not sites and not operations:
+            return None
+        lines = [
+            "The search has stalled. Prioritize a chemically distinct target you have NOT yet "
+            "docked, instead of returning to an exhausted site:"
+        ]
+        for site in sites[:12]:
+            lines.append(
+                f"- untried site {site['target_type']}:{site['target_id']} ({site.get('region')}) "
+                f"allows {site.get('allowed_change_types')}"
+            )
+        if operations:
+            lines.append(f"- untried operations: {', '.join(operations[:24])}")
+        return "\n".join(lines)
+
     def _append_experience_evidence(self, record: dict[str, Any]) -> None:
         """Append one per-attempt trajectory/evidence record during the run."""
         path = self.run_dir / "trajectory-evidence.jsonl"
@@ -4580,6 +4635,8 @@ class Workflow:
             ),
             "selection_stage": "confirmation" if best_uses_confirmation else "screening",
             "non_improving_attempts": non_improving,
+            "stalled": bool(non_improving >= self._termination_settings()["max_consecutive_no_improvement"]),
+            "untried_exploration": self._untried_exploration(),
             "auto_close_recommended": bool(auto_closed_target),
             "auto_closed_target": auto_closed_target,
             "termination_policy": self._termination_settings(),
