@@ -1486,6 +1486,23 @@ class Workflow:
                 "coordinate_policy": "Free docking; fixed atom comparison set, NOT fixed atom positions. No ligand alignment.",
                 "score_policy": "Gate all top-N poses, select primary score among eligible poses, compare paired same-mode reference Evaluation Poses.",
             }
+        # Sites already closed by MARK_UNMODIFIABLE are hidden so the designer cannot
+        # re-propose them; the host also re-validates before building a candidate.
+        if isinstance(dossier.get("sites"), list):
+            dossier["sites"] = [
+                site for site in dossier["sites"]
+                if not self._is_unmodifiable(site.get("target_type"), site.get("target_id"))
+            ]
+        if isinstance(dossier.get("edit_sites"), dict):
+            for key in ("atom_sites", "cut_sites"):
+                if isinstance(dossier["edit_sites"].get(key), list):
+                    dossier["edit_sites"][key] = [
+                        site for site in dossier["edit_sites"][key]
+                        if not self._is_unmodifiable(
+                            site.get("target_type"),
+                            site.get("target_id", site.get("bond_site_id", site.get("atom_index"))),
+                        )
+                    ]
         return dossier
 
     def _direct_payload(
@@ -1546,6 +1563,10 @@ class Workflow:
         stop_hint = (
             "STOP requires a stop_reason from " + ", ".join(self.STOP_REASONS) + "."
         )
+        close_hint = (
+            "MARK_UNMODIFIABLE closes one site and requires target_type, target_id, "
+            "and a completion_reason from " + ", ".join(self.SITE_COMPLETION_REASONS) + "."
+        )
         if self.closed_pool:
             payload["limits"].update(closed_pool_only=True, maximum_unique_candidates=self.closed_pool.budget)
             payload["state"]["convergence"].pop("global_search", None)
@@ -1555,7 +1576,8 @@ class Workflow:
             payload["state"]["learning_summary"] = summary
             if getattr(self.closed_pool, "mode", "frozen_cut") == "multisite":
                 payload["state"]["convergence"]["next_decision"] = (
-                    "Choose any exposed site and a change_type it allows, or STOP. " + stop_hint)
+                    "Choose any exposed site and a change_type it allows, close a site with "
+                    "MARK_UNMODIFIABLE, or STOP. " + close_hint + " " + stop_hint)
                 payload["instruction"] = (
                     "Choose one site from design_dossier.sites, one change_type that site lists in "
                     "allowed_change_types, and then the payload that change_type needs: a listed "
@@ -1563,8 +1585,8 @@ class Workflow:
                     "ring replacement, and no fragment at all for a bond deletion. The same compound "
                     "can be reached through more than one site and fragment; a compound already "
                     "proposed counts as used however it was reached. Use the cumulative "
-                    "structure/docking summary and latest Host feedback. " + stop_hint +
-                    " Do not request local tools or external research.")
+                    "structure/docking summary and latest Host feedback. " + close_hint + " " +
+                    stop_hint + " Do not request local tools or external research.")
                 payload["state"]["attempted_transformations"] = summary.get(
                     "attempted_candidates", payload["state"]["attempted_transformations"])
             else:
@@ -1584,12 +1606,12 @@ class Workflow:
                 layer_decision="host_computed",
             )
             payload["state"]["convergence"]["next_decision"] = (
-                "Choose one site, one allowed operation, and one catalog fragment, or STOP. "
-                + stop_hint)
+                "Choose one site, one allowed operation, and one catalog fragment, close a site "
+                "with MARK_UNMODIFIABLE, or STOP. " + close_hint + " " + stop_hint)
             payload["instruction"] = (
                 "Choose one site from edit_sites, one operation that site allows, and one catalog "
-                "fragment, or STOP. " + stop_hint +
-                " The host builds the product and reports whether the change is a "
+                "fragment, close a site with MARK_UNMODIFIABLE, or STOP. " + close_hint + " " +
+                stop_hint + " The host builds the product and reports whether the change is a "
                 "minimal edit or a whole-fragment replacement. Do not request local tools or external "
                 "research.")
         if feedback is not None:
@@ -1606,9 +1628,9 @@ class Workflow:
     def _repair_direct_decision(
         self, decision: dict[str, Any], payload: dict[str, Any]
     ) -> dict[str, Any]:
-        """Repair only READY/STOP responses; no local tool action is legal."""
+        """Repair READY/STOP/MARK_UNMODIFIABLE responses; no local tool action is legal."""
         decision = self._unwrap_decision(decision)
-        if isinstance(decision, dict) and decision.get("action") in {"READY", "STOP"}:
+        if isinstance(decision, dict) and decision.get("action") in {"READY", "STOP", "MARK_UNMODIFIABLE"}:
             return decision
         if self._contains_transformation_fields(decision):
             return {**decision, "action": "READY"}
@@ -1617,19 +1639,21 @@ class Workflow:
             "mode": "multisite_edit_decision_repair" if self._multisite_enabled() else "single_edit_decision_repair",
             "invalid_decision": decision,
             "instruction": (
-                "Return exactly one JSON object with action READY or STOP. READY must contain "
-                "understanding, edit_hypothesis, operation, one target_type with target_id (or "
-                "edit_atom_index / bond_site_id), and fragment_smiles or fragment_id; "
-                "an atom/ring replacement needs element instead of a fragment. STOP must include "
-                f"a stop_reason from {', '.join(self.STOP_REASONS)}. Do not call or mention local tools."
+                "Return exactly one JSON object with action READY, MARK_UNMODIFIABLE, or STOP. "
+                "READY must contain understanding, edit_hypothesis, operation, one target_type with "
+                "target_id (or edit_atom_index / bond_site_id), and fragment_smiles or fragment_id; "
+                "an atom/ring replacement needs element instead of a fragment. MARK_UNMODIFIABLE "
+                "closes one site and must include target_type, target_id, and a completion_reason "
+                f"from {', '.join(self.SITE_COMPLETION_REASONS)}. STOP must include a stop_reason from "
+                f"{', '.join(self.STOP_REASONS)}. Do not call or mention local tools."
             ),
         }
         repaired = self._unwrap_decision(self._complete_direct_json(repair_payload))
-        if isinstance(repaired, dict) and repaired.get("action") in {"READY", "STOP"}:
+        if isinstance(repaired, dict) and repaired.get("action") in {"READY", "STOP", "MARK_UNMODIFIABLE"}:
             return repaired
         if self._contains_transformation_fields(repaired):
             return {**repaired, "action": "READY"}
-        raise RuntimeError("LLM did not return READY or STOP in single_edit_mode")
+        raise RuntimeError("LLM did not return READY, STOP, or MARK_UNMODIFIABLE in single_edit_mode")
 
     def _complete_direct_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         response_path = None
@@ -1689,6 +1713,22 @@ class Workflow:
                                ),
                                "instruction": "Return STOP with a valid stop_reason, or continue with READY."})
                 continue
+            if decision.get("action") == "MARK_UNMODIFIABLE":
+                try:
+                    accepted = self._record_unmodifiable(decision)
+                except (RuntimeError, ValueError) as error:
+                    payload = self._direct_payload(instruction, previous_design=decision,
+                        rejection={"failure_class": "unmodifiable_invalid", "error": str(error),
+                                   "instruction": "Correct the MARK_UNMODIFIABLE declaration."})
+                    continue
+                payload = self._direct_payload(
+                    instruction,
+                    **({} if accepted else {"previous_design": decision, "rejection": {
+                        "failure_class": "unmodifiable_reused",
+                        "error": "This target is already closed.",
+                        "instruction": "Close a different target, or return READY/STOP."}})
+                )
+                continue
             if not self.closed_pool and not self._multisite_enabled():
                 return decision
             try:
@@ -1740,6 +1780,33 @@ class Workflow:
                 consecutive_rejections += 1
                 if consecutive_rejections >= max_consecutive_invalid:
                     break
+                continue
+            if decision.get("action") == "MARK_UNMODIFIABLE":
+                try:
+                    accepted = self._record_unmodifiable(decision)
+                except (RuntimeError, ValueError) as error:
+                    rejection = {
+                        "status": "rejected",
+                        "failure_class": "unmodifiable_invalid",
+                        "error": str(error),
+                        "instruction": "Correct the MARK_UNMODIFIABLE declaration.",
+                    }
+                    self.state.tool_rejections.append(rejection)
+                    consecutive_rejections += 1
+                    if consecutive_rejections >= max_consecutive_invalid:
+                        break
+                    continue
+                if not accepted:
+                    rejection = {
+                        "status": "rejected",
+                        "failure_class": "unmodifiable_reused",
+                        "error": "This target is already closed.",
+                        "instruction": "Close a different target, or return READY/STOP.",
+                    }
+                    self.state.tool_rejections.append(rejection)
+                    consecutive_rejections += 1
+                    if consecutive_rejections >= max_consecutive_invalid:
+                        break
                 continue
             try:
                 transformation = self._transformation(decision)
@@ -2281,10 +2348,24 @@ class Workflow:
                 transformations.add(self._transformation_key(transformation))
         return transformations
 
+    def _valid_unmodifiable_atom_ids(self) -> set[int]:
+        """Atom edit sites that may be closed, from the host site table when present."""
+        table = getattr(self.tools, "site_table", None)
+        if table:
+            return {
+                record["atom_index"]
+                for record in table.get("atom_sites", [])
+                if record.get("allowed_operations")
+            }
+        return {
+            atom.GetIdx() for atom in self.context.ligand.GetAtoms()
+            if atom.GetAtomicNum() > 1 and atom.GetTotalNumHs() > 0
+        }
+
     def _record_unmodifiable(self, decision: dict[str, Any]) -> bool:
         target_type = decision.get("target_type")
         target_id = decision.get("target_id")
-        scope = decision.get("scope")
+        scope = decision.get("scope") or "site"
         family = decision.get("family")
         reason = decision.get("reason")
         valid_types = {"atom", "bond"}
@@ -2292,11 +2373,8 @@ class Workflow:
         if target_type not in valid_types:
             raise RuntimeError("MARK_UNMODIFIABLE target_type must be atom or bond_site")
         if target_type == "atom":
-            if not isinstance(target_id, int) or target_id not in {
-                atom.GetIdx() for atom in self.context.ligand.GetAtoms()
-                if atom.GetAtomicNum() > 1 and atom.GetTotalNumHs() > 0
-            }:
-                raise RuntimeError("MARK_UNMODIFIABLE atom target_id must be a heavy atom with hydrogen")
+            if not isinstance(target_id, int) or target_id not in self._valid_unmodifiable_atom_ids():
+                raise RuntimeError("MARK_UNMODIFIABLE atom target_id is not a host-enumerated edit site")
         else:
             known_sites = {
                 site["bond_site_id"]
@@ -2393,7 +2471,7 @@ class Workflow:
             },
             "llm_unmodifiable",
             "MARK_UNMODIFIABLE",
-            reason=reason.strip(),
+            reason=(reason.strip() if isinstance(reason, str) and reason.strip() else completion_reason),
         )
         if scope == "family" and isinstance(family, str):
             attempt_record["family"] = family

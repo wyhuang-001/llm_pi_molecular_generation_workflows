@@ -294,3 +294,26 @@ def test_pose_evaluation_failure_does_not_end_the_run(tmp_path):
     result = workflow.run()["result"]
     assert result["stopping_reason"] != "docking_not_complete"
     assert len(result["attempts"]) > 1, "the search must continue after a pose-gate failure"
+
+
+def test_mark_unmodifiable_closes_site_in_direct_mode(tmp_path):
+    """Direct mode supports MARK_UNMODIFIABLE, including ring/halogen atoms without H."""
+    class Dummy:
+        def complete_json(self, payload):
+            return {"action": "STOP", "stop_reason": "no_promising_edit"}
+
+    workflow = Workflow(TASK, Dummy(), tmp_path / "run")
+    # morpholine ring O (no hydrogen) and meta-Cl are host sites now
+    assert workflow._record_unmodifiable({
+        "action": "MARK_UNMODIFIABLE", "target_type": "atom", "target_id": 2,
+        "completion_reason": "no_promising_edit",
+    }) is True
+    assert workflow._record_unmodifiable({
+        "action": "MARK_UNMODIFIABLE", "target_type": "bond", "target_id": "cut-001",
+        "completion_reason": "site_complete",
+    }) is True
+    workflow._prepare_initial_context()
+    dossier = workflow._direct_dossier()
+    site_ids = {(s.get("target_type"), s.get("target_id")) for s in dossier.get("sites", [])}
+    assert ("atom", 2) not in site_ids
+    assert ("bond", "cut-001") not in site_ids
