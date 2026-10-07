@@ -54,3 +54,9 @@
   `max_consecutive_no_improvement`（默认5）个非改善 docking 候选后自动 MARK_UNMODIFIABLE（no_promising_edit）。
 - task 增加显式 `termination_policy`；重新 freeze evaluator-multisite-v4。
 - 全量 216 测试通过。
+
+## 调参 + 启用 playwright
+- `max_consecutive_no_improvement` 5→3，`hard_max_attempts` 30→50，闭集预算重建为 50。
+- 启用 `external_research`（Playwright/MCP stdio）：`npx -y @playwright/mcp@latest` 导航 RCSB 4WKQ + snapshot。
+  - 去掉 closed_pool 的「禁止浏览」硬限制；closed_pool 在 research disabled 时仍保持隔离（不加载持久化 web 记忆）。
+- 重新 freeze evaluator-multisite-v5。全量 216 测试通过。

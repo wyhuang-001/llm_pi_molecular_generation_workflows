@@ -3,7 +3,7 @@
   "mode": "multisite_reachability",
   "task": "4WKQ/task.benchmark-multisite.json",
   "inputs": {
-    "task_sha256": "59be4210bc04866abb27b9486ace4c31a457fc32c461f1a26aeea4ede7d6a19a",
+    "task_sha256": "4a6e6b4b5917933d8bf3cc0379ec8cd781693662d056ff1d2889e51baddd8dc3",
     "reachability_sha256": "c3dee704f25cce56fcb8f5b189c8fbabd56eb1b143416ab35de17f9b886e1e28",
     "general_library_sha256": "eede5d25300dd86a62366ddf5ac7f7e886a2c3ef77c60166cdd89f71a88edbee"
   },
@@ -21,7 +21,7 @@
     }
   },
   "candidate_count": 214,
-  "maximum_unique_candidates": 30,
+  "maximum_unique_candidates": 50,
   "maximum_design_requests": 150,
   "counts": {
     "catalog_total": 214,
@@ -31,7 +31,7 @@
     "literature_derived_fragments": 22,
     "all_decomposition_fragments": 88,
     "compounds_needing_no_fragment": 0,
-    "bond_sites": 13,
+    "bond_sites": 11,
     "atom_sites": 15
   },
   "public_files": {

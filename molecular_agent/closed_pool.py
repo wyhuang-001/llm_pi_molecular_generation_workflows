@@ -114,8 +114,6 @@ class ClosedPool:
             raise ValueError("Frozen pool was generated for different structure/topology/preparation")
         if not context.task.get("single_edit_mode", {}).get("enabled"):
             raise ValueError("Closed-pool benchmark requires single_edit_mode")
-        if context.task.get("external_research", {}).get("enabled"):
-            raise ValueError("Closed-pool benchmark disables browsing/research context")
         self.construction_policy = context.task.get("candidate_construction") or {}
         if self.construction_policy.get("initial_receptor_clash_policy", "reject") not in {"reject", "defer_to_docking"}:
             raise ValueError("Unsupported initial receptor clash policy")

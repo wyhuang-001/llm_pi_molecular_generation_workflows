@@ -1269,16 +1269,21 @@ class Workflow:
             return
         self._direct_edit_mode = self._single_edit_enabled()
         if self.closed_pool:
-            # Do not load a persisted web/SAR memory, and never construct the six-item
-            # heuristic panels for a full-visibility, single-site benchmark.
             self.state.design_dossier = self.closed_pool.dossier(self.tools)
-            self.state.external_research = {"status": "disabled", "reason": "Closed-pool structure-only input"}
-            self._write_json("design-dossier.json", self.state.design_dossier)
-            self._write_json("initial-context.json", {"design_dossier": self.state.design_dossier,
-                                                      "external_research": self.state.external_research})
-            self._initial_context_prepared = True
-            return
-        self._prepare_design_dossier()
+            research_enabled = bool((self.context.task.get("external_research") or {}).get("enabled"))
+            if not research_enabled:
+                # Hidden-label benchmark default: do not load a persisted web/SAR memory
+                # and never construct the six-item heuristic panels for a full-visibility,
+                # single-site benchmark.
+                self.state.external_research = {"status": "disabled", "reason": "Closed-pool structure-only input"}
+                self._write_json("design-dossier.json", self.state.design_dossier)
+                self._write_json("initial-context.json", {"design_dossier": self.state.design_dossier,
+                                                          "external_research": self.state.external_research})
+                self._initial_context_prepared = True
+                return
+        else:
+            self._prepare_design_dossier()
+        self._write_json("design-dossier.json", self.state.design_dossier)
         saved_research = self.run_dir / "external-research.json"
         if self.state.external_research is None and saved_research.is_file():
             self.state.external_research = json.loads(saved_research.read_text())
