@@ -46,3 +46,11 @@
   2. 回退 build 脚本里重复的 cut-Cl/cut-F；
   3. 重建位点表(11 cuts)/片段库(214, 含 AS-ethynyl)/reachability，重新 freeze evaluator-multisite-v3。
 - 全量 215 测试通过。待新一轮真实 run 验证 Cl→Br/Cl→乙炔基 能过 pose 门。
+
+## iter4 分析 + 位点级自动关闭
+- iter4 真实 run（`runs/4wkq-llm-20261007-153604`）：30/30 候选、0 拒绝、best_delta=-0.564、best_quality=0.545、
+  hard_safety_limit 收尾；Cl→Br（cut-010）pose 门通过（delta +0.096 更差，模型正确放弃）。
+- 新增：direct/closed-pool 模式的位点级门控——`_auto_close_exhausted_site` 在某位点连续
+  `max_consecutive_no_improvement`（默认5）个非改善 docking 候选后自动 MARK_UNMODIFIABLE（no_promising_edit）。
+- task 增加显式 `termination_policy`；重新 freeze evaluator-multisite-v4。
+- 全量 216 测试通过。

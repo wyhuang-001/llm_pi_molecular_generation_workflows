@@ -79,6 +79,12 @@
     "minimum_seed_win_fraction": 0.6666666666666666,
     "hard_max_attempts": 30
   },
+  "termination_policy": {
+    "max_consecutive_invalid_edits": 3,
+    "max_consecutive_policy_rejections": 3,
+    "max_consecutive_designer_failures": 3,
+    "max_consecutive_no_improvement": 5
+  },
   "fragment_replacement": {
     "max_removed_heavy_atom_fraction": 0.4,
     "protected_core_atom_indices": [

@@ -328,3 +328,25 @@ def test_halogen_element_swap_uses_an_element_not_a_fragment(pool: ClosedPool) -
     assert normalized["element"] == "Br"
     assert "Br" in pool.product_smiles(normalized)
     assert "Cl" not in pool.product_smiles(normalized)
+
+
+def test_auto_close_exhausted_site_in_direct_mode(tmp_path):
+    """Direct mode closes a site after max_consecutive_no_improvement non-improving docks."""
+    class Dummy:
+        def complete_json(self, payload):
+            return {"action": "STOP", "stop_reason": "no_promising_edit"}
+
+    workflow = Workflow(TASK, Dummy(), tmp_path / "run")
+    for i in range(1, 7):
+        workflow._record_docking_result(
+            i,
+            {"site_type": "atom", "change_type": "addition", "edit_atom_index": 1,
+             "fragment_smiles": f"[*:1]C(C{i})C"},
+            tmp_path / f"candidate-{i}.sdf",
+            {"status": "complete", "comparison": {"metrics": {"minimizedAffinity": {
+                "direction": "lower_is_better",
+                "delta_candidate_minus_reference": {"mean": 0.2 * i, "stddev": 0.05},
+                "candidate_better_seed_fraction": 1.0}}}},
+        )
+    assert workflow._is_unmodifiable("atom", 1)
+    assert workflow.state.unmodifiable_targets[-1]["completion_reason"] == "no_promising_edit"

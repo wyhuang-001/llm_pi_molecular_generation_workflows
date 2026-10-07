@@ -3735,6 +3735,48 @@ class Workflow:
             pass
         return None
 
+    def _auto_close_exhausted_site(self, transformation: dict[str, Any]) -> dict[str, Any] | None:
+        """Close a site when its consecutive non-improving candidates exhaust the budget.
+
+        Direct/closed-pool mode has no locked active target, so per-site patience is
+        read from the tail of ``docking_history`` for this transformation's site.
+        """
+        limit = self._termination_settings()["max_consecutive_no_improvement"]
+        target = self._transformation_target(transformation)
+        target_type, target_id = target["target_type"], target["target_id"]
+        if target_id is None or self._is_unmodifiable(target_type, target_id):
+            return None
+        non_improving = 0
+        for entry in reversed(self.state.docking_history):
+            entry_target = self._transformation_target(entry.get("transformation") or {})
+            if entry_target["target_type"] != target_type or entry_target["target_id"] != target_id:
+                continue
+            if entry.get("is_new_best"):
+                break
+            if entry.get("status") == "complete":
+                non_improving += 1
+        if non_improving < limit:
+            return None
+        decision = {
+            "action": "MARK_UNMODIFIABLE",
+            "target_type": target_type,
+            "target_id": target_id,
+            "scope": "site",
+            "completion_reason": "no_promising_edit",
+            "reason": f"Host auto-close after {non_improving} consecutive non-improving docked candidates.",
+        }
+        try:
+            if self._record_unmodifiable(decision):
+                return {
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "completion_reason": "no_promising_edit",
+                    "source": "host_auto_close",
+                }
+        except RuntimeError:
+            pass
+        return None
+
     def _record_candidate_history(
         self,
         report: dict[str, Any],
@@ -4351,8 +4393,6 @@ class Workflow:
             if is_significant_improvement
             else int(self.state.convergence.get("non_improving_attempts", 0)) + 1
         )
-        auto_closed_target = self._auto_close_active_target(non_improving)
-
         entry = {
             "attempt": attempt,
             "candidate_id": f"attempt-{attempt:02d}",
@@ -4391,6 +4431,9 @@ class Workflow:
         self.state.docking_history.append(entry)
         self._update_sar_memory(attempt, transformation, entry)
         self._refresh_site_search()
+        auto_closed_target = self._auto_close_active_target(non_improving)
+        if auto_closed_target is None:
+            auto_closed_target = self._auto_close_exhausted_site(transformation)
         scored_count = sum(
             item.get("raw_quality_from_mean") is not None for item in self.state.docking_history
         )
