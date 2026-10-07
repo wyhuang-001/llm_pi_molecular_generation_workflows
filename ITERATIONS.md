@@ -60,3 +60,13 @@
 - 启用 `external_research`（Playwright/MCP stdio）：`npx -y @playwright/mcp@latest` 导航 RCSB 4WKQ + snapshot。
   - 去掉 closed_pool 的「禁止浏览」硬限制；closed_pool 在 research disabled 时仍保持隔离（不加载持久化 web 记忆）。
 - 重新 freeze evaluator-multisite-v5。全量 216 测试通过。
+
+## 第一批：轨迹/证据经验库（离线模块）
+- 新增 `molecular_agent/experience.py`：运行中每轮 docking 追加一条 `trajectory-evidence.jsonl`
+  （site/operation/fragment/pocket/evidence/outcome/failure）；`structure_experience` 聚合成
+  位点/片段/操作/口袋/失败五类结构化经验；`ExperienceLibrary` 按配体哈希落盘
+  `experience-library/<hash>.json`，`match` 按 任务/位点/片段/操作/口袋/失败 六路加权排序。
+- 工作流接入：`_record_docking_result` 写证据；`run()` 结束 ingest 入库；`_prepare_initial_context`
+  第一轮匹配并注入 `payload.experience_context`。
+- 只存 Host 验证事实，不存 LLM 推理。`experience-library/` 已加入 .gitignore。
+- 全量 219 测试通过（新增 3 个 experience 单测）。

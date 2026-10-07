@@ -6,6 +6,7 @@ config.single_edit.json
 .aicloud_api_key
 runs/*
 !runs/.gitkeep
+experience-library/
 __pycache__/
 .pytest_cache/
 *.pyc

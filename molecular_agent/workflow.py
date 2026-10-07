@@ -16,6 +16,7 @@ from .edit_taxonomy import (
     operation_label,
 )
 from .editing import EditResult, apply_transformation, transformation_product_smiles, write_sdf
+from .experience import ExperienceLibrary, build_evidence_record
 from .fragment_library import FragmentLibrary
 from .models import AgentState, ToolObservation
 from .research import ExternalResearchError, PlaywrightResearchAdapter
@@ -168,6 +169,11 @@ class Workflow:
         self._direct_edit_mode = False
         self._initial_context_prepared = False
         self.closed_pool = None
+        # Offline experience library: per-attempt trajectory evidence is written
+        # during the run and distilled/reused across rounds (first loop only).
+        library_dir = self.context.task.get("experience_library_dir", "experience-library")
+        self.experience_library = ExperienceLibrary(library_dir)
+        self.experience_context: str = ""
         if (self.context.task.get("closed_pool") or {}).get("enabled"):
             from .closed_pool import ClosedPool
             if not self._single_edit_enabled():
@@ -1276,6 +1282,7 @@ class Workflow:
                 # and never construct the six-item heuristic panels for a full-visibility,
                 # single-site benchmark.
                 self.state.external_research = {"status": "disabled", "reason": "Closed-pool structure-only input"}
+                self.experience_context = self._build_experience_context()
                 self._write_json("design-dossier.json", self.state.design_dossier)
                 self._write_json("initial-context.json", {"design_dossier": self.state.design_dossier,
                                                           "external_research": self.state.external_research})
@@ -1375,6 +1382,7 @@ class Workflow:
             bundle["structure_memory"] = memory
             self._write_json("external-research.json", bundle)
             self._write_json("state-checkpoint.json", self.state.compact_view())
+        self.experience_context = self._build_experience_context()
         self._write_json("initial-context.json", {
             "design_dossier": self.state.design_dossier,
             "external_research": self.state.external_research,
@@ -1534,6 +1542,7 @@ class Workflow:
             "external_research": (self.state.external_research or {}).get(
                 "structure_memory", {"status": "unavailable", "observations": []}
             ),
+            "experience_context": self.experience_context or None,
             "edit_base": "original_co_crystal_ligand_only",
             "comparison_policy": "reference docking is authoritative; best-so-far is comparison only",
             "state": {
@@ -3782,6 +3791,88 @@ class Workflow:
             pass
         return None
 
+    def _append_experience_evidence(self, record: dict[str, Any]) -> None:
+        """Append one per-attempt trajectory/evidence record during the run."""
+        path = self.run_dir / "trajectory-evidence.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _evidence_outcome(entry: dict[str, Any]) -> str:
+        status = entry.get("status")
+        if status != "complete":
+            return "docking_failed"
+        if not (entry.get("pose_evidence") or {}).get("native_like"):
+            return "pose_failed"
+        if entry.get("is_new_best"):
+            return "new_best"
+        delta = entry.get("delta_candidate_minus_reference")
+        if isinstance(delta, (int, float)) and delta < 0:
+            return "improved"
+        if isinstance(delta, (int, float)) and delta > 0:
+            return "worse"
+        return "neutral"
+
+    def _append_docking_evidence(
+        self, attempt: int, transformation: dict[str, Any], entry: dict[str, Any]
+    ) -> None:
+        """Build and persist one docking-attempt trajectory/evidence record."""
+        target = self._transformation_target(transformation)
+        site: dict[str, Any] = {"target_type": target["target_type"], "target_id": target["target_id"]}
+        for record in (self.state.design_dossier or {}).get("sites", []):
+            if record.get("target_type") == target["target_type"] and record.get("target_id") == target["target_id"]:
+                site["region"] = record.get("region")
+                break
+        fragment = {
+            "fragment_id": transformation.get("fragment_id"),
+            "fragment_smiles": transformation.get("fragment_smiles"),
+            "element": transformation.get("element"),
+        }
+        interactions = entry.get("interaction_consensus") or {}
+        residues: set[str] = set()
+        for key in ("gained", "lost", "retained"):
+            for item in interactions.get(key) or []:
+                if isinstance(item, dict) and item.get("protein_residue"):
+                    residues.add(str(item["protein_residue"]))
+        pocket = {"residues": sorted(residues)}
+        evidence = {
+            "delta_candidate_minus_reference": entry.get("delta_candidate_minus_reference"),
+            "quality": entry.get("quality"),
+            "seed_win_fraction": entry.get("seed_win_fraction"),
+            "seed_stddev": entry.get("seed_stddev"),
+            "pose_native_like": (entry.get("pose_evidence") or {}).get("native_like"),
+        }
+        outcome = self._evidence_outcome(entry)
+        failure = None
+        if outcome in {"pose_failed", "docking_failed"}:
+            failure = {"failure_class": outcome, "reason": entry.get("status")}
+        ligand_smiles = Chem.MolToSmiles(Chem.RemoveHs(self.context.ligand), isomericSmiles=True)
+        self._append_experience_evidence(build_evidence_record(
+            attempt, self.state.task, ligand_smiles, site,
+            transformation.get("operation") or "", fragment, pocket, evidence, outcome, failure,
+        ))
+
+    def _experience_query(self) -> dict[str, Any]:
+        """Current round's task surface for multi-way matching."""
+        sites = []
+        fragments = []
+        operations: set[str] = set()
+        residues: set[str] = set()
+        for site in (self.state.design_dossier or {}).get("sites", []):
+            sites.append({"target_type": site.get("target_type"), "target_id": site.get("target_id")})
+            for ct in site.get("allowed_change_types") or []:
+                operations.add(f"{site.get('site_type', site.get('target_type'))}:{ct}")
+        for record in (self.closed_pool.catalog if self.closed_pool else []):
+            fragments.append({"fragment_id": record.get("fragment_id"), "fragment_smiles": record.get("smiles")})
+        return {"sites": sites, "fragments": fragments, "operations": sorted(operations),
+                "pocket_residues": sorted(residues), "failure_classes": {"*"}}
+
+    def _build_experience_context(self) -> str:
+        """Match + gate + rank prior experience, serialized for the first design loop."""
+        ligand_smiles = Chem.MolToSmiles(Chem.RemoveHs(self.context.ligand), isomericSmiles=True)
+        ranked = self.experience_library.match(ligand_smiles, self._experience_query())
+        return self.experience_library.context_text(ranked)
+
     def _record_candidate_history(
         self,
         report: dict[str, Any],
@@ -4436,6 +4527,7 @@ class Workflow:
         self.state.docking_history.append(entry)
         self._update_sar_memory(attempt, transformation, entry)
         self._refresh_site_search()
+        self._append_docking_evidence(attempt, transformation, entry)
         auto_closed_target = self._auto_close_active_target(non_improving)
         if auto_closed_target is None:
             auto_closed_target = self._auto_close_exhausted_site(transformation)
@@ -5055,6 +5147,8 @@ class Workflow:
             result = self.design(first_decision)
         final = {"state": self.state.compact_view(), "result": result}
         self._write_json("result.json", final)
+        ligand_smiles = Chem.MolToSmiles(Chem.RemoveHs(self.context.ligand), isomericSmiles=True)
+        self.experience_library.ingest_run(self.run_dir, ligand_smiles)
         self._emit("workflow_completed", {
             "status": result.get("status"),
             "stopping_reason": result.get("stopping_reason"),
