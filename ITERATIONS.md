@@ -35,3 +35,14 @@
   4. 重建 fragments/sites/reachability/manifest，重新 freeze evaluator-multisite-v2。
 - 验证：Cl→乙炔基、Cl→甲基、F→H(deletion) 均能构建正确产物；全量 215 测试通过。
 - 注意：新位点/片段不改变文献覆盖（仍是 26 个 C6 化合物），苯胺编辑为无标签背景探索。
+
+## iter3 分析 + iter4 修复
+- iter3 真实 run（`runs/4wkq-llm-20261007-142819`，deepseek-v4-pro）：20 候选/21 请求、0 拒绝、best_delta=-0.35、
+  no_promising_edit 收尾。干净但 best 不如 iter2（-0.60），且模型试了苯胺 Cl→Br 却 pose retention 失败。
+- 根因：`pose_retention.core_atom_indices` 原为 [10..30]，把 Cl(26)/F(28) 也算进姿势核心，编辑它们被判 non-native。
+- 另外发现：冻结表 sites-v2.json 本就有 cut-010(Cl)/cut-011(F)（aniline-halogen），上一轮加的 cut-Cl/cut-F 是重复的，已回退。
+- 修复：
+  1. task 的 pose core 与 protected core 排除 Cl(26)/F(28)（19 原子，苯胺环仍在核心里）；
+  2. 回退 build 脚本里重复的 cut-Cl/cut-F；
+  3. 重建位点表(11 cuts)/片段库(214, 含 AS-ethynyl)/reachability，重新 freeze evaluator-multisite-v3。
+- 全量 215 测试通过。待新一轮真实 run 验证 Cl→Br/Cl→乙炔基 能过 pose 门。

@@ -3,7 +3,7 @@
   "mode": "multisite_reachability",
   "task": "4WKQ/task.benchmark-multisite.json",
   "inputs": {
-    "task_sha256": "50ed3338549f1f353655e36c0eedffe170e30ceda3b235c025ded436e3c77f5c",
+    "task_sha256": "59be4210bc04866abb27b9486ace4c31a457fc32c461f1a26aeea4ede7d6a19a",
     "reachability_sha256": "c3dee704f25cce56fcb8f5b189c8fbabd56eb1b143416ab35de17f9b886e1e28",
     "general_library_sha256": "eede5d25300dd86a62366ddf5ac7f7e886a2c3ef77c60166cdd89f71a88edbee"
   },
@@ -38,7 +38,7 @@
     "catalog": "4WKQ/design/fragments-multisite.json",
     "catalog_sha256": "7593625655db6ae06f4f4d61220fa634b013a07757e794e74f85ee99e7805a50",
     "site_table": "4WKQ/design/sites-multisite.json",
-    "site_table_sha256": "e2995333465252eb649f38c0658463d7011e8a101fc7b5a72334962d05a539f9",
+    "site_table_sha256": "d65da6074103bd75721ddd4ab4755a33f89d6098855775b8be6606f39b154590",
     "site_table_derived_from": "4WKQ/design/sites-v2.json"
   },
   "private_files": {

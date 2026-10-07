@@ -549,63 +549,6 @@ def build(task_path: Path, reachability_path: Path, general_path: Path,
     return catalog, private, manifest
 
 
-def _halogen_cut_sites(task_path: Path) -> list[dict]:
-    """Add a directed cut site for every terminal halogen on an aromatic carbon.
-
-    The frozen site table protects the whole aniline including Cl/F, so the
-    aniline-halogen bonds are absent from ``cut_sites``. These extra sites make the
-    Cl/F substituents replaceable (single -> multi) via the ordinary bond machinery
-    while keeping the aniline ring itself protected.
-    """
-    context = ComplexContext(task_path)
-    molecule = Chem.RemoveHs(Chem.Mol(context.ligand))
-    total = molecule.GetNumHeavyAtoms()
-    ring_atoms = {index for ring in molecule.GetRingInfo().AtomRings() for index in ring}
-    sites: list[dict] = []
-    halogen_numbers = {9: "F", 17: "Cl", 35: "Br", 53: "I"}
-    for atom in molecule.GetAtoms():
-        number = atom.GetAtomicNum()
-        if number not in halogen_numbers or atom.IsInRing() or atom.GetDegree() != 1:
-            continue
-        neighbor = next(iter(atom.GetNeighbors()))
-        if neighbor.GetAtomicNum() != 6 or not neighbor.GetIsAromatic():
-            continue
-        retained_index, removed_index = neighbor.GetIdx(), atom.GetIdx()
-        retained = [index for index in range(total) if index != removed_index]
-        removed = [removed_index]
-        pos = molecule.GetConformer().GetAtomPosition
-        retained_point, removed_point = pos(retained_index), pos(removed_index)
-        sites.append({
-            "site_id": f"cut-{halogen_numbers[number]}",
-            "target_type": "replacement_site",
-            "region": "aniline-halogen",
-            "label": f"remove the {halogen_numbers[number].lower()} substituent",
-            "cut_bond": [retained_index, removed_index],
-            "retained_atom_index": retained_index,
-            "removed_side_atom_index": removed_index,
-            "retained_atom_indices": retained,
-            "removed_atom_indices": removed,
-            "retained_heavy_atoms": total - 1,
-            "removed_heavy_atoms": 1,
-            "removed_fraction": round(1 / total, 3),
-            "retained_scaffold_smiles": Chem.MolFragmentToSmiles(
-                molecule, atomsToUse=retained, isomericSmiles=True
-            ),
-            "removed_fragment_smiles": Chem.MolFragmentToSmiles(
-                molecule, atomsToUse=removed, isomericSmiles=True
-            ),
-            "attachment_vector": [
-                round(removed_point.x - retained_point.x, 3),
-                round(removed_point.y - retained_point.y, 3),
-                round(removed_point.z - retained_point.z, 3),
-            ],
-            "allowed_operations": ["deletion", "replacement"],
-            "allowed_change_types": ["deletion", "replacement"],
-            "protection": "open",
-        })
-    return sites
-
-
 def derive_site_table(task_path: Path, source: Path) -> dict:
     """Copy the frozen site table and widen the change types it permits.
 
@@ -624,13 +567,11 @@ def derive_site_table(task_path: Path, source: Path) -> dict:
     for record in table.get("cut_sites", []):
         # a directed non-ring cut can always be executed as a deletion or a replacement
         record["allowed_change_types"] = ["deletion", "replacement"]
-    table["cut_sites"] = list(table.get("cut_sites", [])) + _halogen_cut_sites(task_path)
     table["schema_version"] = int(table.get("schema_version", 1))
     table["derived_from"] = str(source.relative_to(ROOT))
     table["derived_note"] = (
         "Multisite variant of the frozen site table. Sites, protection and geometry are "
-        "unchanged; cut sites additionally advertise deletion, and terminal aniline "
-        "halogens (Cl/F) gain directed cut sites so they can be replaced with fragments."
+        "unchanged; cut sites additionally advertise deletion."
     )
     return table
 
